@@ -2,71 +2,57 @@ using System;
 using System.Threading.Tasks;
 using UnityEngine;
 using IndoorNavAR.Core.Events;
+using IndoorNavAR.Core.Data;
 using IndoorNavAR.Core.Managers;
 using IndoorNavAR.Core.Controllers;
 using IndoorNavAR.AR;
 using IndoorNavAR.Navigation;
-using IndoorNavAR.UI;
 
 namespace IndoorNavAR.Core
 {
     /// <summary>
-    /// Gestor principal que orquesta todo el sistema de navegación AR.
-    /// Inicializa componentes, gestiona estados y provee API unificada.
-    /// ✅ MEJORADO: Integración completa con detección de paredes y eventos
+    /// Gestor principal del sistema de navegación AR
+    /// ✅ Compatible con Unity 6 y AR Foundation 6
+    /// ✅ Integración completa con sistema optimizado
+    /// ✅ Flujo mejorado de inicialización
     /// </summary>
     public class NavigationManager : MonoBehaviour
     {
-        [Header("Referencias de Managers")]
+        [Header("📦 Managers")]
         [SerializeField] private ARSessionManager _arSessionManager;
         [SerializeField] private WaypointManager _waypointManager;
         [SerializeField] private ModelLoadManager _modelLoadManager;
         [SerializeField] private PlacementController _placementController;
-        [SerializeField] private NavMeshGenerator _navMeshGenerator;
-        [SerializeField] private NavigationAgent _navigationAgent;
-        [SerializeField] private UIManager _uiManager;
         [SerializeField] private PersistenceManager _persistenceManager;
 
-        [Header("🧱 Referencias de Sistema de Navegación (NUEVO)")]
-        [Tooltip("Generador robusto de superficie navegable con detección de paredes")]
-        [SerializeField] private RobustWalkableSurfaceGenerator _walkableSurfaceGenerator;
-        
-        [Tooltip("Posicionador de agente en piso real")]
+        [Header("🧭 Sistema de Navegación")]
+        [SerializeField] private MultiMeshWalkableSurfaceGenerator _walkableSurfaceGenerator;
+        [SerializeField] private NavigationAgent _navigationAgent;
+        [SerializeField] private NavMeshAgentCoordinator _navMeshCoordinator;
         [SerializeField] private AgentFloorPlacement _agentFloorPlacement;
 
-        [Header("Configuración de Inicio")]
+        [Header("⚙️ Configuración")]
         [SerializeField] private bool _autoInitialize = true;
-        [SerializeField] private bool _loadPreviousSession = false; // ✅ Cambiado a false por defecto
-        [SerializeField] private bool _loadDefaultModelOnStart = true;
-        
-        [Header("🔧 Pipeline de Navegación (NUEVO)")]
-        [Tooltip("Generar NavMesh automáticamente después de cargar modelo")]
-        [SerializeField] private bool _autoGenerateNavMesh = true;
-        
-        [Tooltip("Delay antes de generar NavMesh (segundos)")]
-        [SerializeField] private float _navMeshGenerationDelay = 1f;
+        [SerializeField] private bool _loadPreviousSession = false;
+        [SerializeField] private bool _autoLoadModel = true;
+
+        [Header("🐛 Debug")]
+        [SerializeField] private bool _logDetailedEvents = false;
 
         private AppMode _currentState = AppMode.Initialization;
         private bool _isInitialized;
-        private bool _isProcessingNavMesh; // ✅ NUEVO: Evitar generaciones múltiples
 
         #region Properties
 
         public bool IsInitialized => _isInitialized;
         public AppMode CurrentState => _currentState;
-
-        // Acceso a managers individuales
         public ARSessionManager ARSession => _arSessionManager;
         public WaypointManager Waypoints => _waypointManager;
         public ModelLoadManager Models => _modelLoadManager;
         public PlacementController Placement => _placementController;
-        public NavMeshGenerator NavMesh => _navMeshGenerator;
+        public MultiMeshWalkableSurfaceGenerator WalkableSurface => _walkableSurfaceGenerator;
         public NavigationAgent Agent => _navigationAgent;
-        public UIManager UI => _uiManager;
-        
-        // ✅ NUEVO: Acceso a componentes de navegación
-        public RobustWalkableSurfaceGenerator WalkableSurface => _walkableSurfaceGenerator;
-        public AgentFloorPlacement AgentPlacement => _agentFloorPlacement;
+        public NavMeshAgentCoordinator NavMeshCoordinator => _navMeshCoordinator;
 
         #endregion
 
@@ -74,21 +60,17 @@ namespace IndoorNavAR.Core
 
         private void Awake()
         {
-            ValidateAndFindComponents();
+            FindComponents();
         }
 
         private void OnEnable()
         {
-            // ✅ NUEVO: Suscribirse a eventos del sistema
-            EventBus.Instance?.Subscribe<ModelLoadedEvent>(OnModelLoaded);
-            EventBus.Instance?.Subscribe<NavMeshGeneratedEvent>(OnNavMeshGenerated);
+            SubscribeEvents();
         }
 
         private void OnDisable()
         {
-            // ✅ NUEVO: Desuscribirse para evitar memory leaks
-            EventBus.Instance?.Unsubscribe<ModelLoadedEvent>(OnModelLoaded);
-            EventBus.Instance?.Unsubscribe<NavMeshGeneratedEvent>(OnNavMeshGenerated);
+            UnsubscribeEvents();
         }
 
         private void Start()
@@ -101,196 +83,178 @@ namespace IndoorNavAR.Core
 
         #endregion
 
-        #region Event Handlers
+        #region Component Discovery
 
-        /// <summary>
-        /// ✅ NUEVO: Reacciona cuando se carga un modelo
-        /// </summary>
-        private void OnModelLoaded(ModelLoadedEvent evt)
+        private void FindComponents()
         {
-            Debug.Log($"[NavigationManager] 📦 Modelo cargado: {evt.ModelName}");
+            Log("🔍 Buscando componentes del sistema...");
 
-            // Si está configurado, generar NavMesh automáticamente
-            if (_autoGenerateNavMesh && !_isProcessingNavMesh)
-            {
-                _ = GenerateNavMeshDelayed();
-            }
+            // Managers básicos
+            _arSessionManager ??= FindFirstObjectByType<ARSessionManager>();
+            _waypointManager ??= FindFirstObjectByType<WaypointManager>();
+            _modelLoadManager ??= FindFirstObjectByType<ModelLoadManager>();
+            _placementController ??= FindFirstObjectByType<PlacementController>();
+            _persistenceManager ??= FindFirstObjectByType<PersistenceManager>();
+
+            // Sistema navegación
+            _walkableSurfaceGenerator ??= FindFirstObjectByType<MultiMeshWalkableSurfaceGenerator>();
+            _navigationAgent ??= FindFirstObjectByType<NavigationAgent>();
+            _navMeshCoordinator ??= FindFirstObjectByType<NavMeshAgentCoordinator>();
+            _agentFloorPlacement ??= FindFirstObjectByType<AgentFloorPlacement>();
+
+            ValidateComponents();
         }
 
-        /// <summary>
-        /// ✅ NUEVO: Reacciona cuando se genera el NavMesh
-        /// </summary>
-        private void OnNavMeshGenerated(NavMeshGeneratedEvent evt)
+        private void ValidateComponents()
         {
-            _isProcessingNavMesh = false;
+            bool hasErrors = false;
 
-            if (evt.Success)
+            // Críticos
+            if (_arSessionManager == null)
             {
-                Debug.Log($"[NavigationManager] ✅ NavMesh generado: {evt.SurfaceCount} superficies, {evt.TotalArea:F2}m²");
-                
-                // Cambiar al modo de colocación de waypoints
-                ChangeState(AppMode.WaypointPlacement);
+                Debug.LogError("[NavManager] ❌ ARSessionManager faltante");
+                hasErrors = true;
+            }
+
+            if (_waypointManager == null)
+            {
+                Debug.LogError("[NavManager] ❌ WaypointManager faltante");
+                hasErrors = true;
+            }
+
+            if (_walkableSurfaceGenerator == null)
+            {
+                Debug.LogError("[NavManager] ❌ MultiMeshWalkableSurfaceGenerator faltante");
+                hasErrors = true;
+            }
+
+            if (_navigationAgent == null)
+            {
+                Debug.LogError("[NavManager] ❌ NavigationAgent faltante");
+                hasErrors = true;
+            }
+
+            // Opcionales
+            if (_modelLoadManager == null)
+            {
+                Debug.LogWarning("[NavManager] ⚠️ ModelLoadManager no encontrado");
+            }
+
+            if (_navMeshCoordinator == null)
+            {
+                Debug.LogWarning("[NavManager] ⚠️ NavMeshCoordinator no encontrado");
+            }
+
+            if (hasErrors)
+            {
+                Debug.LogError("[NavManager] ❌ Sistema deshabilitado");
+                enabled = false;
             }
             else
             {
-                Debug.LogError("[NavigationManager] ❌ Generación de NavMesh falló");
+                Debug.Log("[NavManager] ✅ Componentes validados");
             }
+        }
+
+        #endregion
+
+        #region Events
+
+        private void SubscribeEvents()
+        {
+            EventBus.Instance?.Subscribe<ModelLoadedEvent>(OnModelLoaded);
+            EventBus.Instance?.Subscribe<NavigationStartedEvent>(OnNavigationStarted);
+            EventBus.Instance?.Subscribe<NavigationCompletedEvent>(OnNavigationCompleted);
+            EventBus.Instance?.Subscribe<NavigationCancelledEvent>(OnNavigationCancelled);
+        }
+
+        private void UnsubscribeEvents()
+        {
+            EventBus.Instance?.Unsubscribe<ModelLoadedEvent>(OnModelLoaded);
+            EventBus.Instance?.Unsubscribe<NavigationStartedEvent>(OnNavigationStarted);
+            EventBus.Instance?.Unsubscribe<NavigationCompletedEvent>(OnNavigationCompleted);
+            EventBus.Instance?.Unsubscribe<NavigationCancelledEvent>(OnNavigationCancelled);
+        }
+
+        private void OnModelLoaded(ModelLoadedEvent evt)
+        {
+            LogEvent($"📦 Modelo cargado: {evt.ModelName}");
+            ChangeState(AppMode.ModelPlacement);
+        }
+
+        private void OnNavigationStarted(NavigationStartedEvent evt)
+        {
+            LogEvent($"🧭 Navegación iniciada: {evt.DestinationWaypointId}");
+            ChangeState(AppMode.Navigation);
+        }
+
+        private void OnNavigationCompleted(NavigationCompletedEvent evt)
+        {
+            LogEvent($"✅ Navegación completada: {evt.TotalTime:F1}s");
+            ChangeState(AppMode.WaypointPlacement);
+        }
+
+        private void OnNavigationCancelled(NavigationCancelledEvent evt)
+        {
+            LogEvent($"🛑 Navegación cancelada: {evt.Reason}");
+            ChangeState(AppMode.WaypointPlacement);
         }
 
         #endregion
 
         #region Initialization
 
-        private void ValidateAndFindComponents()
-        {
-            // Auto-buscar componentes existentes
-            if (_arSessionManager == null)
-                _arSessionManager = FindFirstObjectByType<ARSessionManager>();
-
-            if (_waypointManager == null)
-                _waypointManager = FindFirstObjectByType<WaypointManager>();
-
-            if (_modelLoadManager == null)
-                _modelLoadManager = FindFirstObjectByType<ModelLoadManager>();
-
-            if (_placementController == null)
-                _placementController = FindFirstObjectByType<PlacementController>();
-
-            if (_navMeshGenerator == null)
-                _navMeshGenerator = FindFirstObjectByType<NavMeshGenerator>();
-
-            if (_navigationAgent == null)
-                _navigationAgent = FindFirstObjectByType<NavigationAgent>();
-
-            if (_uiManager == null)
-                _uiManager = FindFirstObjectByType<UIManager>();
-
-            if (_persistenceManager == null)
-                _persistenceManager = FindFirstObjectByType<PersistenceManager>();
-
-            // ✅ NUEVO: Buscar componentes de navegación
-            if (_walkableSurfaceGenerator == null)
-                _walkableSurfaceGenerator = FindFirstObjectByType<RobustWalkableSurfaceGenerator>();
-
-            if (_agentFloorPlacement == null)
-                _agentFloorPlacement = FindFirstObjectByType<AgentFloorPlacement>();
-
-            // Validar componentes críticos
-            ValidateCriticalComponents();
-        }
-
-        private void ValidateCriticalComponents()
-        {
-            bool hasErrors = false;
-
-            if (_arSessionManager == null)
-            {
-                Debug.LogError("[NavigationManager] ARSessionManager no encontrado.");
-                hasErrors = true;
-            }
-
-            if (_waypointManager == null)
-            {
-                Debug.LogError("[NavigationManager] WaypointManager no encontrado.");
-                hasErrors = true;
-            }
-
-            if (_navMeshGenerator == null && _walkableSurfaceGenerator == null)
-            {
-                Debug.LogError("[NavigationManager] Ningún generador de NavMesh encontrado.");
-                hasErrors = true;
-            }
-
-            // ✅ NUEVO: Validar componentes de navegación
-            if (_walkableSurfaceGenerator == null)
-            {
-                Debug.LogWarning("[NavigationManager] ⚠️ RobustWalkableSurfaceGenerator no encontrado. Usando NavMeshGenerator legacy.");
-            }
-
-            if (_agentFloorPlacement == null)
-            {
-                Debug.LogWarning("[NavigationManager] ⚠️ AgentFloorPlacement no encontrado. Posicionamiento automático deshabilitado.");
-            }
-
-            if (hasErrors)
-            {
-                Debug.LogError("[NavigationManager] Componentes críticos faltantes. Sistema no se iniciará.");
-                enabled = false;
-            }
-            else
-            {
-                Debug.Log("[NavigationManager] ✅ Todos los componentes críticos validados.");
-            }
-        }
-
-        /// <summary>
-        /// Inicializa todo el sistema de forma secuencial.
-        /// </summary>
         public async Task<bool> Initialize()
         {
             if (_isInitialized)
             {
-                Debug.LogWarning("[NavigationManager] Sistema ya inicializado.");
+                Debug.LogWarning("[NavManager] ⚠️ Ya inicializado");
                 return true;
             }
 
             try
             {
-                Debug.Log("[NavigationManager] 🚀 Iniciando sistema de navegación AR...");
+                Debug.Log("[NavManager] ═══════════════════════════");
+                Debug.Log("[NavManager] 🚀 INICIANDO SISTEMA AR");
+                Debug.Log("[NavManager] ═══════════════════════════");
 
                 ChangeState(AppMode.Initialization);
 
-                // Paso 1: Inicializar AR
+                // PASO 1: AR Session
                 await InitializeAR();
 
-                // Paso 2: Cargar sesión anterior si está habilitado (opcional)
+                // PASO 2: Cargar sesión previa (opcional)
                 if (_loadPreviousSession && _persistenceManager != null)
                 {
-                    Debug.Log("[NavigationManager] Cargando sesión anterior...");
+                    Debug.Log("[NavManager] 📂 Cargando sesión...");
                     await _persistenceManager.LoadSession();
                 }
 
-                // Paso 3: Cargar modelo predeterminado si está configurado
-                if (_loadDefaultModelOnStart && _modelLoadManager != null)
+                // PASO 3: Cambiar a detección de planos
+                ChangeState(AppMode.PlaneDetection);
+
+                // PASO 4: Auto-cargar modelo (opcional)
+                if (_autoLoadModel && _modelLoadManager != null)
                 {
-                    Debug.Log("[NavigationManager] Cargando modelo predeterminado...");
-                    bool modelLoaded = await LoadDefaultModel();
-                    
-                    if (!modelLoaded)
-                    {
-                        Debug.LogWarning("[NavigationManager] ⚠️ No se pudo cargar modelo predeterminado.");
-                    }
-                }
-                else
-                {
-                    // Si no se carga modelo, ir a detección de planos
-                    ChangeState(AppMode.PlaneDetection);
+                    Debug.Log("[NavManager] 📦 Cargando modelo automáticamente...");
+                    await Task.Delay(1000); // Esperar planos
+                    await _modelLoadManager.LoadModelOnLargestPlaneAsync();
                 }
 
                 _isInitialized = true;
 
-                EventBus.Instance.Publish(new ShowMessageEvent
-                {
-                    Message = "Sistema iniciado correctamente.",
-                    Type = MessageType.Success,
-                    Duration = 3f
-                });
+                PublishMessage("Sistema iniciado", MessageType.Success);
 
-                Debug.Log("[NavigationManager] ✅ Sistema inicializado exitosamente.");
+                Debug.Log("[NavManager] ═══════════════════════════");
+                Debug.Log("[NavManager] ✅ SISTEMA LISTO");
+                Debug.Log("[NavManager] ═══════════════════════════");
 
                 return true;
             }
             catch (Exception ex)
             {
-                Debug.LogError($"[NavigationManager] ❌ Error inicializando sistema: {ex.Message}");
-
-                EventBus.Instance.Publish(new ShowMessageEvent
-                {
-                    Message = "Error al inicializar sistema.",
-                    Type = MessageType.Error,
-                    Duration = 5f
-                });
-
+                Debug.LogError($"[NavManager] ❌ Error: {ex.Message}");
+                PublishMessage("Error inicializando sistema", MessageType.Error);
                 return false;
             }
         }
@@ -299,14 +263,13 @@ namespace IndoorNavAR.Core
         {
             if (_arSessionManager == null)
             {
-                Debug.LogWarning("[NavigationManager] ARSessionManager no disponible. Saltando inicialización AR.");
+                Debug.LogWarning("[NavManager] ⚠️ ARSessionManager no disponible");
                 return;
             }
 
-            Debug.Log("[NavigationManager] Esperando AR Session...");
+            Debug.Log("[NavManager] 📡 Esperando AR Session...");
 
-            // Esperar a que AR esté listo
-            int timeout = 10; // 10 segundos
+            int timeout = 10;
             while (!_arSessionManager.IsSessionReady && timeout > 0)
             {
                 await Task.Delay(1000);
@@ -315,281 +278,61 @@ namespace IndoorNavAR.Core
 
             if (!_arSessionManager.IsSessionReady)
             {
-                throw new Exception("AR Session no se pudo inicializar en tiempo límite.");
+                throw new Exception("AR Session timeout");
             }
 
-            Debug.Log("[NavigationManager] ✅ AR Session inicializada.");
+            Debug.Log("[NavManager] ✅ AR Session lista");
         }
 
         #endregion
 
         #region State Management
 
-        /// <summary>
-        /// Cambia el estado de la aplicación.
-        /// </summary>
         public void ChangeState(AppMode newState)
         {
-            AppMode previousState = _currentState;
+            var prevState = _currentState;
             _currentState = newState;
 
-            EventBus.Instance.Publish(new AppModeChangedEvent
+            EventBus.Instance?.Publish(new AppModeChangedEvent
             {
-                PreviousMode = previousState,
+                PreviousMode = prevState,
                 NewMode = newState
             });
 
-            // Actualizar UI
-            if (_uiManager != null)
-            {
-                _uiManager.SetAppMode(newState);
-            }
-
-            Debug.Log($"[NavigationManager] Estado: {previousState} → {newState}");
+            LogEvent($"🔄 Estado: {prevState} → {newState}");
         }
 
         #endregion
 
-        #region Public API - Waypoints
+        #region Model Management
 
-        /// <summary>
-        /// Activa/desactiva el modo de colocación de waypoints.
-        /// </summary>
-        public void ToggleWaypointPlacement(bool enabled)
-        {
-            if (_placementController != null)
-            {
-                _placementController.TogglePlacementMode(enabled);
-
-                if (enabled)
-                {
-                    ChangeState(AppMode.WaypointPlacement);
-                }
-            }
-        }
-
-        /// <summary>
-        /// Configura un waypoint específico.
-        /// </summary>
-        public void ConfigureWaypoint(Data.WaypointData waypoint)
-        {
-            if (_uiManager != null)
-            {
-                _uiManager.ShowWaypointConfigPanel(waypoint);
-                ChangeState(AppMode.WaypointConfiguration);
-            }
-        }
-
-        /// <summary>
-        /// Elimina todos los waypoints.
-        /// </summary>
-        public void ClearAllWaypoints()
-        {
-            if (_waypointManager != null)
-            {
-                _waypointManager.ClearAllWaypoints();
-            }
-        }
-
-        #endregion
-
-        #region Public API - Models
-
-        /// <summary>
-        /// Carga el modelo predeterminado configurado en ModelLoadManager.
-        /// ✅ MEJORADO: Maneja el pipeline completo con eventos
-        /// </summary>
-        public async Task<bool> LoadDefaultModel()
+        public async Task<bool> LoadModelOnLargestPlane()
         {
             if (_modelLoadManager == null)
             {
-                Debug.LogError("[NavigationManager] ModelLoadManager no disponible.");
-                return false;
-            }
-
-            if (!_modelLoadManager.HasDefaultModel())
-            {
-                Debug.LogWarning("[NavigationManager] No hay modelo predeterminado configurado.");
+                Debug.LogWarning("[NavManager] ⚠️ ModelLoadManager no disponible");
                 return false;
             }
 
             ChangeState(AppMode.ModelPlacement);
-
-            // Intentar cargar en el plano más grande
-            bool success = await _modelLoadManager.LoadDefaultModelOnLargestPlane();
-
-            if (success)
-            {
-                Debug.Log("[NavigationManager] ✅ Modelo cargado exitosamente.");
-                
-                // El evento ModelLoadedEvent disparará la generación de NavMesh
-                // si _autoGenerateNavMesh está habilitado
-            }
-            else
-            {
-                Debug.LogError("[NavigationManager] ❌ Error cargando modelo.");
-                ChangeState(AppMode.PlaneDetection);
-            }
-
-            return success;
+            return await _modelLoadManager.LoadModelOnLargestPlaneAsync();
         }
 
-        /// <summary>
-        /// Carga un modelo desde Resources por nombre.
-        /// </summary>
-        public async Task<bool> LoadModel(string modelName)
-        {
-            if (_modelLoadManager == null)
-                return false;
-
-            ChangeState(AppMode.ModelPlacement);
-
-            bool success = await _modelLoadManager.LoadModelOnLargestPlane(modelName);
-
-            if (success)
-            {
-                Debug.Log($"[NavigationManager] ✅ Modelo '{modelName}' cargado.");
-            }
-            else
-            {
-                Debug.LogError($"[NavigationManager] ❌ Error cargando modelo '{modelName}'.");
-                ChangeState(AppMode.PlaneDetection);
-            }
-
-            return success;
-        }
-
-        /// <summary>
-        /// Descarga el modelo actual.
-        /// </summary>
         public void UnloadModel()
         {
-            if (_modelLoadManager != null)
-            {
-                _modelLoadManager.UnloadCurrentModel();
-            }
+            _modelLoadManager?.UnloadCurrentModel();
             
-            // Limpiar NavMesh también
-            ClearNavMesh();
-        }
-
-        #endregion
-
-        #region Public API - NavMesh
-
-        /// <summary>
-        /// ✅ NUEVO: Genera NavMesh con delay configurable
-        /// </summary>
-        private async Task GenerateNavMeshDelayed()
-        {
-            if (_isProcessingNavMesh)
-            {
-                Debug.LogWarning("[NavigationManager] ⚠️ Generación de NavMesh ya en progreso.");
-                return;
-            }
-
-            _isProcessingNavMesh = true;
-
-            Debug.Log($"[NavigationManager] Esperando {_navMeshGenerationDelay}s antes de generar NavMesh...");
-            await Task.Delay((int)(_navMeshGenerationDelay * 1000));
-
-            await GenerateNavMesh();
-        }
-
-        /// <summary>
-        /// Genera o regenera el NavMesh.
-        /// ✅ MEJORADO: Usa RobustWalkableSurfaceGenerator si está disponible
-        /// </summary>
-        public async Task<bool> GenerateNavMesh()
-        {
-            if (_isProcessingNavMesh)
-            {
-                Debug.LogWarning("[NavigationManager] ⚠️ Generación de NavMesh ya en progreso.");
-                return false;
-            }
-
-            _isProcessingNavMesh = true;
-
-            try
-            {
-                Debug.Log("[NavigationManager] 🔨 Generando NavMesh...");
-
-                bool success = false;
-
-                // ✅ PRIORIDAD: Usar RobustWalkableSurfaceGenerator (con detección de paredes)
-                if (_walkableSurfaceGenerator != null)
-                {
-                    Debug.Log("[NavigationManager] Usando RobustWalkableSurfaceGenerator (con detección de paredes)");
-                    success = await _walkableSurfaceGenerator.GenerateWalkableSurfaceAsync();
-                }
-                // FALLBACK: Usar NavMeshGenerator legacy
-                else if (_navMeshGenerator != null)
-                {
-                    Debug.Log("[NavigationManager] Usando NavMeshGenerator legacy");
-                    success = await _navMeshGenerator.RegenerateNavMesh();
-                }
-                else
-                {
-                    Debug.LogError("[NavigationManager] ❌ No hay generador de NavMesh disponible.");
-                    _isProcessingNavMesh = false;
-                    return false;
-                }
-
-                if (success)
-                {
-                    Debug.Log("[NavigationManager] ✅ NavMesh generado exitosamente.");
-
-                    EventBus.Instance.Publish(new ShowMessageEvent
-                    {
-                        Message = "Navegación lista. Puedes seleccionar un destino.",
-                        Type = MessageType.Success,
-                        Duration = 3f
-                    });
-                }
-                else
-                {
-                    Debug.LogError("[NavigationManager] ❌ Generación de NavMesh falló.");
-                    _isProcessingNavMesh = false;
-                }
-
-                return success;
-            }
-            catch (Exception ex)
-            {
-                Debug.LogError($"[NavigationManager] ❌ Error generando NavMesh: {ex.Message}");
-                _isProcessingNavMesh = false;
-                return false;
-            }
-        }
-
-        /// <summary>
-        /// Limpia el NavMesh generado.
-        /// </summary>
-        public void ClearNavMesh()
-        {
-            // Limpiar con RobustWalkableSurfaceGenerator
             if (_walkableSurfaceGenerator != null)
             {
                 _walkableSurfaceGenerator.Clear();
             }
-            
-            // Limpiar con NavMeshGenerator legacy
-            if (_navMeshGenerator != null)
-            {
-                _navMeshGenerator.ClearNavMesh();
-            }
-
-            _isProcessingNavMesh = false;
         }
 
         #endregion
 
-        #region Public API - Navigation
+        #region Navigation
 
-        /// <summary>
-        /// Inicia navegación hacia un waypoint.
-        /// </summary>
-        public bool NavigateToWaypoint(Data.WaypointData waypoint)
+        public bool NavigateToWaypoint(WaypointData waypoint)
         {
             if (_navigationAgent == null || waypoint == null)
                 return false;
@@ -598,248 +341,113 @@ namespace IndoorNavAR.Core
 
             if (success)
             {
-                ChangeState(AppMode.Navigation);
-                
-                Debug.Log($"[NavigationManager] 🧭 Navegación iniciada hacia: {waypoint.WaypointName}");
-            }
-            else
-            {
-                Debug.LogError($"[NavigationManager] ❌ No se pudo iniciar navegación hacia: {waypoint.WaypointName}");
+                Debug.Log($"[NavManager] 🧭 Navegando a: {waypoint.WaypointName}");
             }
 
             return success;
         }
 
-        /// <summary>
-        /// Detiene la navegación actual.
-        /// </summary>
         public void StopNavigation()
         {
-            if (_navigationAgent != null)
+            _navigationAgent?.StopNavigation("Usuario canceló");
+        }
+
+        #endregion
+
+        #region Waypoints
+
+        public void ToggleWaypointPlacement(bool enabled)
+        {
+            if (_placementController != null)
             {
-                _navigationAgent.StopNavigation("Usuario detuvo navegación");
-                ChangeState(AppMode.WaypointPlacement);
+                _placementController.TogglePlacementMode(enabled);
                 
-                Debug.Log("[NavigationManager] 🛑 Navegación detenida.");
+                if (enabled)
+                {
+                    ChangeState(AppMode.WaypointPlacement);
+                }
             }
         }
 
-        /// <summary>
-        /// Abre el panel de navegación para seleccionar destino.
-        /// </summary>
-        public void OpenNavigationPanel()
+        public void ClearAllWaypoints()
         {
-            if (_uiManager != null)
-            {
-                _uiManager.ShowNavigationPanel();
-            }
+            _waypointManager?.ClearAllWaypoints();
         }
 
         #endregion
 
-        #region Public API - Agent Placement
+        #region System Control
 
-        /// <summary>
-        /// ✅ NUEVO: Posiciona el agente manualmente en el piso real
-        /// </summary>
-        public void PlaceAgentOnFloor()
-        {
-            if (_agentFloorPlacement != null)
-            {
-                _agentFloorPlacement.PlaceAgentOnFloor();
-            }
-            else
-            {
-                Debug.LogWarning("[NavigationManager] AgentFloorPlacement no disponible.");
-            }
-        }
-
-        #endregion
-
-        #region Public API - Persistence
-
-        /// <summary>
-        /// Guarda la sesión actual.
-        /// </summary>
-        public async Task<bool> SaveSession()
-        {
-            if (_persistenceManager == null)
-                return false;
-
-            return await _persistenceManager.SaveSession();
-        }
-
-        /// <summary>
-        /// Carga la sesión guardada.
-        /// </summary>
-        public async Task<bool> LoadSession()
-        {
-            if (_persistenceManager == null)
-                return false;
-
-            return await _persistenceManager.LoadSession();
-        }
-
-        /// <summary>
-        /// Limpia la sesión guardada.
-        /// </summary>
-        public void ClearSavedSession()
-        {
-            if (_persistenceManager != null)
-            {
-                _persistenceManager.ClearSavedData();
-            }
-        }
-
-        #endregion
-
-        #region Public API - AR Controls
-
-        /// <summary>
-        /// Alterna visualización de planos AR.
-        /// </summary>
-        public void TogglePlaneVisualization(bool show)
-        {
-            if (_arSessionManager != null)
-            {
-                _arSessionManager.TogglePlaneVisualization(show);
-            }
-        }
-
-        /// <summary>
-        /// Limpia todos los planos AR detectados.
-        /// </summary>
-        public void ClearAllPlanes()
-        {
-            if (_arSessionManager != null)
-            {
-                _arSessionManager.ClearAllPlanes();
-            }
-        }
-
-        #endregion
-
-        #region Complete Reset
-
-        /// <summary>
-        /// Resetea todo el sistema al estado inicial.
-        /// </summary>
         public void ResetSystem()
         {
-            Debug.Log("[NavigationManager] 🔄 Reseteando sistema completo...");
+            Debug.Log("[NavManager] 🔄 Reseteando sistema...");
 
-            // Detener navegación
             StopNavigation();
-
-            // Limpiar waypoints
             ClearAllWaypoints();
-
-            // Limpiar NavMesh
-            ClearNavMesh();
-
-            // Descargar modelo
             UnloadModel();
-
-            // Desactivar colocación
             ToggleWaypointPlacement(false);
-
-            // Cambiar a estado inicial
+            
             ChangeState(AppMode.PlaneDetection);
 
-            EventBus.Instance.Publish(new ShowMessageEvent
-            {
-                Message = "Sistema reseteado.",
-                Type = MessageType.Info,
-                Duration = 2f
-            });
+            PublishMessage("Sistema reseteado", MessageType.Info);
+        }
 
-            Debug.Log("[NavigationManager] ✅ Sistema reseteado completamente.");
+        #endregion
+
+        #region Utilities
+
+        private void LogEvent(string msg)
+        {
+            if (_logDetailedEvents)
+            {
+                Debug.Log($"[NavManager] {msg}");
+            }
+        }
+
+        private void Log(string msg)
+        {
+            Debug.Log($"[NavManager] {msg}");
+        }
+
+        private void PublishMessage(string msg, MessageType type)
+        {
+            EventBus.Instance?.Publish(new ShowMessageEvent
+            {
+                Message = msg,
+                Type = type,
+                Duration = type == MessageType.Error ? 5f : 3f
+            });
         }
 
         #endregion
 
         #region Debug
 
-        [ContextMenu("Debug: Complete System Info")]
-        private void DebugSystemInfo()
+        [ContextMenu("ℹ️ System Info")]
+        private void DebugInfo()
         {
-            Debug.Log("========== NAVIGATION SYSTEM INFO ==========");
-            Debug.Log($"Estado actual: {_currentState}");
+            Debug.Log("══════════════════════════════");
+            Debug.Log("NAVIGATION SYSTEM INFO");
+            Debug.Log("══════════════════════════════");
+            Debug.Log($"Estado: {_currentState}");
             Debug.Log($"Inicializado: {_isInitialized}");
-            Debug.Log($"Procesando NavMesh: {_isProcessingNavMesh}");
-            Debug.Log("");
-            Debug.Log("--- Componentes AR ---");
-            Debug.Log($"AR Session Ready: {_arSessionManager?.IsSessionReady ?? false}");
-            Debug.Log($"Planos detectados: {_arSessionManager?.DetectedPlaneCount ?? 0}");
-            Debug.Log("");
-            Debug.Log("--- Modelo ---");
-            Debug.Log($"Modelo cargado: {_modelLoadManager?.IsModelLoaded ?? false}");
-            Debug.Log($"Nombre: {_modelLoadManager?.CurrentModelName ?? "Ninguno"}");
-            Debug.Log("");
-            Debug.Log("--- Navegación ---");
-            Debug.Log($"NavMesh generado: {(_walkableSurfaceGenerator != null ? "Sí (Robust)" : (_navMeshGenerator != null ? "Sí (Legacy)" : "No"))}");
+            Debug.Log($"AR Ready: {_arSessionManager?.IsSessionReady ?? false}");
+            Debug.Log($"Modelo: {_modelLoadManager?.CurrentModelName ?? "None"}");
             Debug.Log($"Waypoints: {_waypointManager?.WaypointCount ?? 0}");
             Debug.Log($"Navegando: {_navigationAgent?.IsNavigating ?? false}");
-            Debug.Log("");
-            Debug.Log("--- Nuevo Sistema ---");
-            Debug.Log($"RobustWalkableSurfaceGenerator: {(_walkableSurfaceGenerator != null ? "✅" : "❌")}");
-            Debug.Log($"AgentFloorPlacement: {(_agentFloorPlacement != null ? "✅" : "❌")}");
-            Debug.Log("===========================================");
+            Debug.Log("══════════════════════════════");
         }
 
-        [ContextMenu("Debug: Quick Setup")]
-        private async void DebugQuickSetup()
+        [ContextMenu("📦 Load Model")]
+        private void DebugLoadModel()
         {
-            Debug.Log("[NavigationManager] 🚀 Ejecutando Quick Setup...");
-
-            // Esperar AR si es necesario
-            if (_arSessionManager != null && !_arSessionManager.IsSessionReady)
-            {
-                Debug.Log("[NavigationManager] Esperando AR Session...");
-                await Task.Delay(2000);
-            }
-
-            // Cargar modelo predeterminado
-            Debug.Log("[NavigationManager] Cargando modelo...");
-            bool modelLoaded = await LoadDefaultModel();
-
-            if (!modelLoaded)
-            {
-                Debug.LogError("[NavigationManager] ❌ Quick Setup falló: No se pudo cargar modelo.");
-                return;
-            }
-
-            // Esperar a que se genere NavMesh automáticamente
-            Debug.Log("[NavigationManager] Esperando generación automática de NavMesh...");
-            
-            int timeout = 20; // 20 segundos máximo
-            while (_isProcessingNavMesh && timeout > 0)
-            {
-                await Task.Delay(500);
-                timeout--;
-            }
-
-            if (timeout == 0)
-            {
-                Debug.LogError("[NavigationManager] ⏰ Timeout esperando NavMesh.");
-            }
-            else
-            {
-                Debug.Log("[NavigationManager] ✅ Quick Setup completado exitosamente.");
-            }
+            _ = LoadModelOnLargestPlane();
         }
 
-        [ContextMenu("Debug: Force NavMesh Generation")]
-        private async void DebugForceNavMesh()
+        [ContextMenu("🔄 Reset")]
+        private void DebugReset()
         {
-            Debug.Log("[NavigationManager] 🔨 Forzando generación de NavMesh...");
-            await GenerateNavMesh();
-        }
-
-        [ContextMenu("Debug: Place Agent on Floor")]
-        private void DebugPlaceAgent()
-        {
-            PlaceAgentOnFloor();
+            ResetSystem();
         }
 
         #endregion

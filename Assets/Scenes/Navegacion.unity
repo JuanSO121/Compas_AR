@@ -513,13 +513,15 @@ MonoBehaviour:
   m_Script: {fileID: 11500000, guid: d000e279b704cbf41bc50119fbf92c7f, type: 3}
   m_Name: 
   m_EditorClassIdentifier: Assembly-CSharp::IndoorNavAR.Navigation.NavMeshAgentCoordinator
-  _navMeshGenerator: {fileID: 0}
+  _walkableSurfaceGenerator: {fileID: 976973327}
   _navigationAgent: {fileID: 446943536}
   _agentFloorPlacement: {fileID: 0}
+  _autoExecuteOnModelLoad: 1
+  _modelLoadDelay: 1
   _placeAgentBeforeNavMesh: 1
   _repositionAfterNavMesh: 1
-  _autoExecuteOnStart: 1
-  _startDelay: 2.5
+  _generationTimeout: 30
+  _maxRetryAttempts: 2
   _logCoordinationSteps: 1
 --- !u!1 &867515506
 GameObject:
@@ -590,7 +592,7 @@ GameObject:
   serializedVersion: 6
   m_Component:
   - component: {fileID: 976973326}
-  - component: {fileID: 976973328}
+  - component: {fileID: 976973327}
   m_Layer: 0
   m_Name: 'NavMeshGenerator '
   m_TagString: Untagged
@@ -613,7 +615,7 @@ Transform:
   m_Children: []
   m_Father: {fileID: 2008524775}
   m_LocalEulerAnglesHint: {x: 0, y: 0, z: 0}
---- !u!114 &976973328
+--- !u!114 &976973327
 MonoBehaviour:
   m_ObjectHideFlags: 0
   m_CorrespondingSourceObject: {fileID: 0}
@@ -622,39 +624,57 @@ MonoBehaviour:
   m_GameObject: {fileID: 976973324}
   m_Enabled: 1
   m_EditorHideFlags: 0
-  m_Script: {fileID: 11500000, guid: d2d593f0f4b5dfe4cb5a9a30e41b7281, type: 3}
+  m_Script: {fileID: 11500000, guid: 8d24d5587bc84a44da457c43351de281, type: 3}
   m_Name: 
-  m_EditorClassIdentifier: Assembly-CSharp::IndoorNavAR.Navigation.RobustWalkableSurfaceGenerator
-  _heightBinSize: 0.07
-  _minClusterDensity: 0.1
-  _maxFloorDeviation: 0.15
-  _surfacePadding: 0.3
-  _surfaceThickness: 0.02
-  _surfaceOffsetBelow: 0.03
-  _wallNormalAngleMin: 45
-  _wallNormalAngleMax: 135
-  _minWallHeight: 0.25
-  _wallVolumeExpansion: 0.15
-  _maxWallHeightAboveFloor: 3
-  _useCarving: 1
-  _ignoreHeightFilter: 1
-  _ignoreFloorDistanceFilter: 1
-  _wallClusterDistance: 0.35
-  _minWallArea: 0.1
-  _minWallTriangles: 3
-  _ignoreElevatedObstacles: 1
-  _elevatedThreshold: 0.35
-  _exclusionExpansion: 0.12
+  m_EditorClassIdentifier: Assembly-CSharp::IndoorNavAR.Navigation.MultiMeshWalkableSurfaceGenerator
+  _heightBinSize: 0.43
+  _minClusterDensity: 0.12
+  _maxFloorDeviation: 0.12
+  _surfacePadding: 0.25
+  _surfaceThickness: 0.01
+  _surfaceOffsetBelow: 0.02
+  _wallAngleMin: 30
+  _wallAngleMax: 150
+  _minWallHeight: 0.8
+  _minWallArea: 0.3
+  _planeNormalTolerance: 0.15
+  _planeDistanceTolerance: 0.3
+  _detectOpenings: 1
+  _minOpeningWidth: 0.7
+  _minFullWallHeight: 2
+  _openingRaycastGridSize: 3
+  _openingRaycastDistance: 2
+  _openingPassThroughThreshold: 0.6
+  _openingDetectionLayers:
+    serializedVersion: 2
+    m_Bits: 4294967295
+  _detectFurnitureInScan: 1
+  _furnitureVoxelSize: 0.15
+  _minFurnitureDensity: 0.3
+  _minFurnitureHeight: 0.3
+  _maxFurnitureHeight: 2.8
+  _minFurnitureArea: 0.1
+  _minFurnitureVolume: 0.05
+  _primaryMesh: {fileID: 0}
+  _proxyMeshes: []
+  _autoFindProxyMeshes: 1
+  _proxyMeshTag: NavMeshObstacle
+  _obstaclePadding: 0.15
+  _obstacleHeightPadding: 0.1
+  _agentRadius: 0.15
+  _agentHeight: 1.8
   _navMeshLayer: 0
   _navMeshAreaNotWalkable: 1
-  _voxelSize: 0.07
-  _minRegionArea: 2
-  _agentRadius: 0.6
-  _agentHeight: 2
-  _scannedMeshFilter: {fileID: 0}
+  _voxelSize: 0.06
+  _minRegionArea: 1
+  _useAsyncBaking: 1
+  _maxObstaclesPerFrame: 10
+  _useLODForDistantObstacles: 1
+  _lodDistanceThreshold: 5
   _showDebugVisualization: 1
-  _logDetailedAnalysis: 0
-  _debugDrawWallNormals: 1
+  _logDetailedAnalysis: 1
+  _enableRuntimeDiagnostics: 1
+  _debugDrawOpeningRaycasts: 1
 --- !u!1 &1001452942
 GameObject:
   m_ObjectHideFlags: 0
@@ -704,17 +724,15 @@ MonoBehaviour:
   _waypointManager: {fileID: 186852594}
   _modelLoadManager: {fileID: 1492072617}
   _placementController: {fileID: 1107925287}
-  _navMeshGenerator: {fileID: 0}
-  _navigationAgent: {fileID: 446943536}
-  _uiManager: {fileID: 0}
   _persistenceManager: {fileID: 0}
-  _walkableSurfaceGenerator: {fileID: 976973328}
+  _walkableSurfaceGenerator: {fileID: 976973327}
+  _navigationAgent: {fileID: 446943536}
+  _navMeshCoordinator: {fileID: 837302032}
   _agentFloorPlacement: {fileID: 0}
   _autoInitialize: 1
   _loadPreviousSession: 0
-  _loadDefaultModelOnStart: 1
-  _autoGenerateNavMesh: 1
-  _navMeshGenerationDelay: 1
+  _autoLoadModel: 1
+  _logDetailedEvents: 0
 --- !u!195 &1001452946
 NavMeshAgent:
   m_ObjectHideFlags: 0
@@ -832,7 +850,7 @@ MonoBehaviour:
   m_Name: 
   m_EditorClassIdentifier: Assembly-CSharp::IndoorNavAR.Testing.KeyboardTestingController
   _waypointManager: {fileID: 186852594}
-  _navMeshGenerator: {fileID: 0}
+  _navMeshGenerator: {fileID: 976973327}
   _navigationAgent: {fileID: 446943536}
   _placementController: {fileID: 1107925287}
   _showInstructions: 1
@@ -1148,12 +1166,11 @@ MonoBehaviour:
   m_Script: {fileID: 11500000, guid: 9396b25d0a374fb46b60074e9271dd8a, type: 3}
   m_Name: 
   m_EditorClassIdentifier: Assembly-CSharp::IndoorNavAR.Core.Managers.ModelLoadManager
-  _defaultModelPrefab: {fileID: 7814779772776263761, guid: 511658880d22f114ea8d41a16c6071d0, type: 3}
-  _resourcesFolder: RoomModels
-  _useResourcesAsBackup: 1
+  _modelPrefab: {fileID: 226538380387124205, guid: 5e7fcbf767a88c8498f641d0feae9db9, type: 3}
   _modelParent: {fileID: 0}
-  _defaultModelScale: 1
+  _defaultScale: 1
   _useARAnchors: 1
+  _autoLoadOnLargestPlane: 0
 --- !u!4 &1492072618
 Transform:
   m_ObjectHideFlags: 0
@@ -1419,7 +1436,7 @@ Transform:
   m_GameObject: {fileID: 1873175135}
   serializedVersion: 2
   m_LocalRotation: {x: 0, y: 0, z: 0, w: 1}
-  m_LocalPosition: {x: 0.1836, y: 0, z: 0.41118}
+  m_LocalPosition: {x: 0, y: 0, z: 0}
   m_LocalScale: {x: 1, y: 1, z: 1}
   m_ConstrainProportionsScale: 0
   m_Children: []
@@ -1492,6 +1509,67 @@ Transform:
   - {fileID: 837302031}
   m_Father: {fileID: 0}
   m_LocalEulerAnglesHint: {x: 0, y: 0, z: 0}
+--- !u!1001 &421001263868042463
+PrefabInstance:
+  m_ObjectHideFlags: 0
+  serializedVersion: 2
+  m_Modification:
+    serializedVersion: 3
+    m_TransformParent: {fileID: 0}
+    m_Modifications:
+    - target: {fileID: 226538380387124205, guid: 5e7fcbf767a88c8498f641d0feae9db9, type: 3}
+      propertyPath: m_Name
+      value: Biblioteca
+      objectReference: {fileID: 0}
+    - target: {fileID: 226538380387124205, guid: 5e7fcbf767a88c8498f641d0feae9db9, type: 3}
+      propertyPath: m_IsActive
+      value: 0
+      objectReference: {fileID: 0}
+    - target: {fileID: 607708702849882455, guid: 5e7fcbf767a88c8498f641d0feae9db9, type: 3}
+      propertyPath: m_LocalPosition.x
+      value: 0
+      objectReference: {fileID: 0}
+    - target: {fileID: 607708702849882455, guid: 5e7fcbf767a88c8498f641d0feae9db9, type: 3}
+      propertyPath: m_LocalPosition.y
+      value: 0
+      objectReference: {fileID: 0}
+    - target: {fileID: 607708702849882455, guid: 5e7fcbf767a88c8498f641d0feae9db9, type: 3}
+      propertyPath: m_LocalPosition.z
+      value: 0
+      objectReference: {fileID: 0}
+    - target: {fileID: 607708702849882455, guid: 5e7fcbf767a88c8498f641d0feae9db9, type: 3}
+      propertyPath: m_LocalRotation.w
+      value: 1
+      objectReference: {fileID: 0}
+    - target: {fileID: 607708702849882455, guid: 5e7fcbf767a88c8498f641d0feae9db9, type: 3}
+      propertyPath: m_LocalRotation.x
+      value: 0
+      objectReference: {fileID: 0}
+    - target: {fileID: 607708702849882455, guid: 5e7fcbf767a88c8498f641d0feae9db9, type: 3}
+      propertyPath: m_LocalRotation.y
+      value: 0
+      objectReference: {fileID: 0}
+    - target: {fileID: 607708702849882455, guid: 5e7fcbf767a88c8498f641d0feae9db9, type: 3}
+      propertyPath: m_LocalRotation.z
+      value: 0
+      objectReference: {fileID: 0}
+    - target: {fileID: 607708702849882455, guid: 5e7fcbf767a88c8498f641d0feae9db9, type: 3}
+      propertyPath: m_LocalEulerAnglesHint.x
+      value: 0
+      objectReference: {fileID: 0}
+    - target: {fileID: 607708702849882455, guid: 5e7fcbf767a88c8498f641d0feae9db9, type: 3}
+      propertyPath: m_LocalEulerAnglesHint.y
+      value: 0
+      objectReference: {fileID: 0}
+    - target: {fileID: 607708702849882455, guid: 5e7fcbf767a88c8498f641d0feae9db9, type: 3}
+      propertyPath: m_LocalEulerAnglesHint.z
+      value: 0
+      objectReference: {fileID: 0}
+    m_RemovedComponents: []
+    m_RemovedGameObjects: []
+    m_AddedGameObjects: []
+    m_AddedComponents: []
+  m_SourcePrefab: {fileID: 100100000, guid: 5e7fcbf767a88c8498f641d0feae9db9, type: 3}
 --- !u!1001 &6053017865874710982
 PrefabInstance:
   m_ObjectHideFlags: 0
@@ -1510,7 +1588,7 @@ PrefabInstance:
       objectReference: {fileID: 0}
     - target: {fileID: 7016565646962738363, guid: d0f916b92dcfab540a9ea711aba44a9b, type: 3}
       propertyPath: m_LocalPosition.y
-      value: 0.308
+      value: 0.289
       objectReference: {fileID: 0}
     - target: {fileID: 7016565646962738363, guid: d0f916b92dcfab540a9ea711aba44a9b, type: 3}
       propertyPath: m_LocalPosition.z
@@ -1564,3 +1642,4 @@ SceneRoots:
   - {fileID: 1873175137}
   - {fileID: 2008524775}
   - {fileID: 6053017865874710982}
+  - {fileID: 421001263868042463}

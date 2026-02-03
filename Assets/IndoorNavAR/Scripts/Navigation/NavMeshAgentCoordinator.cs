@@ -5,129 +5,158 @@ using IndoorNavAR.Core.Events;
 namespace IndoorNavAR.Navigation
 {
     /// <summary>
-    /// Coordina la generación de NavMesh y el posicionamiento correcto del agente.
-    /// ✅ GARANTIZA flujo correcto: detectar piso → generar NavMesh → posicionar agente.
+    /// Coordinador del sistema NavMesh con validación mejorada
+    /// ✅ Compatible con Unity 6 y AR Foundation 6
+    /// ✅ Validación correcta de modelo cargado
+    /// ✅ Gestión inteligente de eventos
     /// </summary>
     public class NavMeshAgentCoordinator : MonoBehaviour
     {
-        [Header("Referencias")]
-        [SerializeField] private NavMeshGenerator _navMeshGenerator;
+        [Header("📦 Componentes")]
+        [SerializeField] private MultiMeshWalkableSurfaceGenerator _walkableSurfaceGenerator;
         [SerializeField] private NavigationAgent _navigationAgent;
         [SerializeField] private AgentFloorPlacement _agentFloorPlacement;
 
-        [Header("Configuración")]
-        [Tooltip("Posicionar agente antes de generar NavMesh")]
+        [Header("⚙️ Configuración")]
+        [SerializeField] private bool _autoExecuteOnModelLoad = true;
+        [SerializeField] private float _modelLoadDelay = 1.0f;
         [SerializeField] private bool _placeAgentBeforeNavMesh = true;
-
-        [Tooltip("Reposicionar agente después de generar NavMesh")]
         [SerializeField] private bool _repositionAfterNavMesh = true;
 
-        [Tooltip("Ejecutar flujo completo al iniciar")]
-        [SerializeField] private bool _autoExecuteOnStart = true;
+        [Header("🔧 Timeouts")]
+        [SerializeField] private float _generationTimeout = 30f;
+        [SerializeField] private int _maxRetryAttempts = 2;
 
-        [Tooltip("Delay antes de ejecutar (segundos)")]
-        [SerializeField] private float _startDelay = 2.5f;
-
-        [Header("Debug")]
+        [Header("🐛 Debug")]
         [SerializeField] private bool _logCoordinationSteps = true;
 
         private bool _isExecuting;
+        private bool _isInitialized;
+        private GameObject _lastLoadedModel;
 
         #region Unity Lifecycle
 
         private void Awake()
         {
-            ValidateComponents();
+            FindComponents();
         }
 
-        private void Start()
+        private void OnEnable()
         {
-            if (_autoExecuteOnStart)
-            {
-                Invoke(nameof(ExecuteFullSetupAsync), _startDelay);
-            }
+            EventBus.Instance?.Subscribe<ModelLoadedEvent>(OnModelLoaded);
+        }
+
+        private void OnDisable()
+        {
+            EventBus.Instance?.Unsubscribe<ModelLoadedEvent>(OnModelLoaded);
         }
 
         #endregion
 
-        #region Validation
+        #region Component Discovery
 
-        private void ValidateComponents()
+        private void FindComponents()
         {
-            bool hasErrors = false;
+            Log("🔍 Buscando componentes...");
 
-            if (_navMeshGenerator == null)
+            if (_walkableSurfaceGenerator == null)
             {
-                _navMeshGenerator = FindFirstObjectByType<NavMeshGenerator>();
-                if (_navMeshGenerator == null)
-                {
-                    Debug.LogError("[NavMeshAgentCoordinator] NavMeshGenerator no encontrado");
-                    hasErrors = true;
-                }
+                _walkableSurfaceGenerator = FindFirstObjectByType<MultiMeshWalkableSurfaceGenerator>();
             }
 
             if (_navigationAgent == null)
             {
                 _navigationAgent = FindFirstObjectByType<NavigationAgent>();
-                if (_navigationAgent == null)
-                {
-                    Debug.LogError("[NavMeshAgentCoordinator] NavigationAgent no encontrado");
-                    hasErrors = true;
-                }
             }
 
             if (_agentFloorPlacement == null)
             {
-                // Intentar obtener del NavigationAgent
-                if (_navigationAgent != null)
-                {
-                    _agentFloorPlacement = _navigationAgent.GetComponent<AgentFloorPlacement>();
-                }
-
-                // Si no existe, agregarlo automáticamente
+                _agentFloorPlacement = FindFirstObjectByType<AgentFloorPlacement>();
+                
+                // Auto-crear si no existe
                 if (_agentFloorPlacement == null && _navigationAgent != null)
                 {
-                    Debug.Log("[NavMeshAgentCoordinator] Agregando AgentFloorPlacement al NavigationAgent...");
                     _agentFloorPlacement = _navigationAgent.gameObject.AddComponent<AgentFloorPlacement>();
-                }
-
-                if (_agentFloorPlacement == null)
-                {
-                    Debug.LogError("[NavMeshAgentCoordinator] No se pudo configurar AgentFloorPlacement");
-                    hasErrors = true;
+                    Log("📍 AgentFloorPlacement creado automáticamente");
                 }
             }
 
-            if (hasErrors)
+            ValidateComponents();
+        }
+
+        private void ValidateComponents()
+        {
+            bool valid = true;
+
+            if (_walkableSurfaceGenerator == null)
             {
+                Debug.LogError("[Coordinator] ❌ MultiMeshWalkableSurfaceGenerator faltante");
+                valid = false;
+            }
+
+            if (_navigationAgent == null)
+            {
+                Debug.LogError("[Coordinator] ❌ NavigationAgent faltante");
+                valid = false;
+            }
+
+            if (!valid)
+            {
+                Debug.LogError("[Coordinator] ❌ Sistema deshabilitado - componentes críticos faltantes");
                 enabled = false;
+                return;
             }
-            else
-            {
-                Debug.Log("[NavMeshAgentCoordinator] ✅ Componentes validados correctamente");
-            }
+
+            Debug.Log("[Coordinator] ✅ Componentes validados");
+            _isInitialized = true;
         }
 
         #endregion
 
-        #region Full Setup Flow
+        #region Event Handlers
 
-        private async void ExecuteFullSetupAsync()
+        private async void OnModelLoaded(ModelLoadedEvent evt)
         {
+            if (!_autoExecuteOnModelLoad)
+            {
+                Log($"📦 Modelo cargado: {evt.ModelName} (auto-execute OFF)");
+                return;
+            }
+
+            Log($"📦 Modelo cargado: {evt.ModelName}");
+            _lastLoadedModel = evt.ModelInstance;
+
+            // Esperar estabilización
+            Log($"⏳ Esperando {_modelLoadDelay}s...");
+            await Task.Delay((int)(_modelLoadDelay * 1000));
+
+            // Ejecutar setup
             await ExecuteFullSetup();
         }
 
-        /// <summary>
-        /// Ejecuta el flujo completo de configuración:
-        /// 1. Posicionar agente sobre el piso
-        /// 2. Generar NavMesh
-        /// 3. Reposicionar agente en NavMesh
-        /// </summary>
+        #endregion
+
+        #region Main Flow
+
         public async Task<bool> ExecuteFullSetup()
         {
+            if (!_isInitialized)
+            {
+                Debug.LogError("[Coordinator] ❌ No inicializado");
+                return false;
+            }
+
             if (_isExecuting)
             {
-                Debug.LogWarning("[NavMeshAgentCoordinator] Setup ya en ejecución");
+                Debug.LogWarning("[Coordinator] ⚠️ Ya ejecutando");
+                return false;
+            }
+
+            // Validar modelo
+            if (!IsModelLoaded())
+            {
+                Debug.LogError("[Coordinator] ❌ No hay modelo cargado");
+                PublishMessage("Carga un modelo 3D primero", MessageType.Warning);
                 return false;
             }
 
@@ -135,78 +164,48 @@ namespace IndoorNavAR.Navigation
 
             try
             {
-                if (_logCoordinationSteps)
+                Log("═══════════════════════════════");
+                Log("🚀 INICIANDO SETUP NAVEGACIÓN");
+                Log("═══════════════════════════════");
+
+                // PASO 1: Posicionar agente (pre-NavMesh)
+                if (_placeAgentBeforeNavMesh && _agentFloorPlacement != null)
                 {
-                    Debug.Log("[NavMeshAgentCoordinator] ==========================================");
-                    Debug.Log("[NavMeshAgentCoordinator] 🚀 INICIANDO CONFIGURACIÓN COMPLETA");
-                    Debug.Log("[NavMeshAgentCoordinator] ==========================================");
-                }
-
-                // PASO 1: Posicionar agente ANTES de generar NavMesh
-                if (_placeAgentBeforeNavMesh)
-                {
-                    if (_logCoordinationSteps)
-                    {
-                        Debug.Log("[NavMeshAgentCoordinator] 📍 PASO 1: Posicionando agente sobre el piso...");
-                    }
-
-                    bool agentPlaced = _agentFloorPlacement.PlaceAgentOnFloor();
-                    
-                    if (!agentPlaced)
-                    {
-                        Debug.LogError("[NavMeshAgentCoordinator] ❌ Error posicionando agente");
-                        return false;
-                    }
-
-                    await Task.Delay(100); // Pequeño delay para estabilización
+                    Log("📍 [1/3] Posicionando agente...");
+                    _agentFloorPlacement.PlaceAgentOnFloor();
+                    await Task.Delay(100);
                 }
 
                 // PASO 2: Generar NavMesh
-                if (_logCoordinationSteps)
-                {
-                    Debug.Log("[NavMeshAgentCoordinator] 🔨 PASO 2: Generando NavMesh...");
-                }
+                Log("🔨 [2/3] Generando NavMesh...");
+                bool success = await GenerateNavMeshWithRetry();
 
-                bool navMeshGenerated = await _navMeshGenerator.GenerateAdvancedNavMesh();
-
-                if (!navMeshGenerated)
+                if (!success)
                 {
-                    Debug.LogError("[NavMeshAgentCoordinator] ❌ Error generando NavMesh");
+                    Debug.LogError("[Coordinator] ❌ Falló generación NavMesh");
+                    PublishMessage("Error generando navegación", MessageType.Error);
                     return false;
                 }
 
-                // PASO 3: Reposicionar agente DESPUÉS de NavMesh (ajuste fino)
-                if (_repositionAfterNavMesh)
+                // PASO 3: Ajustar agente (post-NavMesh)
+                if (_repositionAfterNavMesh && _agentFloorPlacement != null)
                 {
-                    if (_logCoordinationSteps)
-                    {
-                        Debug.Log("[NavMeshAgentCoordinator] 🎯 PASO 3: Ajustando posición del agente en NavMesh...");
-                    }
-
-                    await Task.Delay(200); // Esperar a que NavMesh se consolide
-
+                    Log("🎯 [3/3] Ajustando agente en NavMesh...");
+                    await Task.Delay(200);
                     _agentFloorPlacement.RepositionAgent();
                 }
 
-                if (_logCoordinationSteps)
-                {
-                    Debug.Log("[NavMeshAgentCoordinator] ==========================================");
-                    Debug.Log("[NavMeshAgentCoordinator] ✅ CONFIGURACIÓN COMPLETA EXITOSA");
-                    Debug.Log("[NavMeshAgentCoordinator] ==========================================");
-                }
+                Log("═══════════════════════════════");
+                Log("✅ SETUP COMPLETADO");
+                Log("═══════════════════════════════");
 
-                EventBus.Instance.Publish(new ShowMessageEvent
-                {
-                    Message = "Sistema de navegación listo",
-                    Type = MessageType.Success,
-                    Duration = 3f
-                });
-
+                PublishMessage("Sistema de navegación listo", MessageType.Success);
                 return true;
             }
             catch (System.Exception ex)
             {
-                Debug.LogError($"[NavMeshAgentCoordinator] ❌ Error en setup: {ex.Message}\n{ex.StackTrace}");
+                Debug.LogError($"[Coordinator] ❌ Error: {ex.Message}");
+                PublishMessage("Error en setup", MessageType.Error);
                 return false;
             }
             finally
@@ -217,108 +216,146 @@ namespace IndoorNavAR.Navigation
 
         #endregion
 
-        #region Public API
+        #region NavMesh Generation
 
-        /// <summary>
-        /// Regenera todo el sistema (útil al cambiar de mapa).
-        /// </summary>
-        public async Task<bool> RegenerateAll()
+        private async Task<bool> GenerateNavMeshWithRetry()
         {
-            if (_logCoordinationSteps)
+            for (int i = 0; i < _maxRetryAttempts; i++)
             {
-                Debug.Log("[NavMeshAgentCoordinator] 🔄 Regenerando sistema completo...");
+                if (i > 0)
+                {
+                    Log($"⚠️ Reintento {i + 1}/{_maxRetryAttempts}");
+                    await Task.Delay(1000);
+                }
+
+                bool success = await GenerateWithTimeout();
+                if (success) return true;
             }
 
-            // Limpiar NavMesh anterior
-            _navMeshGenerator.ClearNavMesh();
-
-            await Task.Delay(100);
-
-            // Ejecutar setup completo
-            return await ExecuteFullSetup();
+            return false;
         }
 
-        /// <summary>
-        /// Solo posiciona el agente (sin regenerar NavMesh).
-        /// </summary>
-        public bool RepositionAgentOnly()
+        private async Task<bool> GenerateWithTimeout()
         {
-            if (_logCoordinationSteps)
+            var genTask = _walkableSurfaceGenerator.GenerateWalkableSurfaceAsync();
+            var timeoutTask = Task.Delay((int)(_generationTimeout * 1000));
+
+            var completed = await Task.WhenAny(genTask, timeoutTask);
+
+            if (completed == timeoutTask)
             {
-                Debug.Log("[NavMeshAgentCoordinator] 📍 Reposicionando solo el agente...");
+                Debug.LogError("[Coordinator] ⏰ Timeout");
+                return false;
             }
 
-            return _agentFloorPlacement.PlaceAgentOnFloor();
-        }
-
-        /// <summary>
-        /// Solo regenera el NavMesh (sin mover el agente).
-        /// </summary>
-        public async Task<bool> RegenerateNavMeshOnly()
-        {
-            if (_logCoordinationSteps)
-            {
-                Debug.Log("[NavMeshAgentCoordinator] 🔨 Regenerando solo NavMesh...");
-            }
-
-            return await _navMeshGenerator.RegenerateNavMesh();
+            return await genTask;
         }
 
         #endregion
 
-        #region Event Subscriptions
+        #region Validation
 
-        private void OnEnable()
+        private bool IsModelLoaded()
         {
-            // Suscribirse a eventos relevantes
-            EventBus.Instance.Subscribe<ModelLoadedEvent>(OnModelLoaded);
+            // Verificar si hay modelo en escena
+            if (_lastLoadedModel != null && _lastLoadedModel.activeInHierarchy)
+            {
+                return true;
+            }
+
+            // Buscar ModelLoadManager
+            var modelManager = FindFirstObjectByType<Core.Managers.ModelLoadManager>();
+            if (modelManager != null && modelManager.IsModelLoaded)
+            {
+                _lastLoadedModel = modelManager.CurrentModel;
+                return true;
+            }
+
+            return false;
         }
 
-        private void OnDisable()
+        #endregion
+
+        #region Public API
+
+        public async Task<bool> RegenerateAll()
         {
-            EventBus.Instance.Unsubscribe<ModelLoadedEvent>(OnModelLoaded);
+            Log("🔄 Regenerando todo...");
+
+            if (_walkableSurfaceGenerator != null)
+            {
+                _walkableSurfaceGenerator.Clear();
+            }
+
+            await Task.Delay(100);
+            return await ExecuteFullSetup();
         }
 
-        private async void OnModelLoaded(ModelLoadedEvent evt)
+        public bool RepositionAgentOnly()
+        {
+            if (_agentFloorPlacement == null) return false;
+            
+            Log("📍 Reposicionando agente...");
+            return _agentFloorPlacement.PlaceAgentOnFloor();
+        }
+
+        public async Task<bool> RegenerateNavMeshOnly()
+        {
+            if (_walkableSurfaceGenerator == null) return false;
+            
+            Log("🔨 Regenerando NavMesh...");
+            return await GenerateNavMeshWithRetry();
+        }
+
+        public bool IsSystemReady()
+        {
+            return _isInitialized && 
+                   !_isExecuting && 
+                   _walkableSurfaceGenerator != null && 
+                   _navigationAgent != null;
+        }
+
+        #endregion
+
+        #region Utilities
+
+        private void Log(string msg)
         {
             if (_logCoordinationSteps)
             {
-                Debug.Log($"[NavMeshAgentCoordinator] 📦 Modelo cargado: {evt.ModelName}. Regenerando sistema...");
+                Debug.Log($"[Coordinator] {msg}");
             }
+        }
 
-            // Esperar un poco a que el modelo se estabilice
-            await Task.Delay(500);
-
-            // Regenerar todo
-            await RegenerateAll();
+        private void PublishMessage(string msg, MessageType type)
+        {
+            EventBus.Instance?.Publish(new ShowMessageEvent
+            {
+                Message = msg,
+                Type = type,
+                Duration = type == MessageType.Error ? 5f : 3f
+            });
         }
 
         #endregion
 
         #region Debug
 
-        [ContextMenu("🚀 Execute Full Setup")]
-        private void DebugExecuteSetup()
-        {
-            _ = ExecuteFullSetup();
-        }
+        [ContextMenu("🚀 Execute Setup")]
+        private void DebugExecute() => _ = ExecuteFullSetup();
 
         [ContextMenu("🔄 Regenerate All")]
-        private void DebugRegenerateAll()
-        {
-            _ = RegenerateAll();
-        }
+        private void DebugRegen() => _ = RegenerateAll();
 
-        [ContextMenu("📍 Reposition Agent Only")]
-        private void DebugRepositionAgent()
+        [ContextMenu("ℹ️ Status")]
+        private void DebugStatus()
         {
-            RepositionAgentOnly();
-        }
-
-        [ContextMenu("🔨 Regenerate NavMesh Only")]
-        private void DebugRegenerateNavMesh()
-        {
-            _ = RegenerateNavMeshOnly();
+            Debug.Log("========== STATUS ==========");
+            Debug.Log($"Inicializado: {_isInitialized}");
+            Debug.Log($"Ejecutando: {_isExecuting}");
+            Debug.Log($"Modelo cargado: {IsModelLoaded()}");
+            Debug.Log($"Sistema listo: {IsSystemReady()}");
+            Debug.Log("============================");
         }
 
         #endregion

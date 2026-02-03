@@ -5,6 +5,7 @@ TagManager:
   serializedVersion: 3
   tags:
   - WayPoint
+  - NavMeshObstacle
   layers:
   - Default
   - TransparentFX

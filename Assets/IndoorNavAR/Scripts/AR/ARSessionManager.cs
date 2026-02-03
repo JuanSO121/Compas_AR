@@ -131,7 +131,7 @@ namespace IndoorNavAR.AR
                 ARPlane plane = kvp.Value;   // Extract the ARPlane
                 ProcessRemovedPlane(plane);
             }
-        }
+        } 
 
         private void ProcessAddedPlane(ARPlane plane)
         {

@@ -1,3 +1,5 @@
+// File: KeyboardTestingController.cs
+
 using UnityEngine;
 using IndoorNavAR.Core.Managers;
 using IndoorNavAR.Navigation;
@@ -8,12 +10,13 @@ namespace IndoorNavAR.Testing
     /// <summary>
     /// Controlador de testing mediante teclado para probar el sistema sin UI.
     /// Permite crear waypoints, generar NavMesh y navegar usando teclas.
+    /// ✅ ACTUALIZADO: Usa MultiMeshWalkableSurfaceGenerator
     /// </summary>
     public class KeyboardTestingController : MonoBehaviour
     {
         [Header("Referencias")]
         [SerializeField] private WaypointManager _waypointManager;
-        [SerializeField] private NavMeshGenerator _navMeshGenerator;
+        [SerializeField] private MultiMeshWalkableSurfaceGenerator _navMeshGenerator;
         [SerializeField] private NavigationAgent _navigationAgent;
         [SerializeField] private PlacementController _placementController;
 
@@ -48,7 +51,7 @@ namespace IndoorNavAR.Testing
                 _waypointManager = FindFirstObjectByType<WaypointManager>();
 
             if (_navMeshGenerator == null)
-                _navMeshGenerator = FindFirstObjectByType<NavMeshGenerator>();
+                _navMeshGenerator = FindFirstObjectByType<MultiMeshWalkableSurfaceGenerator>();
 
             if (_navigationAgent == null)
                 _navigationAgent = FindFirstObjectByType<NavigationAgent>();
@@ -118,6 +121,12 @@ namespace IndoorNavAR.Testing
             {
                 ShowSystemInfo();
             }
+
+            // [X] - Limpiar NavMesh
+            if (Input.GetKeyDown(KeyCode.X))
+            {
+                ClearNavMesh();
+            }
         }
 
         #region Keyboard Actions
@@ -151,12 +160,12 @@ namespace IndoorNavAR.Testing
         {
             if (_navMeshGenerator == null)
             {
-                Debug.LogError("[KeyboardTesting] NavMeshGenerator no encontrado.");
+                Debug.LogError("[KeyboardTesting] MultiMeshWalkableSurfaceGenerator no encontrado.");
                 return;
             }
 
-            Debug.Log("🔧 [N] Generando NavMesh...");
-            bool success = await _navMeshGenerator.RegenerateNavMesh();
+            Debug.Log("🔧 [N] Generando NavMesh (V4.0 AR Móvil)...");
+            bool success = await _navMeshGenerator.GenerateWalkableSurfaceAsync();
 
             if (success)
             {
@@ -166,6 +175,18 @@ namespace IndoorNavAR.Testing
             {
                 Debug.LogWarning("⚠️ [N] Error generando NavMesh.");
             }
+        }
+
+        private void ClearNavMesh()
+        {
+            if (_navMeshGenerator == null)
+            {
+                Debug.LogError("[KeyboardTesting] MultiMeshWalkableSurfaceGenerator no encontrado.");
+                return;
+            }
+
+            _navMeshGenerator.Clear();
+            Debug.Log("🧹 [X] NavMesh limpiado.");
         }
 
         private void NavigateToNextWaypoint()
@@ -278,7 +299,6 @@ namespace IndoorNavAR.Testing
         {
             Debug.Log("========== INFO DEL SISTEMA ==========");
             Debug.Log($"Waypoints: {_waypointManager?.WaypointCount ?? 0}");
-            Debug.Log($"NavMesh Generando: {_navMeshGenerator?.IsGenerating ?? false}");
             Debug.Log($"Agente Navegando: {_navigationAgent?.IsNavigating ?? false}");
             Debug.Log($"Placement Activo: {_placementController?.IsPlacementActive ?? false}");
             
@@ -303,7 +323,8 @@ namespace IndoorNavAR.Testing
             Debug.Log("╠═══════════════════════════════════════════════╣");
             Debug.Log("║  [W]       - Crear Waypoint aleatorio         ║");
             Debug.Log("║  [1]       - Crear grid 2x2 de waypoints      ║");
-            Debug.Log("║  [N]       - Generar NavMesh                  ║");
+            Debug.Log("║  [N]       - Generar NavMesh (V4.0)           ║");
+            Debug.Log("║  [X]       - Limpiar NavMesh                  ║");
             Debug.Log("║  [SPACE]   - Navegar al siguiente waypoint    ║");
             Debug.Log("║  [S]       - Detener navegación               ║");
             Debug.Log("║  [T]       - Teleportar agente al origen      ║");
@@ -335,8 +356,9 @@ namespace IndoorNavAR.Testing
             style.padding = new RectOffset(10, 10, 10, 10);
 
             string info = "CONTROLES:\n" +
-                         "[W] Waypoint | [1] Grid | [N] NavMesh | [SPACE] Navegar | [S] Stop\n" +
-                         "[I] Info | [H] Ayuda | [C] Limpiar | [P] Placement\n\n";
+                         "[W] Waypoint | [1] Grid | [N] NavMesh | [X] Clear NavMesh\n" +
+                         "[SPACE] Navegar | [S] Stop | [I] Info | [H] Ayuda\n" +
+                         "[C] Limpiar | [P] Placement\n\n";
 
             if (_waypointManager != null)
             {

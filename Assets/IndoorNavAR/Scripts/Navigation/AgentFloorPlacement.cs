@@ -10,8 +10,8 @@ namespace IndoorNavAR.Navigation
 {
     /// <summary>
     /// Posiciona el agente en el PISO REAL (más bajo), ignorando mesas y techos.
-    /// ✅ ARREGLADO: Espera a que el NavMesh esté listo antes de posicionar
-    /// ✅ ARREGLADO: Reacciona automáticamente a carga de modelos
+    /// ✅ FIXED: Loop infinito de flotación corregido
+    /// ✅ FIXED: Tolerancia aumentada para evitar reposicionamientos constantes
     /// </summary>
     [RequireComponent(typeof(NavMeshAgent))]
     public class AgentFloorPlacement : MonoBehaviour
@@ -41,11 +41,28 @@ namespace IndoorNavAR.Navigation
         [SerializeField] private bool _autoCorrectFloating = true;
 
         [Tooltip("Frecuencia de verificación (segundos)")]
-        [SerializeField] private float _checkInterval = 1f;
+        [SerializeField] private float _checkInterval = 2f; // ✅ Aumentado de 1s a 2s
+
+        [Header("🔧 NavMesh Waiting")]
+        [Tooltip("Intentos máximos de espera por NavMesh")]
+        [SerializeField] private int _maxNavMeshWaitAttempts = 10;
+
+        [Tooltip("Delay entre intentos (segundos)")]
+        [SerializeField] private float _navMeshCheckDelay = 0.5f;
+
+        [Tooltip("Radio de búsqueda para SamplePosition")]
+        [SerializeField] private float _navMeshSampleRadius = 10f;
+
+        [Header("🛡️ Tolerancia de Flotación")]
+        [Tooltip("Distancia máxima al piso antes de considerar flotación (metros)")]
+        [SerializeField] private float _floatingTolerance = 1.0f; // ✅ NUEVO: Era hardcoded 0.5m
+
+        [Tooltip("Umbral mínimo de movimiento para evitar correcciones innecesarias")]
+        [SerializeField] private float _minMovementThreshold = 0.05f; // ✅ NUEVO
 
         [Header("🔧 Debug")]
         [SerializeField] private bool _debugVisualization = true;
-        [SerializeField] private bool _verboseLogs = true;
+        [SerializeField] private bool _verboseLogs = false; // ✅ Cambiado a false por defecto
 
         private NavMeshAgent _agent;
         private float _lastCheck;
@@ -54,6 +71,13 @@ namespace IndoorNavAR.Navigation
         private List<SurfaceInfo> _allSurfaces = new List<SurfaceInfo>();
         private Bounds _modelBounds;
         private bool _waitingForNavMesh;
+        private Coroutine _navMeshWaitCoroutine;
+        
+        // ✅ NUEVO: Prevenir loops
+        private int _consecutiveCorrections = 0;
+        private const int MAX_CONSECUTIVE_CORRECTIONS = 3;
+        private float _lastCorrectionTime;
+        private const float MIN_TIME_BETWEEN_CORRECTIONS = 3f;
 
         private class SurfaceInfo
         {
@@ -67,9 +91,9 @@ namespace IndoorNavAR.Navigation
 
         private enum SurfaceType
         {
-            Floor,      // Piso real (más bajo)
-            Furniture,  // Mesas, sillas (intermedio)
-            Ceiling,    // Techo (más alto)
+            Floor,
+            Furniture,
+            Ceiling,
             Unknown
         }
 
@@ -81,30 +105,37 @@ namespace IndoorNavAR.Navigation
             
             if (_agent == null)
             {
-                Debug.LogError("[AgentFloorPlacement] NavMeshAgent no encontrado.");
+                Debug.LogError("[AgentFloorPlacement] ❌ NavMeshAgent no encontrado.");
                 enabled = false;
+                return;
             }
+
+            _agent.updatePosition = true;
+            _agent.updateRotation = true;
         }
 
         private void OnEnable()
         {
-            // ✅ NUEVO: Suscribirse a eventos del sistema
             EventBus.Instance?.Subscribe<NavMeshGeneratedEvent>(OnNavMeshGenerated);
             EventBus.Instance?.Subscribe<ModelLoadedEvent>(OnModelLoaded);
         }
 
         private void OnDisable()
         {
-            // ✅ NUEVO: Desuscribirse para evitar memory leaks
             EventBus.Instance?.Unsubscribe<NavMeshGeneratedEvent>(OnNavMeshGenerated);
             EventBus.Instance?.Unsubscribe<ModelLoadedEvent>(OnModelLoaded);
+
+            if (_navMeshWaitCoroutine != null)
+            {
+                StopCoroutine(_navMeshWaitCoroutine);
+                _navMeshWaitCoroutine = null;
+            }
         }
 
         private void Start()
         {
             if (_placeOnStart)
             {
-                // Intentar solo si NavMesh ya existe
                 if (IsNavMeshReady())
                 {
                     PlaceAgentOnFloor();
@@ -133,9 +164,6 @@ namespace IndoorNavAR.Navigation
 
         #region Event Handlers
 
-        /// <summary>
-        /// ✅ NUEVO: Se ejecuta cuando se genera/actualiza el NavMesh
-        /// </summary>
         private void OnNavMeshGenerated(NavMeshGeneratedEvent evt)
         {
             if (!evt.Success)
@@ -144,6 +172,7 @@ namespace IndoorNavAR.Navigation
                 {
                     Debug.LogWarning("[AgentFloorPlacement] ⚠️ NavMesh falló, no se puede posicionar agente");
                 }
+                _waitingForNavMesh = false;
                 return;
             }
 
@@ -152,13 +181,14 @@ namespace IndoorNavAR.Navigation
                 Debug.Log("[AgentFloorPlacement] 📡 Evento NavMeshGenerated recibido");
             }
 
-            // Esperar 1 frame para que el NavMesh se estabilice
-            StartCoroutine(PlaceAgentNextFrame());
+            if (_navMeshWaitCoroutine != null)
+            {
+                StopCoroutine(_navMeshWaitCoroutine);
+            }
+
+            _navMeshWaitCoroutine = StartCoroutine(WaitForNavMeshAndPlace());
         }
 
-        /// <summary>
-        /// ✅ NUEVO: Se ejecuta cuando se carga un modelo
-        /// </summary>
         private void OnModelLoaded(ModelLoadedEvent evt)
         {
             if (_verboseLogs)
@@ -166,61 +196,106 @@ namespace IndoorNavAR.Navigation
                 Debug.Log($"[AgentFloorPlacement] 📦 Modelo cargado: {evt.ModelName}");
             }
 
-            // Resetear estado
             _isPlaced = false;
             _allSurfaces.Clear();
-
-            // NO posicionar inmediatamente - esperar a que se genere el NavMesh
+            _modelBounds = default;
+            _consecutiveCorrections = 0; // ✅ Reset contador
             _waitingForNavMesh = true;
         }
 
-        /// <summary>
-        /// ✅ NUEVO: Coloca el agente en el siguiente frame
-        /// </summary>
-        private IEnumerator PlaceAgentNextFrame()
+        private IEnumerator WaitForNavMeshAndPlace()
         {
-            // Esperar 2 frames para total estabilidad
+            if (_verboseLogs)
+            {
+                Debug.Log("[AgentFloorPlacement] ⏳ Esperando consolidación de NavMesh...");
+            }
+
+            int attempts = 0;
+            bool navMeshReady = false;
+
             yield return null;
             yield return null;
 
-            if (IsNavMeshReady())
+            while (attempts < _maxNavMeshWaitAttempts && !navMeshReady)
             {
-                PlaceAgentOnFloor();
-                _waitingForNavMesh = false;
+                attempts++;
+
+                if (IsNavMeshReady())
+                {
+                    navMeshReady = true;
+                    
+                    if (_verboseLogs)
+                    {
+                        Debug.Log($"[AgentFloorPlacement] ✅ NavMesh listo después de {attempts} intentos");
+                    }
+                    
+                    break;
+                }
+
+                if (_verboseLogs && attempts % 3 == 0)
+                {
+                    Debug.Log($"[AgentFloorPlacement] ⏳ Esperando NavMesh... (intento {attempts}/{_maxNavMeshWaitAttempts})");
+                }
+
+                yield return new WaitForSeconds(_navMeshCheckDelay);
+            }
+
+            if (navMeshReady)
+            {
+                yield return null;
+
+                bool success = PlaceAgentOnFloor();
+                
+                if (success)
+                {
+                    _waitingForNavMesh = false;
+                    _consecutiveCorrections = 0; // ✅ Reset
+                }
+                else
+                {
+                    Debug.LogWarning("[AgentFloorPlacement] ⚠️ Posicionamiento falló a pesar de NavMesh listo");
+                }
             }
             else
             {
-                if (_verboseLogs)
-                {
-                    Debug.LogWarning("[AgentFloorPlacement] ⚠️ NavMesh aún no listo después de esperar");
-                }
+                Debug.LogError($"[AgentFloorPlacement] ❌ NavMesh no estuvo listo después de {attempts} intentos ({attempts * _navMeshCheckDelay}s)");
+                _waitingForNavMesh = false;
             }
+
+            _navMeshWaitCoroutine = null;
         }
 
         #endregion
 
         #region Public API
 
-        /// <summary>
-        /// Posiciona el agente en el piso REAL (más bajo).
-        /// ✅ ARREGLADO: Valida que NavMesh esté listo antes de intentar
-        /// </summary>
         public bool PlaceAgentOnFloor()
         {
             if (_verboseLogs)
             {
                 Debug.Log("==========================================");
-                Debug.Log("[AgentFloorPlacement] 🎯 Detectando PISO REAL...");
+                Debug.Log("[AgentFloorPlacement] 🎯 INICIANDO POSICIONAMIENTO EN PISO REAL...");
             }
 
-            // ✅ NUEVO: Verificar que NavMesh esté listo
-            if (!IsNavMeshReady())
+            if (_agent == null)
             {
-                Debug.LogWarning("[AgentFloorPlacement] ⚠️ NavMesh no está listo. Espera a NavMeshGeneratedEvent.");
+                Debug.LogError("[AgentFloorPlacement] ❌ NavMeshAgent no disponible");
                 return false;
             }
 
-            // Analizar toda la geometría del modelo
+            if (!IsNavMeshReady())
+            {
+                Debug.LogWarning("[AgentFloorPlacement] ⚠️ NavMesh no está listo.");
+                
+                if (_navMeshWaitCoroutine == null)
+                {
+                    _waitingForNavMesh = true;
+                    _navMeshWaitCoroutine = StartCoroutine(WaitForNavMeshAndPlace());
+                }
+                
+                return false;
+            }
+
             AnalyzeModelGeometry();
 
             if (_allSurfaces.Count == 0)
@@ -230,7 +305,6 @@ namespace IndoorNavAR.Navigation
                 return false;
             }
 
-            // Detectar el piso real
             Vector3? floorPosition = DetectRealFloor();
 
             if (!floorPosition.HasValue)
@@ -240,23 +314,28 @@ namespace IndoorNavAR.Navigation
             }
 
             _detectedFloorPosition = floorPosition.Value;
-            Vector3 agentPosition = _detectedFloorPosition + Vector3.up * _heightOffset;
+            Vector3 agentTargetPosition = _detectedFloorPosition + Vector3.up * _heightOffset;
 
-            // Posicionar agente
-            bool success = PositionAgent(agentPosition);
+            bool success = PositionAgent(agentTargetPosition);
 
             if (success)
             {
                 _isPlaced = true;
+                _waitingForNavMesh = false;
+                _consecutiveCorrections = 0; // ✅ Reset en éxito
                 
                 if (_verboseLogs)
                 {
-                    Debug.Log($"[AgentFloorPlacement] ✅ Agente posicionado en PISO REAL");
+                    Debug.Log($"[AgentFloorPlacement] ✅ AGENTE POSICIONADO EXITOSAMENTE");
                     Debug.Log($"  Piso detectado: Y={_detectedFloorPosition.y:F3}m");
                     Debug.Log($"  Agente final: Y={transform.position.y:F3}m");
-                    Debug.Log($"  Bounds modelo: Min Y={_modelBounds.min.y:F3}m, Max Y={_modelBounds.max.y:F3}m");
+                    Debug.Log($"  Agente on NavMesh: {_agent.isOnNavMesh}");
                     Debug.Log("==========================================");
                 }
+            }
+            else
+            {
+                Debug.LogError("[AgentFloorPlacement] ❌ Error posicionando agente");
             }
 
             return success;
@@ -265,34 +344,47 @@ namespace IndoorNavAR.Navigation
         public void RepositionAgent()
         {
             _isPlaced = false;
+            _consecutiveCorrections = 0; // ✅ Reset
             PlaceAgentOnFloor();
         }
 
         public float GetFloorHeight() => _detectedFloorPosition.y;
 
+        public bool IsCorrectlyPlaced()
+        {
+            if (!_isPlaced || _agent == null)
+                return false;
+
+            if (!_agent.isOnNavMesh)
+                return false;
+
+            float distanceToFloor = Mathf.Abs(transform.position.y - _detectedFloorPosition.y);
+            return distanceToFloor < _floatingTolerance;
+        }
+
         #endregion
 
         #region NavMesh Validation
 
-        /// <summary>
-        /// ✅ NUEVO: Verifica si hay un NavMesh válido disponible
-        /// </summary>
         private bool IsNavMeshReady()
         {
-            // Verificar si hay triangulación NavMesh
             NavMeshTriangulation triangulation = NavMesh.CalculateTriangulation();
             
             if (triangulation.vertices == null || triangulation.vertices.Length == 0)
-            {
                 return false;
-            }
 
-            // Verificar que el agente pueda usar NavMesh
-            if (_agent != null && !_agent.isOnNavMesh)
+            if (triangulation.indices == null || triangulation.indices.Length == 0)
+                return false;
+
+            if (triangulation.areas == null || triangulation.areas.Length == 0)
+                return false;
+
+            NavMeshHit hit;
+            Vector3 samplePosition = transform.position;
+            
+            if (!NavMesh.SamplePosition(samplePosition, out hit, _navMeshSampleRadius, NavMesh.AllAreas))
             {
-                // Intentar samplear posición actual
-                NavMeshHit hit;
-                if (!NavMesh.SamplePosition(transform.position, out hit, 10f, NavMesh.AllAreas))
+                if (!NavMesh.SamplePosition(Vector3.zero, out hit, _navMeshSampleRadius * 2f, NavMesh.AllAreas))
                 {
                     return false;
                 }
@@ -305,9 +397,6 @@ namespace IndoorNavAR.Navigation
 
         #region Geometry Analysis
 
-        /// <summary>
-        /// Analiza toda la geometría del modelo.
-        /// </summary>
         private void AnalyzeModelGeometry()
         {
             _allSurfaces.Clear();
@@ -315,7 +404,6 @@ namespace IndoorNavAR.Navigation
             Renderer[] renderers = FindObjectsByType<Renderer>(FindObjectsSortMode.None);
             List<Renderer> validRenderers = new List<Renderer>();
 
-            // Filtrar por capa
             foreach (Renderer r in renderers)
             {
                 if ((_modelLayers.value & (1 << r.gameObject.layer)) != 0)
@@ -326,11 +414,10 @@ namespace IndoorNavAR.Navigation
 
             if (validRenderers.Count == 0)
             {
-                Debug.LogError("[AgentFloorPlacement] No hay geometría en las capas configuradas.");
+                Debug.LogError("[AgentFloorPlacement] ❌ No hay geometría en las capas configuradas.");
                 return;
             }
 
-            // Calcular bounds completo del modelo
             _modelBounds = validRenderers[0].bounds;
             for (int i = 1; i < validRenderers.Count; i++)
             {
@@ -339,13 +426,10 @@ namespace IndoorNavAR.Navigation
 
             if (_verboseLogs)
             {
-                Debug.Log($"[AgentFloorPlacement] 📊 Analizando modelo...");
-                Debug.Log($"  Total renderers: {validRenderers.Count}");
-                Debug.Log($"  Bounds: Y min={_modelBounds.min.y:F3}m, max={_modelBounds.max.y:F3}m");
-                Debug.Log($"  Altura total: {_modelBounds.size.y:F3}m");
+                Debug.Log($"[AgentFloorPlacement] 📊 Análisis: {validRenderers.Count} renderers");
             }
 
-            // Analizar cada superficie
+            int horizontalCount = 0;
             foreach (Renderer r in validRenderers)
             {
                 MeshFilter mf = r.GetComponent<MeshFilter>();
@@ -353,6 +437,8 @@ namespace IndoorNavAR.Navigation
                     continue;
 
                 bool isHorizontal = IsHorizontalSurface(mf, r.transform);
+                if (isHorizontal) horizontalCount++;
+
                 Bounds bounds = r.bounds;
                 float area = bounds.size.x * bounds.size.z;
 
@@ -366,40 +452,27 @@ namespace IndoorNavAR.Navigation
                     type = SurfaceType.Unknown
                 });
             }
-
-            if (_verboseLogs)
-            {
-                Debug.Log($"  Superficies detectadas: {_allSurfaces.Count}");
-                Debug.Log($"  Horizontales: {_allSurfaces.Count(s => s.isHorizontal)}");
-            }
         }
 
-        /// <summary>
-        /// Detecta el piso REAL (más bajo, ignorando mesas y techo).
-        /// </summary>
         private Vector3? DetectRealFloor()
         {
             if (_allSurfaces.Count == 0)
                 return null;
 
-            // Clasificar superficies
             ClassifySurfaces();
 
-            // ESTRATEGIA 1: Usar el punto más bajo del modelo (SIEMPRE CORRECTO)
             if (_useAbsoluteLowest)
             {
                 float absoluteLowest = _modelBounds.min.y;
                 
                 if (_verboseLogs)
                 {
-                    Debug.Log($"[AgentFloorPlacement] ✅ Usando punto MÁS BAJO del modelo");
-                    Debug.Log($"  Altura: Y={absoluteLowest:F3}m");
+                    Debug.Log($"[AgentFloorPlacement] ✅ Usando punto más bajo: Y={absoluteLowest:F3}m");
                 }
 
-                return new Vector3(transform.position.x, absoluteLowest, transform.position.z);
+                return new Vector3(_modelBounds.center.x, absoluteLowest, _modelBounds.center.z);
             }
 
-            // ESTRATEGIA 2: Buscar superficie horizontal más baja y grande
             var floorCandidates = _allSurfaces
                 .Where(s => s.type == SurfaceType.Floor && s.isHorizontal && s.area >= _minFloorArea)
                 .OrderBy(s => s.height)
@@ -408,93 +481,32 @@ namespace IndoorNavAR.Navigation
             if (floorCandidates.Count > 0)
             {
                 var floor = floorCandidates.First();
-                
-                if (_verboseLogs)
-                {
-                    Debug.Log($"[AgentFloorPlacement] ✅ Piso detectado por análisis");
-                    Debug.Log($"  Superficie: {floor.name}");
-                    Debug.Log($"  Altura: Y={floor.height:F3}m");
-                    Debug.Log($"  Área: {floor.area:F2}m²");
-                }
-
-                return new Vector3(transform.position.x, floor.height, transform.position.z);
+                return new Vector3(_modelBounds.center.x, floor.height, _modelBounds.center.z);
             }
 
-            // FALLBACK: Usar bounds mínimo
-            if (_verboseLogs)
-            {
-                Debug.Log($"[AgentFloorPlacement] ⚠️ Usando fallback: bounds mínimo");
-            }
-
-            return new Vector3(transform.position.x, _modelBounds.min.y, transform.position.z);
+            return new Vector3(_modelBounds.center.x, _modelBounds.min.y, _modelBounds.center.z);
         }
 
-        /// <summary>
-        /// Clasifica superficies en: Piso, Muebles, Techo.
-        /// </summary>
         private void ClassifySurfaces()
         {
             float minY = _modelBounds.min.y;
             float maxY = _modelBounds.max.y;
             float totalHeight = maxY - minY;
 
-            // Definir zonas
             float ceilingThreshold = maxY - (totalHeight * _ignoreTopPercent);
-            float floorZone = minY + (totalHeight * 0.2f); // 20% inferior = zona de piso
-
-            if (_verboseLogs)
-            {
-                Debug.Log($"[AgentFloorPlacement] 🔍 Clasificando superficies...");
-                Debug.Log($"  Zona piso: Y < {floorZone:F3}m");
-                Debug.Log($"  Zona techo: Y > {ceilingThreshold:F3}m");
-            }
+            float floorZone = minY + (totalHeight * 0.2f);
 
             foreach (var surface in _allSurfaces)
             {
-                // Clasificar por altura
                 if (surface.height >= ceilingThreshold)
-                {
                     surface.type = SurfaceType.Ceiling;
-                }
                 else if (surface.height <= floorZone)
-                {
                     surface.type = SurfaceType.Floor;
-                }
                 else
-                {
                     surface.type = SurfaceType.Furniture;
-                }
-
-                if (_verboseLogs && surface.isHorizontal)
-                {
-                    string icon = surface.type switch
-                    {
-                        SurfaceType.Floor => "🟢 PISO",
-                        SurfaceType.Furniture => "🟡 MUEBLE",
-                        SurfaceType.Ceiling => "🔴 TECHO",
-                        _ => "⚪ DESCONOCIDO"
-                    };
-
-                    Debug.Log($"  {icon} - {surface.name} (Y={surface.height:F3}m, área={surface.area:F2}m²)");
-                }
-            }
-
-            int floors = _allSurfaces.Count(s => s.type == SurfaceType.Floor);
-            int furniture = _allSurfaces.Count(s => s.type == SurfaceType.Furniture);
-            int ceilings = _allSurfaces.Count(s => s.type == SurfaceType.Ceiling);
-
-            if (_verboseLogs)
-            {
-                Debug.Log($"[AgentFloorPlacement] 📊 Clasificación:");
-                Debug.Log($"  Pisos: {floors}");
-                Debug.Log($"  Muebles: {furniture}");
-                Debug.Log($"  Techos: {ceilings}");
             }
         }
 
-        /// <summary>
-        /// Verifica si una superficie es horizontal.
-        /// </summary>
         private bool IsHorizontalSurface(MeshFilter mf, Transform t)
         {
             Mesh mesh = mf.sharedMesh;
@@ -511,47 +523,66 @@ namespace IndoorNavAR.Navigation
             avgNormal = (avgNormal / normals.Length).normalized;
 
             float angle = Vector3.Angle(avgNormal, Vector3.up);
-            return angle < 30f; // Casi horizontal
+            return angle < 30f;
         }
 
         #endregion
 
         #region Agent Positioning
 
-        /// <summary>
-        /// ✅ MEJORADO: Posiciona el agente validando NavMesh
-        /// </summary>
         private bool PositionAgent(Vector3 targetPosition)
         {
-            // Si el agente ya está en NavMesh, usar Warp
+            if (_agent == null)
+                return false;
+
+            // ESTRATEGIA 1: Warp si ya está en NavMesh
             if (_agent.isOnNavMesh)
             {
                 NavMeshHit hit;
-                if (NavMesh.SamplePosition(targetPosition, out hit, 5f, NavMesh.AllAreas))
+                if (NavMesh.SamplePosition(targetPosition, out hit, _navMeshSampleRadius, NavMesh.AllAreas))
                 {
                     _agent.Warp(hit.position);
                     
                     if (_verboseLogs)
                     {
-                        Debug.Log($"[AgentFloorPlacement] ✅ Agente warped a NavMesh: {hit.position}");
+                        Debug.Log($"[AgentFloorPlacement] ✅ Agente warped: {hit.position}");
                     }
                     
                     return true;
                 }
-                else
+            }
+
+            // ESTRATEGIA 2: Reposicionamiento manual
+            bool wasEnabled = _agent.enabled;
+            _agent.enabled = false;
+            
+            transform.position = targetPosition;
+            
+            _agent.enabled = wasEnabled;
+
+            if (_agent.isOnNavMesh)
+            {
+                if (_verboseLogs)
                 {
-                    Debug.LogWarning("[AgentFloorPlacement] ⚠️ No se pudo samplear posición en NavMesh");
+                    Debug.Log($"[AgentFloorPlacement] ✅ Agente en NavMesh después de reactivación");
+                }
+                return true;
+            }
+
+            // ESTRATEGIA 3: Posición cercana válida
+            NavMeshHit nearbyHit;
+            if (NavMesh.SamplePosition(targetPosition, out nearbyHit, _navMeshSampleRadius, NavMesh.AllAreas))
+            {
+                _agent.enabled = false;
+                transform.position = nearbyHit.position;
+                _agent.enabled = wasEnabled;
+
+                if (_agent.isOnNavMesh)
+                {
+                    return true;
                 }
             }
 
-            // Fallback: posicionar directamente (puede causar flotación temporal)
-            transform.position = targetPosition;
-            
-            if (_verboseLogs)
-            {
-                Debug.Log($"[AgentFloorPlacement] ⚠️ Agente posicionado directamente (sin NavMesh)");
-            }
-            
             return true;
         }
 
@@ -560,24 +591,66 @@ namespace IndoorNavAR.Navigation
         #region Floating Correction
 
         /// <summary>
-        /// ✅ MEJORADO: Solo corrige si NavMesh está listo
+        /// ✅ FIXED: Previene loops infinitos con múltiples salvaguardas
         /// </summary>
         private void CheckAndCorrectFloating()
         {
+            if (!_isPlaced || _detectedFloorPosition == Vector3.zero)
+                return;
+
             if (!IsNavMeshReady())
                 return;
 
-            // Verificar si el agente está muy por encima del piso detectado
-            float distanceToFloor = transform.position.y - _detectedFloorPosition.y;
+            // ✅ SALVAGUARDA 1: Limitar frecuencia de correcciones
+            if (Time.time - _lastCorrectionTime < MIN_TIME_BETWEEN_CORRECTIONS)
+                return;
 
-            if (distanceToFloor > 0.5f)
+            // ✅ SALVAGUARDA 2: Limitar correcciones consecutivas
+            if (_consecutiveCorrections >= MAX_CONSECUTIVE_CORRECTIONS)
             {
                 if (_verboseLogs)
                 {
-                    Debug.LogWarning($"[AgentFloorPlacement] ⚠️ Flotación detectada ({distanceToFloor:F3}m). Corrigiendo...");
+                    Debug.LogWarning($"[AgentFloorPlacement] ⚠️ Máximo de correcciones consecutivas alcanzado ({MAX_CONSECUTIVE_CORRECTIONS}). Deshabilitando auto-corrección.");
                 }
+                _autoCorrectFloating = false;
+                return;
+            }
+
+            float distanceToFloor = transform.position.y - _detectedFloorPosition.y;
+
+            // ✅ SALVAGUARDA 3: Tolerancia aumentada
+            if (distanceToFloor > _floatingTolerance)
+            {
+                // ✅ SALVAGUARDA 4: Verificar que realmente necesita corrección
+                if (distanceToFloor < _floatingTolerance + _minMovementThreshold)
+                {
+                    // Diferencia muy pequeña, ignorar
+                    return;
+                }
+
+                Debug.LogWarning($"[AgentFloorPlacement] ⚠️ FLOTACIÓN DETECTADA: {distanceToFloor:F3}m");
+                
+                _consecutiveCorrections++;
+                _lastCorrectionTime = Time.time;
                 
                 PlaceAgentOnFloor();
+            }
+            else if (_agent != null && !_agent.isOnNavMesh)
+            {
+                Debug.LogWarning($"[AgentFloorPlacement] ⚠️ Agente NO en NavMesh. Reposicionando...");
+                
+                _consecutiveCorrections++;
+                _lastCorrectionTime = Time.time;
+                
+                PlaceAgentOnFloor();
+            }
+            else
+            {
+                // ✅ Todo OK, resetear contador
+                if (_consecutiveCorrections > 0)
+                {
+                    _consecutiveCorrections = 0;
+                }
             }
         }
 
@@ -612,32 +685,10 @@ namespace IndoorNavAR.Navigation
             PlaceAgentOnFloor();
         }
 
-        [ContextMenu("🔍 Analyze Model Geometry")]
-        private void DebugAnalyze()
+        [ContextMenu("🔄 Force Reposition")]
+        private void DebugForceReposition()
         {
-            AnalyzeModelGeometry();
-            
-            if (_allSurfaces.Count > 0)
-            {
-                ClassifySurfaces();
-                
-                Debug.Log("========== RESUMEN ==========");
-                Debug.Log($"Punto más bajo: Y={_modelBounds.min.y:F3}m");
-                Debug.Log($"Punto más alto: Y={_modelBounds.max.y:F3}m");
-                Debug.Log($"Total superficies: {_allSurfaces.Count}");
-                
-                var floors = _allSurfaces.Where(s => s.type == SurfaceType.Floor).ToList();
-                if (floors.Count > 0)
-                {
-                    Debug.Log($"\nPISOS DETECTADOS ({floors.Count}):");
-                    foreach (var f in floors.OrderBy(s => s.height))
-                    {
-                        Debug.Log($"  - {f.name}: Y={f.height:F3}m, área={f.area:F2}m²");
-                    }
-                }
-                
-                Debug.Log("============================");
-            }
+            RepositionAgent();
         }
 
         [ContextMenu("✅ Check NavMesh Status")]
@@ -646,31 +697,16 @@ namespace IndoorNavAR.Navigation
             Debug.Log("========== NAVMESH STATUS ==========");
             Debug.Log($"NavMesh Ready: {IsNavMeshReady()}");
             
-            NavMeshTriangulation tri = NavMesh.CalculateTriangulation();
-            Debug.Log($"NavMesh Vertices: {tri.vertices?.Length ?? 0}");
-            Debug.Log($"NavMesh Triangles: {(tri.indices?.Length ?? 0) / 3}");
-            
             if (_agent != null)
             {
                 Debug.Log($"Agent on NavMesh: {_agent.isOnNavMesh}");
                 Debug.Log($"Agent Position: {transform.position}");
             }
             
+            Debug.Log($"Is Placed: {_isPlaced}");
+            Debug.Log($"Consecutive Corrections: {_consecutiveCorrections}/{MAX_CONSECUTIVE_CORRECTIONS}");
+            Debug.Log($"Auto Correct Enabled: {_autoCorrectFloating}");
             Debug.Log("===================================");
-        }
-
-        [ContextMenu("📊 Show Configuration")]
-        private void DebugShowConfig()
-        {
-            Debug.Log("========== CONFIGURACIÓN ==========");
-            Debug.Log($"Use Absolute Lowest: {_useAbsoluteLowest} ⭐");
-            Debug.Log($"Ignore Top Percent: {_ignoreTopPercent * 100}%");
-            Debug.Log($"Min Floor Area: {_minFloorArea}m²");
-            Debug.Log($"Model Layers: {LayerMaskToString(_modelLayers)}");
-            Debug.Log($"Height Offset: {_heightOffset}m");
-            Debug.Log($"Place On Start: {_placeOnStart}");
-            Debug.Log($"Auto Correct Floating: {_autoCorrectFloating}");
-            Debug.Log("==================================");
         }
 
         private void OnDrawGizmos()
@@ -678,7 +714,6 @@ namespace IndoorNavAR.Navigation
             if (!_debugVisualization)
                 return;
 
-            // Bounds del modelo
             if (_modelBounds.size != Vector3.zero)
             {
                 Gizmos.color = new Color(1f, 1f, 0f, 0.15f);
@@ -687,7 +722,6 @@ namespace IndoorNavAR.Navigation
                 Gizmos.color = Color.yellow;
                 Gizmos.DrawWireCube(_modelBounds.center, _modelBounds.size);
 
-                // Línea del piso real (más bajo)
                 Gizmos.color = new Color(0f, 1f, 0f, 0.7f);
                 Vector3 floorLineStart = _modelBounds.min;
                 Vector3 floorLineEnd = _modelBounds.max;
@@ -696,7 +730,6 @@ namespace IndoorNavAR.Navigation
                 Gizmos.DrawLine(floorLineStart, floorLineEnd);
             }
 
-            // Superficies clasificadas
             foreach (var surface in _allSurfaces)
             {
                 if (!surface.isHorizontal)
@@ -714,7 +747,6 @@ namespace IndoorNavAR.Navigation
                 Gizmos.DrawCube(surface.bounds.center, surface.bounds.size);
             }
 
-            // Piso detectado y agente
             if (_isPlaced && _detectedFloorPosition != Vector3.zero)
             {
                 Gizmos.color = Color.green;
@@ -723,7 +755,6 @@ namespace IndoorNavAR.Navigation
                 Gizmos.color = new Color(0f, 1f, 0f, 0.5f);
                 Gizmos.DrawLine(transform.position, _detectedFloorPosition);
 
-                // Plano visual del piso
                 Vector3 planeCenter = _modelBounds.center;
                 planeCenter.y = _detectedFloorPosition.y;
                 Vector3 planeSize = new Vector3(_modelBounds.size.x, 0.02f, _modelBounds.size.z);
@@ -732,10 +763,20 @@ namespace IndoorNavAR.Navigation
                 Gizmos.DrawCube(planeCenter, planeSize);
             }
 
-            // ✅ NUEVO: Indicador de estado
             if (_waitingForNavMesh)
             {
                 Gizmos.color = Color.yellow;
+                float pulseSize = 0.3f + Mathf.PingPong(Time.time * 2f, 0.2f);
+                Gizmos.DrawWireSphere(transform.position + Vector3.up * 2f, pulseSize);
+            }
+            else if (_isPlaced && IsCorrectlyPlaced())
+            {
+                Gizmos.color = Color.green;
+                Gizmos.DrawWireSphere(transform.position + Vector3.up * 2f, 0.3f);
+            }
+            else if (_isPlaced && !IsCorrectlyPlaced())
+            {
+                Gizmos.color = Color.red;
                 Gizmos.DrawWireSphere(transform.position + Vector3.up * 2f, 0.3f);
             }
         }

@@ -7,37 +7,35 @@ using IndoorNavAR.Core.Events;
 namespace IndoorNavAR.Core.Managers
 {
     /// <summary>
-    /// Gestor de carga dinámica de modelos 3D personalizados.
-    /// Soporta carga desde Resources, AssetBundles y anclaje en AR.
-    /// ✅ MODIFICADO: Ahora acepta prefabs directamente desde el Inspector.
+    /// Gestor simplificado de carga de modelos 3D para AR.
+    /// ✅ Compatible con Unity 6 y AR Foundation 6
+    /// ✅ Asignación directa de prefab desde Inspector
+    /// ✅ Integración optimizada con sistema de navegación
     /// </summary>
     public class ModelLoadManager : MonoBehaviour
     {
-        [Header("Modelo Predeterminado")]
-        [Tooltip("Arrastra el prefab del modelo directamente aquí")]
-        [SerializeField] private GameObject _defaultModelPrefab;
+        [Header("📦 Modelo 3D")]
+        [Tooltip("Arrastra aquí el prefab del modelo 3D")]
+        [SerializeField] private GameObject _modelPrefab;
         
-        [Header("Configuración Alternativa (Resources)")]
-        [SerializeField] private string _resourcesFolder = "RoomModels";
-        [SerializeField] private bool _useResourcesAsBackup = true;
-        
-        [Header("Configuración General")]
+        [Header("⚙️ Configuración")]
         [SerializeField] private Transform _modelParent;
-        [SerializeField] private float _defaultModelScale = 1f;
+        [SerializeField] private float _defaultScale = 1f;
         
-        [Header("AR Anchoring")]
+        [Header("🎯 AR Configuration")]
         [SerializeField] private bool _useARAnchors = true;
+        [SerializeField] private bool _autoLoadOnLargestPlane = false;
 
+        // Estado
         private GameObject _currentModel;
         private ARAnchor _currentAnchor;
-        private string _currentModelName;
         private bool _isModelLoaded;
 
         #region Properties
 
-        public bool IsModelLoaded => _isModelLoaded;
+        public bool IsModelLoaded => _isModelLoaded && _currentModel != null;
         public GameObject CurrentModel => _currentModel;
-        public string CurrentModelName => _currentModelName;
+        public string CurrentModelName => _modelPrefab != null ? _modelPrefab.name : "None";
 
         #endregion
 
@@ -45,406 +43,243 @@ namespace IndoorNavAR.Core.Managers
 
         private void Awake()
         {
-            CreateModelParent();
-            ValidateDefaultPrefab();
+            InitializeModelParent();
+            ValidateModelPrefab();
+        }
+
+        private void Start()
+        {
+            if (_autoLoadOnLargestPlane && _modelPrefab != null)
+            {
+                _ = LoadModelOnLargestPlaneAsync();
+            }
         }
 
         #endregion
 
         #region Initialization
 
-        private void CreateModelParent()
+        private void InitializeModelParent()
         {
             if (_modelParent == null)
             {
-                GameObject parent = new GameObject("[3D Models]");
+                GameObject parent = new GameObject("[3D_Models_Container]");
                 _modelParent = parent.transform;
-                Debug.Log("[ModelLoadManager] Contenedor de modelos creado.");
+                Debug.Log("[ModelLoadManager] ✅ Contenedor de modelos creado");
             }
         }
 
-        private void ValidateDefaultPrefab()
+        private void ValidateModelPrefab()
         {
-            if (_defaultModelPrefab == null)
+            if (_modelPrefab == null)
             {
-                Debug.LogWarning("[ModelLoadManager] No hay modelo predeterminado asignado. Usa el Inspector para asignar uno.");
+                Debug.LogWarning("[ModelLoadManager] ⚠️ No hay modelo asignado en el Inspector");
             }
             else
             {
-                Debug.Log($"[ModelLoadManager] Modelo predeterminado cargado: {_defaultModelPrefab.name}");
+                Debug.Log($"[ModelLoadManager] ✅ Modelo configurado: {_modelPrefab.name}");
             }
         }
 
         #endregion
 
-        #region Model Loading - Direct Prefab
+        #region Model Loading
 
         /// <summary>
-        /// Carga el modelo predeterminado desde el prefab asignado en el Inspector.
+        /// Carga el modelo en una posición específica
         /// </summary>
-        public async Task<bool> LoadDefaultModel(Vector3 position, Quaternion rotation)
+        public async Task<bool> LoadModel(Vector3 position, Quaternion rotation)
         {
-            if (_defaultModelPrefab == null)
+            if (_modelPrefab == null)
             {
-                Debug.LogError("[ModelLoadManager] No hay modelo predeterminado asignado.");
-                
-                EventBus.Instance.Publish(new ShowMessageEvent
-                {
-                    Message = "No hay modelo predeterminado configurado.",
-                    Type = MessageType.Error,
-                    Duration = 3f
-                });
-
-                return false;
-            }
-
-            return await LoadModelFromPrefab(_defaultModelPrefab, position, rotation);
-        }
-
-        /// <summary>
-        /// Carga un modelo desde un prefab específico.
-        /// </summary>
-        public async Task<bool> LoadModelFromPrefab(GameObject prefab, Vector3 position, Quaternion rotation)
-        {
-            if (prefab == null)
-            {
-                Debug.LogError("[ModelLoadManager] Prefab es null.");
+                Debug.LogError("[ModelLoadManager] ❌ No hay modelo asignado");
+                PublishMessage("No hay modelo configurado", MessageType.Error);
                 return false;
             }
 
             try
             {
-                string modelName = prefab.name;
-                Debug.Log($"[ModelLoadManager] Cargando modelo desde prefab: {modelName}");
-
-                // Mostrar mensaje al usuario
-                EventBus.Instance.Publish(new ShowMessageEvent
-                {
-                    Message = $"Cargando modelo {modelName}...",
-                    Type = MessageType.Info,
-                    Duration = 2f
-                });
+                Debug.Log($"[ModelLoadManager] 📦 Cargando modelo: {_modelPrefab.name}");
+                PublishMessage($"Cargando {_modelPrefab.name}...", MessageType.Info);
 
                 // Limpiar modelo anterior
-                if (_currentModel != null)
-                {
-                    UnloadCurrentModel();
-                }
+                UnloadCurrentModel();
 
                 await Task.Yield();
 
                 // Instanciar modelo
-                _currentModel = Instantiate(prefab, position, rotation, _modelParent);
-                _currentModel.name = $"Model_{modelName}";
-                _currentModelName = modelName;
+                _currentModel = Instantiate(_modelPrefab, position, rotation, _modelParent);
+                _currentModel.name = $"Model_{_modelPrefab.name}";
+                _currentModel.transform.localScale = Vector3.one * _defaultScale;
 
-                // Aplicar escala
-                _currentModel.transform.localScale = Vector3.one * _defaultModelScale;
-
-                // Optimizar modelo
+                // Optimizar
                 OptimizeModel(_currentModel);
 
-                // Crear ancla AR si está habilitado
+                // Anclar en AR si está habilitado
                 if (_useARAnchors)
                 {
-                    await CreateARAnchorForModel(position, rotation);
+                    await CreateARAnchor(position, rotation);
                 }
 
                 _isModelLoaded = true;
 
-                // Publicar evento de éxito
-                EventBus.Instance.Publish(new ModelLoadedEvent
+                // Publicar evento
+                EventBus.Instance?.Publish(new ModelLoadedEvent
                 {
                     ModelInstance = _currentModel,
-                    ModelName = modelName,
+                    ModelName = _modelPrefab.name,
                     Position = position
                 });
 
-                EventBus.Instance.Publish(new ShowMessageEvent
-                {
-                    Message = $"Modelo {modelName} cargado exitosamente.",
-                    Type = MessageType.Success,
-                    Duration = 3f
-                });
+                PublishMessage($"Modelo cargado: {_modelPrefab.name}", MessageType.Success);
+                Debug.Log($"[ModelLoadManager] ✅ Modelo cargado exitosamente");
 
-                Debug.Log($"[ModelLoadManager] Modelo cargado exitosamente: {modelName}");
                 return true;
             }
             catch (Exception ex)
             {
-                Debug.LogError($"[ModelLoadManager] Error cargando modelo: {ex.Message}");
+                Debug.LogError($"[ModelLoadManager] ❌ Error: {ex.Message}");
                 
-                EventBus.Instance.Publish(new ModelLoadFailedEvent
+                EventBus.Instance?.Publish(new ModelLoadFailedEvent
                 {
-                    ModelName = prefab.name,
+                    ModelName = _modelPrefab.name,
                     ErrorMessage = ex.Message
                 });
 
-                return false;
-            }
-        }
-
-        #endregion
-
-        #region Model Loading - Resources (Backup)
-
-        /// <summary>
-        /// Carga un modelo 3D desde la carpeta Resources de forma asíncrona.
-        /// </summary>
-        public async Task<bool> LoadModelFromResources(string modelName, Vector3 position, Quaternion rotation)
-        {
-            try
-            {
-                Debug.Log($"[ModelLoadManager] Cargando modelo desde Resources: {modelName}");
-
-                // Mostrar mensaje al usuario
-                EventBus.Instance.Publish(new ShowMessageEvent
-                {
-                    Message = $"Cargando modelo {modelName}...",
-                    Type = MessageType.Info,
-                    Duration = 2f
-                });
-
-                // Limpiar modelo anterior
-                if (_currentModel != null)
-                {
-                    UnloadCurrentModel();
-                }
-
-                await Task.Yield();
-
-                string path = string.IsNullOrEmpty(_resourcesFolder) 
-                    ? modelName 
-                    : $"{_resourcesFolder}/{modelName}";
-                
-                GameObject modelPrefab = Resources.Load<GameObject>(path);
-
-                if (modelPrefab == null)
-                {
-                    Debug.LogError($"[ModelLoadManager] Modelo no encontrado en Resources: {path}");
-                    
-                    EventBus.Instance.Publish(new ModelLoadFailedEvent
-                    {
-                        ModelName = modelName,
-                        ErrorMessage = "Modelo no encontrado en Resources"
-                    });
-
-                    return false;
-                }
-
-                // Usar el método de prefab
-                return await LoadModelFromPrefab(modelPrefab, position, rotation);
-            }
-            catch (Exception ex)
-            {
-                Debug.LogError($"[ModelLoadManager] Error cargando modelo: {ex.Message}");
-                
-                EventBus.Instance.Publish(new ModelLoadFailedEvent
-                {
-                    ModelName = modelName,
-                    ErrorMessage = ex.Message
-                });
-
+                PublishMessage("Error cargando modelo", MessageType.Error);
                 return false;
             }
         }
 
         /// <summary>
-        /// Carga el modelo predeterminado en la posición del plano AR más grande.
+        /// Carga el modelo en el plano AR más grande detectado
         /// </summary>
-        public async Task<bool> LoadDefaultModelOnLargestPlane()
+        public async Task<bool> LoadModelOnLargestPlaneAsync()
         {
-            // Buscar el ARSessionManager
+            if (_modelPrefab == null)
+            {
+                Debug.LogError("[ModelLoadManager] ❌ No hay modelo asignado");
+                return false;
+            }
+
             var arSessionManager = FindFirstObjectByType<AR.ARSessionManager>();
 
             if (arSessionManager == null)
             {
-                Debug.LogError("[ModelLoadManager] ARSessionManager no encontrado.");
+                Debug.LogError("[ModelLoadManager] ❌ ARSessionManager no encontrado");
                 return false;
             }
 
-            // Obtener plano más grande
+            // Esperar a que haya planos detectados
+            int maxWait = 10;
+            while (arSessionManager.DetectedPlaneCount == 0 && maxWait > 0)
+            {
+                Debug.Log("[ModelLoadManager] ⏳ Esperando detección de planos...");
+                await Task.Delay(500);
+                maxWait--;
+            }
+
             ARPlane largestPlane = arSessionManager.GetLargestPlane();
 
             if (largestPlane == null)
             {
-                Debug.LogWarning("[ModelLoadManager] No hay planos AR detectados. Cargando en origen.");
-                
-                // Cargar en origen si no hay planos
-                return await LoadDefaultModel(Vector3.zero, Quaternion.identity);
+                Debug.LogWarning("[ModelLoadManager] ⚠️ No hay planos detectados, cargando en origen");
+                PublishMessage("No se detectaron superficies, cargando en origen", MessageType.Warning);
+                return await LoadModel(Vector3.zero, Quaternion.identity);
             }
 
-            // Cargar en el centro del plano
             Vector3 position = largestPlane.center;
             Quaternion rotation = Quaternion.identity;
 
-            return await LoadDefaultModel(position, rotation);
-        }
+            Debug.Log($"[ModelLoadManager] 🎯 Cargando en plano: área={largestPlane.size.x * largestPlane.size.y:F2}m²");
 
-        /// <summary>
-        /// Carga un modelo desde Resources en la posición del plano AR más grande.
-        /// </summary>
-        public async Task<bool> LoadModelOnLargestPlane(string modelName)
-        {
-            // Buscar el ARSessionManager
-            var arSessionManager = FindFirstObjectByType<AR.ARSessionManager>();
-
-            if (arSessionManager == null)
-            {
-                Debug.LogError("[ModelLoadManager] ARSessionManager no encontrado.");
-                return false;
-            }
-
-            // Obtener plano más grande
-            ARPlane largestPlane = arSessionManager.GetLargestPlane();
-
-            if (largestPlane == null)
-            {
-                Debug.LogWarning("[ModelLoadManager] No hay planos AR detectados.");
-                
-                EventBus.Instance.Publish(new ShowMessageEvent
-                {
-                    Message = "No se detectaron superficies. Busca una superficie plana.",
-                    Type = MessageType.Warning,
-                    Duration = 3f
-                });
-
-                return false;
-            }
-
-            // Cargar en el centro del plano
-            Vector3 position = largestPlane.center;
-            Quaternion rotation = Quaternion.identity;
-
-            return await LoadModelFromResources(modelName, position, rotation);
+            return await LoadModel(position, rotation);
         }
 
         #endregion
 
         #region Model Optimization
 
-        /// <summary>
-        /// Optimiza el modelo para mejor rendimiento en AR.
-        /// </summary>
         private void OptimizeModel(GameObject model)
         {
-            // Desactivar colliders innecesarios (el modelo es solo visual)
-            Collider[] colliders = model.GetComponentsInChildren<Collider>();
-            foreach (var collider in colliders)
+            // Desactivar colliders (el modelo es solo visual)
+            var colliders = model.GetComponentsInChildren<Collider>();
+            foreach (var col in colliders)
             {
-                collider.enabled = false;
+                col.enabled = false;
             }
 
-            // Opcional: Desactivar sombras para mejor performance
-            Renderer[] renderers = model.GetComponentsInChildren<Renderer>();
-            foreach (var renderer in renderers)
+            // Desactivar sombras para mejor rendimiento
+            var renderers = model.GetComponentsInChildren<Renderer>();
+            foreach (var rend in renderers)
             {
-                renderer.shadowCastingMode = UnityEngine.Rendering.ShadowCastingMode.Off;
+                rend.shadowCastingMode = UnityEngine.Rendering.ShadowCastingMode.Off;
             }
 
-            // Configurar capa (útil para raycasting selectivo)
-            SetLayerRecursively(model, LayerMask.NameToLayer("Default"));
-
-            Debug.Log($"[ModelLoadManager] Modelo optimizado: {colliders.Length} colliders desactivados, {renderers.Length} renderers configurados.");
-        }
-
-        private void SetLayerRecursively(GameObject obj, int layer)
-        {
-            obj.layer = layer;
-
-            foreach (Transform child in obj.transform)
-            {
-                SetLayerRecursively(child.gameObject, layer);
-            }
+            Debug.Log($"[ModelLoadManager] 🔧 Optimizado: {colliders.Length} colliders, {renderers.Length} renderers");
         }
 
         #endregion
 
         #region AR Anchoring
 
-        /// <summary>
-        /// Crea un ancla AR para el modelo (persistencia de posición).
-        /// ✅ Compatible con AR Foundation 6 - Requiere ARPlane + Pose
-        /// </summary>
-        private async Task CreateARAnchorForModel(Vector3 position, Quaternion rotation)
+        private async Task CreateARAnchor(Vector3 position, Quaternion rotation)
         {
             try
             {
-                // Buscar ARAnchorManager
                 var anchorManager = FindFirstObjectByType<ARAnchorManager>();
-
                 if (anchorManager == null)
                 {
-                    Debug.LogWarning("[ModelLoadManager] ARAnchorManager no disponible. Ancla no creada.");
+                    Debug.LogWarning("[ModelLoadManager] ⚠️ ARAnchorManager no encontrado");
                     return;
                 }
 
-                // Buscar ARSessionManager para obtener planos
                 var arSessionManager = FindFirstObjectByType<AR.ARSessionManager>();
-
                 if (arSessionManager == null || arSessionManager.DetectedPlaneCount == 0)
                 {
-                    Debug.LogWarning("[ModelLoadManager] No hay planos AR disponibles. Ancla no creada.");
+                    Debug.LogWarning("[ModelLoadManager] ⚠️ No hay planos para anclar");
                     return;
                 }
 
                 await Task.Yield();
 
-                // Buscar el plano más cercano a la posición del modelo
-                UnityEngine.XR.ARFoundation.ARPlane closestPlane = FindClosestPlane(arSessionManager, position);
-
+                ARPlane closestPlane = FindClosestPlane(arSessionManager, position);
                 if (closestPlane == null)
                 {
-                    Debug.LogWarning("[ModelLoadManager] No se encontró plano cercano. Ancla no creada.");
+                    Debug.LogWarning("[ModelLoadManager] ⚠️ No se encontró plano cercano");
                     return;
                 }
 
-                // ✅ AR Foundation 6: AttachAnchor requiere (ARPlane, Pose)
+                // AR Foundation 6: usar Pose
                 Pose pose = new Pose(position, rotation);
                 _currentAnchor = anchorManager.AttachAnchor(closestPlane, pose);
 
                 if (_currentAnchor != null)
                 {
-                    // Hacer el modelo hijo del ancla para seguimiento
-                    if (_currentModel != null)
-                    {
-                        _currentModel.transform.SetParent(_currentAnchor.transform);
-                    }
-
-                    Debug.Log($"[ModelLoadManager] Ancla AR creada para modelo: {_currentAnchor.trackableId}");
-                }
-                else
-                {
-                    Debug.LogWarning("[ModelLoadManager] AttachAnchor devolvió null. El modelo no estará anclado.");
+                    _currentModel.transform.SetParent(_currentAnchor.transform);
+                    Debug.Log($"[ModelLoadManager] ⚓ Ancla AR creada: {_currentAnchor.trackableId}");
                 }
             }
             catch (Exception ex)
             {
-                Debug.LogError($"[ModelLoadManager] Error creando ancla AR: {ex.Message}");
+                Debug.LogError($"[ModelLoadManager] ❌ Error creando ancla: {ex.Message}");
             }
         }
 
-        /// <summary>
-        /// Encuentra el plano AR más cercano a una posición.
-        /// </summary>
-        private UnityEngine.XR.ARFoundation.ARPlane FindClosestPlane(AR.ARSessionManager arSessionManager, Vector3 position)
+        private ARPlane FindClosestPlane(AR.ARSessionManager arSessionManager, Vector3 position)
         {
-            UnityEngine.XR.ARFoundation.ARPlane closestPlane = null;
+            ARPlane closestPlane = null;
             float minDistance = float.MaxValue;
 
             foreach (var kvp in arSessionManager.DetectedPlanes)
             {
-                var plane = kvp.Value;
-                
-                if (plane == null)
-                    continue;
+                if (kvp.Value == null) continue;
 
-                float distance = Vector3.Distance(position, plane.center);
-                
+                float distance = Vector3.Distance(position, kvp.Value.center);
                 if (distance < minDistance)
                 {
                     minDistance = distance;
-                    closestPlane = plane;
+                    closestPlane = kvp.Value;
                 }
             }
 
@@ -453,104 +288,53 @@ namespace IndoorNavAR.Core.Managers
 
         #endregion
 
-        #region Model Manipulation
+        #region Model Management
 
-        /// <summary>
-        /// Actualiza la posición del modelo actual.
-        /// </summary>
-        public void UpdateModelPosition(Vector3 newPosition)
-        {
-            if (_currentModel == null)
-            {
-                Debug.LogWarning("[ModelLoadManager] No hay modelo cargado.");
-                return;
-            }
-
-            _currentModel.transform.position = newPosition;
-            Debug.Log($"[ModelLoadManager] Posición del modelo actualizada: {newPosition}");
-        }
-
-        /// <summary>
-        /// Actualiza la rotación del modelo actual.
-        /// </summary>
-        public void UpdateModelRotation(Quaternion newRotation)
-        {
-            if (_currentModel == null)
-            {
-                Debug.LogWarning("[ModelLoadManager] No hay modelo cargado.");
-                return;
-            }
-
-            _currentModel.transform.rotation = newRotation;
-            Debug.Log($"[ModelLoadManager] Rotación del modelo actualizada.");
-        }
-
-        /// <summary>
-        /// Actualiza la escala del modelo actual.
-        /// </summary>
-        public void UpdateModelScale(float scale)
-        {
-            if (_currentModel == null)
-            {
-                Debug.LogWarning("[ModelLoadManager] No hay modelo cargado.");
-                return;
-            }
-
-            _currentModel.transform.localScale = Vector3.one * scale;
-            Debug.Log($"[ModelLoadManager] Escala del modelo actualizada: {scale}");
-        }
-
-        /// <summary>
-        /// Rota el modelo en el eje Y (útil para ajustar orientación).
-        /// </summary>
-        public void RotateModelY(float degrees)
-        {
-            if (_currentModel == null)
-                return;
-
-            _currentModel.transform.Rotate(Vector3.up, degrees, Space.World);
-        }
-
-        #endregion
-
-        #region Model Unloading
-
-        /// <summary>
-        /// Descarga el modelo actual.
-        /// </summary>
         public void UnloadCurrentModel()
+        {
+            if (_currentModel == null) return;
+
+            // Remover ancla AR
+            if (_currentAnchor != null)
+            {
+                var anchorManager = FindFirstObjectByType<ARAnchorManager>();
+                if (anchorManager != null)
+                {
+                    anchorManager.TryRemoveAnchor(_currentAnchor);
+                }
+                _currentAnchor = null;
+            }
+
+            // Destruir modelo
+            Destroy(_currentModel);
+            _currentModel = null;
+            _isModelLoaded = false;
+
+            Debug.Log("[ModelLoadManager] 🗑️ Modelo descargado");
+            PublishMessage("Modelo descargado", MessageType.Info);
+        }
+
+        public void UpdateModelPosition(Vector3 newPosition)
         {
             if (_currentModel != null)
             {
-                // ✅ Destruir ancla si existe - AR Foundation 6
-                if (_currentAnchor != null)
-                {
-                    var anchorManager = FindFirstObjectByType<ARAnchorManager>();
-                    if (anchorManager != null)
-                    {
-                        // Usar TryRemoveAnchor en lugar de RemoveAnchor
-                        if (!anchorManager.TryRemoveAnchor(_currentAnchor))
-                        {
-                            Debug.LogWarning("[ModelLoadManager] No se pudo remover ancla.");
-                        }
-                    }
-                    _currentAnchor = null;
-                }
+                _currentModel.transform.position = newPosition;
+            }
+        }
 
-                // Destruir modelo
-                Destroy(_currentModel);
-                _currentModel = null;
-                _currentModelName = null;
-                _isModelLoaded = false;
+        public void UpdateModelRotation(Quaternion newRotation)
+        {
+            if (_currentModel != null)
+            {
+                _currentModel.transform.rotation = newRotation;
+            }
+        }
 
-                Debug.Log("[ModelLoadManager] Modelo descargado.");
-
-                EventBus.Instance.Publish(new ShowMessageEvent
-                {
-                    Message = "Modelo descargado.",
-                    Type = MessageType.Info,
-                    Duration = 2f
-                });
+        public void UpdateModelScale(float scale)
+        {
+            if (_currentModel != null)
+            {
+                _currentModel.transform.localScale = Vector3.one * scale;
             }
         }
 
@@ -558,47 +342,41 @@ namespace IndoorNavAR.Core.Managers
 
         #region Utilities
 
-        /// <summary>
-        /// Verifica si hay un modelo predeterminado asignado.
-        /// </summary>
-        public bool HasDefaultModel()
+        private void PublishMessage(string message, MessageType type)
         {
-            return _defaultModelPrefab != null;
-        }
-
-        /// <summary>
-        /// Verifica si un modelo existe en Resources.
-        /// </summary>
-        public bool ModelExists(string modelName)
-        {
-            string path = string.IsNullOrEmpty(_resourcesFolder) 
-                ? modelName 
-                : $"{_resourcesFolder}/{modelName}";
-            
-            GameObject modelPrefab = Resources.Load<GameObject>(path);
-            return modelPrefab != null;
+            EventBus.Instance?.Publish(new ShowMessageEvent
+            {
+                Message = message,
+                Type = type,
+                Duration = type == MessageType.Error ? 5f : 3f
+            });
         }
 
         #endregion
 
         #region Debug
 
-        [ContextMenu("Debug: Load Default Model")]
-        private void DebugLoadDefaultModel()
+        [ContextMenu("🔨 Load Model on Largest Plane")]
+        private void DebugLoadModel()
         {
-            _ = LoadDefaultModel(Vector3.zero, Quaternion.identity);
+            _ = LoadModelOnLargestPlaneAsync();
         }
 
-        [ContextMenu("Debug: Load Default Model On Largest Plane")]
-        private void DebugLoadDefaultModelOnPlane()
-        {
-            _ = LoadDefaultModelOnLargestPlane();
-        }
-
-        [ContextMenu("Debug: Unload Current Model")]
+        [ContextMenu("🗑️ Unload Model")]
         private void DebugUnloadModel()
         {
             UnloadCurrentModel();
+        }
+
+        [ContextMenu("ℹ️ Model Info")]
+        private void DebugInfo()
+        {
+            Debug.Log("========== MODEL INFO ==========");
+            Debug.Log($"Prefab: {(_modelPrefab != null ? _modelPrefab.name : "None")}");
+            Debug.Log($"Loaded: {_isModelLoaded}");
+            Debug.Log($"Current: {(_currentModel != null ? _currentModel.name : "None")}");
+            Debug.Log($"Anchored: {(_currentAnchor != null ? "Yes" : "No")}");
+            Debug.Log("================================");
         }
 
         #endregion

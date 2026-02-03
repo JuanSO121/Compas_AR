@@ -11,19 +11,26 @@ namespace IndoorNavAR.Core
 {
     /// <summary>
     /// Gestor de persistencia para guardar y cargar sesiones.
-    /// Serializa waypoints, configuración y estado del modelo.
+    /// ✅ Compatible con Unity 6 y ModelLoadManager simplificado
+    /// ✅ Serializa waypoints y estado del modelo
+    /// ✅ Auto-guardado opcional
     /// </summary>
     public class PersistenceManager : MonoBehaviour
     {
-        [Header("Configuración")]
+        [Header("⚙️ Configuración")]
         [SerializeField] private string _saveFileName = "navigation_session.json";
         [SerializeField] private bool _usePlayerPrefs = false;
-        [SerializeField] private bool _autoSaveEnabled = true;
-        [SerializeField] private float _autoSaveInterval = 60f; // segundos
+        
+        [Header("💾 Auto-Guardado")]
+        [SerializeField] private bool _autoSaveEnabled = false;
+        [SerializeField] private float _autoSaveInterval = 60f;
 
-        [Header("Referencias")]
+        [Header("📦 Referencias")]
         [SerializeField] private WaypointManager _waypointManager;
         [SerializeField] private ModelLoadManager _modelLoadManager;
+
+        [Header("🐛 Debug")]
+        [SerializeField] private bool _logOperations = true;
 
         private string SaveFilePath => Path.Combine(Application.persistentDataPath, _saveFileName);
         private float _timeSinceLastAutoSave;
@@ -32,7 +39,7 @@ namespace IndoorNavAR.Core
 
         private void Awake()
         {
-            ValidateDependencies();
+            FindDependencies();
         }
 
         private void Update()
@@ -53,20 +60,30 @@ namespace IndoorNavAR.Core
 
         #region Initialization
 
-        private void ValidateDependencies()
+        private void FindDependencies()
         {
             if (_waypointManager == null)
-                _waypointManager = FindFirstObjectByType<WaypointManager>();
-
-            if (_modelLoadManager == null)
-                _modelLoadManager = FindFirstObjectByType<ModelLoadManager>();
-
-            if (_waypointManager == null)
             {
-                Debug.LogWarning("[PersistenceManager] WaypointManager no encontrado.");
+                _waypointManager = FindFirstObjectByType<WaypointManager>();
             }
 
-            Debug.Log($"[PersistenceManager] Ruta de guardado: {SaveFilePath}");
+            if (_modelLoadManager == null)
+            {
+                _modelLoadManager = FindFirstObjectByType<ModelLoadManager>();
+            }
+
+            // Validación
+            if (_waypointManager == null)
+            {
+                Debug.LogWarning("[PersistenceManager] ⚠️ WaypointManager no encontrado");
+            }
+
+            if (_modelLoadManager == null)
+            {
+                Debug.LogWarning("[PersistenceManager] ⚠️ ModelLoadManager no encontrado");
+            }
+
+            Log($"📂 Ruta de guardado: {SaveFilePath}");
         }
 
         #endregion
@@ -74,13 +91,13 @@ namespace IndoorNavAR.Core
         #region Save Session
 
         /// <summary>
-        /// Guarda la sesión actual de forma asíncrona.
+        /// Guarda la sesión actual de forma asíncrona
         /// </summary>
         public async Task<bool> SaveSession()
         {
             try
             {
-                Debug.Log("[PersistenceManager] Guardando sesión...");
+                Log("💾 Guardando sesión...");
 
                 // Crear datos de sesión
                 SessionData sessionData = CreateSessionData();
@@ -88,40 +105,26 @@ namespace IndoorNavAR.Core
                 // Serializar a JSON
                 string json = JsonUtility.ToJson(sessionData, true);
 
+                // Guardar según configuración
                 if (_usePlayerPrefs)
                 {
-                    // Guardar en PlayerPrefs
                     await Task.Run(() => PlayerPrefs.SetString("SessionData", json));
                     PlayerPrefs.Save();
                 }
                 else
                 {
-                    // Guardar en archivo
                     await Task.Run(() => File.WriteAllText(SaveFilePath, json));
                 }
 
-                EventBus.Instance.Publish(new ShowMessageEvent
-                {
-                    Message = "Sesión guardada correctamente.",
-                    Type = MessageType.Success,
-                    Duration = 2f
-                });
-
-                Debug.Log($"[PersistenceManager] Sesión guardada: {sessionData.waypointCount} waypoints.");
+                PublishMessage($"Sesión guardada: {sessionData.waypointCount} waypoints", MessageType.Success);
+                Log($"✅ Sesión guardada exitosamente");
 
                 return true;
             }
             catch (Exception ex)
             {
-                Debug.LogError($"[PersistenceManager] Error guardando sesión: {ex.Message}");
-
-                EventBus.Instance.Publish(new ShowMessageEvent
-                {
-                    Message = "Error al guardar sesión.",
-                    Type = MessageType.Error,
-                    Duration = 3f
-                });
-
+                Debug.LogError($"[PersistenceManager] ❌ Error guardando: {ex.Message}");
+                PublishMessage("Error al guardar sesión", MessageType.Error);
                 return false;
             }
         }
@@ -143,14 +146,19 @@ namespace IndoorNavAR.Core
                 data.waypointCount = data.waypoints.Count;
             }
 
-            // Datos del modelo
+            // Datos del modelo (solo si está cargado)
             if (_modelLoadManager != null && _modelLoadManager.IsModelLoaded)
             {
-                data.hasModel = true;
-                data.modelName = _modelLoadManager.CurrentModelName;
-                data.modelPosition = _modelLoadManager.CurrentModel.transform.position;
-                data.modelRotation = _modelLoadManager.CurrentModel.transform.rotation;
-                data.modelScale = _modelLoadManager.CurrentModel.transform.localScale.x;
+                var model = _modelLoadManager.CurrentModel;
+                
+                if (model != null)
+                {
+                    data.hasModel = true;
+                    data.modelName = _modelLoadManager.CurrentModelName;
+                    data.modelPosition = model.transform.position;
+                    data.modelRotation = model.transform.rotation;
+                    data.modelScale = model.transform.localScale.x;
+                }
             }
 
             return data;
@@ -161,18 +169,18 @@ namespace IndoorNavAR.Core
         #region Load Session
 
         /// <summary>
-        /// Carga una sesión guardada de forma asíncrona.
+        /// Carga una sesión guardada de forma asíncrona
         /// </summary>
         public async Task<bool> LoadSession()
         {
             try
             {
-                Debug.Log("[PersistenceManager] Cargando sesión...");
+                Log("📂 Cargando sesión...");
 
                 // Verificar si existe guardado
                 if (!HasSavedSession())
                 {
-                    Debug.Log("[PersistenceManager] No hay sesión guardada.");
+                    Log("⚠️ No hay sesión guardada");
                     return false;
                 }
 
@@ -190,7 +198,7 @@ namespace IndoorNavAR.Core
 
                 if (string.IsNullOrEmpty(json))
                 {
-                    Debug.LogWarning("[PersistenceManager] Archivo de guardado vacío.");
+                    Debug.LogWarning("[PersistenceManager] ⚠️ Archivo vacío");
                     return false;
                 }
 
@@ -199,62 +207,58 @@ namespace IndoorNavAR.Core
 
                 if (sessionData == null)
                 {
-                    Debug.LogError("[PersistenceManager] Error deserializando datos.");
+                    Debug.LogError("[PersistenceManager] ❌ Error deserializando");
                     return false;
                 }
 
                 // Cargar datos
                 await LoadSessionData(sessionData);
 
-                EventBus.Instance.Publish(new ShowMessageEvent
-                {
-                    Message = $"Sesión cargada: {sessionData.waypointCount} waypoints.",
-                    Type = MessageType.Success,
-                    Duration = 3f
-                });
-
-                Debug.Log($"[PersistenceManager] Sesión cargada: {sessionData.waypointCount} waypoints.");
+                PublishMessage($"Sesión cargada: {sessionData.waypointCount} waypoints", MessageType.Success);
+                Log($"✅ Sesión cargada: {sessionData.waypointCount} waypoints");
 
                 return true;
             }
             catch (Exception ex)
             {
-                Debug.LogError($"[PersistenceManager] Error cargando sesión: {ex.Message}");
-
-                EventBus.Instance.Publish(new ShowMessageEvent
-                {
-                    Message = "Error al cargar sesión.",
-                    Type = MessageType.Error,
-                    Duration = 3f
-                });
-
+                Debug.LogError($"[PersistenceManager] ❌ Error cargando: {ex.Message}");
+                PublishMessage("Error al cargar sesión", MessageType.Error);
                 return false;
             }
         }
 
         private async Task LoadSessionData(SessionData data)
         {
-            // Cargar modelo si existe
-            if (data.hasModel && _modelLoadManager != null)
+            // PASO 1: Cargar modelo si existe
+            if (data.hasModel && _modelLoadManager != null && !string.IsNullOrEmpty(data.modelName))
             {
-                bool modelLoaded = await _modelLoadManager.LoadModelFromResources(
-                    data.modelName, 
-                    data.modelPosition, 
+                Log($"📦 Cargando modelo: {data.modelName}");
+                
+                // Cargar modelo en la posición guardada
+                bool modelLoaded = await _modelLoadManager.LoadModel(
+                    data.modelPosition,
                     data.modelRotation
                 );
 
                 if (modelLoaded)
                 {
+                    // Aplicar escala guardada
                     _modelLoadManager.UpdateModelScale(data.modelScale);
+                    Log($"✅ Modelo cargado y configurado");
                 }
+                else
+                {
+                    Debug.LogWarning("[PersistenceManager] ⚠️ No se pudo cargar el modelo");
+                }
+
+                // Esperar estabilización del modelo
+                await Task.Delay(500);
             }
 
-            // Pequeño delay para asegurar que el modelo esté colocado
-            await Task.Delay(500);
-
-            // Cargar waypoints
+            // PASO 2: Cargar waypoints
             if (_waypointManager != null && data.waypoints != null && data.waypoints.Count > 0)
             {
+                Log($"📍 Cargando {data.waypoints.Count} waypoints");
                 _waypointManager.LoadWaypoints(data.waypoints);
             }
         }
@@ -264,7 +268,7 @@ namespace IndoorNavAR.Core
         #region Utilities
 
         /// <summary>
-        /// Verifica si existe una sesión guardada.
+        /// Verifica si existe una sesión guardada
         /// </summary>
         public bool HasSavedSession()
         {
@@ -279,7 +283,7 @@ namespace IndoorNavAR.Core
         }
 
         /// <summary>
-        /// Elimina los datos guardados.
+        /// Elimina los datos guardados
         /// </summary>
         public void ClearSavedData()
         {
@@ -298,23 +302,17 @@ namespace IndoorNavAR.Core
                     }
                 }
 
-                EventBus.Instance.Publish(new ShowMessageEvent
-                {
-                    Message = "Datos guardados eliminados.",
-                    Type = MessageType.Info,
-                    Duration = 2f
-                });
-
-                Debug.Log("[PersistenceManager] Datos guardados eliminados.");
+                PublishMessage("Datos eliminados", MessageType.Info);
+                Log("🗑️ Datos guardados eliminados");
             }
             catch (Exception ex)
             {
-                Debug.LogError($"[PersistenceManager] Error eliminando datos: {ex.Message}");
+                Debug.LogError($"[PersistenceManager] ❌ Error eliminando: {ex.Message}");
             }
         }
 
         /// <summary>
-        /// Obtiene información de la última sesión guardada.
+        /// Obtiene información de la última sesión guardada
         /// </summary>
         public string GetLastSaveInfo()
         {
@@ -336,7 +334,7 @@ namespace IndoorNavAR.Core
 
                 SessionData data = JsonUtility.FromJson<SessionData>(json);
 
-                return $"Guardado: {data.timestamp}\nWaypoints: {data.waypointCount}";
+                return $"Guardado: {data.timestamp}\nWaypoints: {data.waypointCount}\nModelo: {(data.hasModel ? data.modelName : "Ninguno")}";
             }
             catch
             {
@@ -344,41 +342,119 @@ namespace IndoorNavAR.Core
             }
         }
 
+        /// <summary>
+        /// Obtiene estadísticas de la sesión guardada
+        /// </summary>
+        public SessionStats GetSessionStats()
+        {
+            var stats = new SessionStats
+            {
+                hasSession = HasSavedSession(),
+                waypointCount = 0,
+                hasModel = false,
+                modelName = "None",
+                timestamp = "N/A"
+            };
+
+            if (!stats.hasSession)
+                return stats;
+
+            try
+            {
+                string json = _usePlayerPrefs 
+                    ? PlayerPrefs.GetString("SessionData", "") 
+                    : File.ReadAllText(SaveFilePath);
+
+                SessionData data = JsonUtility.FromJson<SessionData>(json);
+
+                if (data != null)
+                {
+                    stats.waypointCount = data.waypointCount;
+                    stats.hasModel = data.hasModel;
+                    stats.modelName = data.modelName ?? "None";
+                    stats.timestamp = data.timestamp;
+                }
+            }
+            catch (Exception ex)
+            {
+                Debug.LogError($"[PersistenceManager] Error obteniendo stats: {ex.Message}");
+            }
+
+            return stats;
+        }
+
+        #endregion
+
+        #region Helpers
+
+        private void Log(string message)
+        {
+            if (_logOperations)
+            {
+                Debug.Log($"[PersistenceManager] {message}");
+            }
+        }
+
+        private void PublishMessage(string message, MessageType type)
+        {
+            EventBus.Instance?.Publish(new ShowMessageEvent
+            {
+                Message = message,
+                Type = type,
+                Duration = type == MessageType.Error ? 5f : 3f
+            });
+        }
+
         #endregion
 
         #region Debug
 
-        [ContextMenu("Debug: Save Current Session")]
+        [ContextMenu("💾 Save Session")]
         private void DebugSaveSession()
         {
             _ = SaveSession();
         }
 
-        [ContextMenu("Debug: Load Saved Session")]
+        [ContextMenu("📂 Load Session")]
         private void DebugLoadSession()
         {
             _ = LoadSession();
         }
 
-        [ContextMenu("Debug: Clear Saved Data")]
+        [ContextMenu("🗑️ Clear Data")]
         private void DebugClearData()
         {
             ClearSavedData();
         }
 
-        [ContextMenu("Debug: Show Save Info")]
-        private void DebugShowSaveInfo()
+        [ContextMenu("ℹ️ Show Info")]
+        private void DebugShowInfo()
         {
-            Debug.Log($"[PersistenceManager] {GetLastSaveInfo()}");
+            Debug.Log("========== SESSION INFO ==========");
+            Debug.Log(GetLastSaveInfo());
+            Debug.Log("==================================");
+        }
+
+        [ContextMenu("📊 Show Stats")]
+        private void DebugShowStats()
+        {
+            var stats = GetSessionStats();
+            Debug.Log("========== SESSION STATS ==========");
+            Debug.Log($"Tiene sesión: {stats.hasSession}");
+            Debug.Log($"Waypoints: {stats.waypointCount}");
+            Debug.Log($"Tiene modelo: {stats.hasModel}");
+            Debug.Log($"Modelo: {stats.modelName}");
+            Debug.Log($"Fecha: {stats.timestamp}");
+            Debug.Log("===================================");
         }
 
         #endregion
     }
 
-    #region Session Data Structure
+    #region Data Structures
 
     /// <summary>
-    /// Estructura de datos para serializar sesiones completas.
+    /// Estructura de datos para serializar sesiones completas
     /// </summary>
     [Serializable]
     public class SessionData
@@ -396,6 +472,18 @@ namespace IndoorNavAR.Core
         public Vector3 modelPosition;
         public Quaternion modelRotation;
         public float modelScale;
+    }
+
+    /// <summary>
+    /// Estadísticas de sesión guardada
+    /// </summary>
+    public struct SessionStats
+    {
+        public bool hasSession;
+        public int waypointCount;
+        public bool hasModel;
+        public string modelName;
+        public string timestamp;
     }
 
     #endregion
