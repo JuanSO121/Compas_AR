@@ -24,6 +24,7 @@ namespace IndoorNavAR.Core
         [SerializeField] private ModelLoadManager      _modelLoadManager;
         [SerializeField] private PlacementController   _placementController;
         [SerializeField] private PersistenceManager    _persistenceManager;
+        [SerializeField] private AROriginAligner _arOriginAligner;
 
         [Header("🧭 Sistema de Navegación")]
         [SerializeField] private MultiLevelNavMeshGenerator _walkableSurfaceGenerator;
@@ -85,6 +86,7 @@ namespace IndoorNavAR.Core
             _navMeshCoordinator     ??= FindFirstObjectByType<NavMeshAgentCoordinator>();
 
             ValidateComponents();
+            _arOriginAligner ??= FindFirstObjectByType<AROriginAligner>();
         }
 
         private void ValidateComponents()
@@ -134,6 +136,33 @@ namespace IndoorNavAR.Core
         {
             LogEvent($"📦 Modelo cargado: {evt.ModelName}");
             ChangeState(AppMode.ModelPlacement);
+
+            // Alinear XR Origin al StartPoint del modelo recién cargado.
+            // AROriginAligner espera sus propios _delayFrames antes de ejecutar,
+            // dando tiempo a que los transforms del GLB se actualicen.
+            if (_arOriginAligner != null)
+            {
+                _arOriginAligner.AlignToStartPoint();
+                Debug.Log("[NavManager] 🎯 Alineando XR Origin al StartPoint...");
+            }
+            else
+            {
+                // Si no hay aligner, al menos teleportar el agente (fallback)
+                StartCoroutine(TeleportAgentNextFrame());
+            }
+        }
+
+        private System.Collections.IEnumerator TeleportAgentNextFrame()
+        {
+            yield return null;
+            yield return null;
+            var sp = NavigationStartPointManager.GetStartPointForLevel(0);
+            if (sp != null)
+            {
+                sp.ConfirmModelPositioned();
+                sp.ReteleportAgent();
+                Debug.Log("[NavManager] 📍 Agente teleportado al StartPoint (fallback).");
+            }
         }
 
         private void OnNavigationStarted(NavigationStartedEvent evt)
@@ -265,11 +294,14 @@ namespace IndoorNavAR.Core
                 {
                     Debug.Log($"[NavManager] ✅ StartPoint encontrado: {startPoint.gameObject.name}");
                     startPoint.ReteleportAgent();
+                    _arOriginAligner?.ForceRealign();
                 }
                 else
                 {
                     Debug.LogWarning("[NavManager] ⚠️ Sin NavigationStartPoint — agente no reposicionado.");
                 }
+
+                
 
                 ChangeState(AppMode.Navigation);
                 Debug.Log("[NavManager] ✅ InitializeFromSavedSession COMPLETADO.");

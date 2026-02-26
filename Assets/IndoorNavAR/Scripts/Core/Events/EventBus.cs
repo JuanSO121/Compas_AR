@@ -5,9 +5,6 @@ using UnityEngine;
 
 namespace IndoorNavAR.Core.Events
 {
-    /// <summary>
-    /// Sistema centralizado de eventos para comunicación desacoplada entre componentes.
-    /// </summary>
     public class EventBus : MonoBehaviour
     {
         private static EventBus _instance;
@@ -22,7 +19,6 @@ namespace IndoorNavAR.Core.Events
                     {
                         GameObject go = new GameObject("[EventBus]");
                         _instance = go.AddComponent<EventBus>();
-
 #if !UNITY_EDITOR
                         DontDestroyOnLoad(go);
 #endif
@@ -161,6 +157,15 @@ namespace IndoorNavAR.Core.Events
         public string WaypointId;
     }
 
+    // ✅ FIX v3 — NUEVO EVENTO
+    // Publicado por WaypointManager.LoadWaypoints() al finalizar la carga en lote.
+    // MobileNavigationUI lo escucha para refrescar la lista UNA SOLA VEZ,
+    // evitando N refreshes simultáneos por N WaypointPlacedEvents individuales.
+    public struct WaypointsBatchLoadedEvent
+    {
+        public int Count;
+    }
+
     // ========== Model Events ==========
 
     public struct ModelLoadedEvent
@@ -219,10 +224,6 @@ namespace IndoorNavAR.Core.Events
         public Vector3 CurrentPosition;
     }
 
-    /// <summary>
-    /// Publicado cuando el agente transiciona entre pisos.
-    /// ✅ Requerido por NavigationAgent.UpdateCurrentLevel()
-    /// </summary>
     public struct FloorTransitionEvent
     {
         public int FromLevel;

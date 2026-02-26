@@ -1,12 +1,14 @@
 // File: ModelLoadManager.cs
-// ✅ FIX #1 — RestoreModelTransform() incluye guard contra doble instanciación:
-//             si ya existe un modelo cargado, lo destruye antes de instanciar uno nuevo.
-// ✅ RestoreModelTransform NO publica ModelLoadedEvent — evita disparar NavMeshAgentCoordinator.
+// ✅ FIX #1 — RestoreModelTransform() incluye guard contra doble instanciación.
+// ✅ RestoreModelTransform NO publica ModelLoadedEvent.
 // ✅ LoadModel (flujo completo) sí publica ModelLoadedEvent.
+// ✅ FIX #2 — HideNavMeshObstacles(): oculta Renderer/MeshFilter de GameObjects
+//             con tag "NavMeshObstacle" (solo eran para el bake, no deben verse en runtime).
 
 using System;
 using System.Threading.Tasks;
 using UnityEngine;
+using UnityEngine.AI;
 using UnityEngine.XR.ARFoundation;
 using IndoorNavAR.Core.Events;
 
@@ -27,6 +29,12 @@ namespace IndoorNavAR.Core.Managers
 
         [Header("🔗 Integración de Navegación")]
         [SerializeField] private bool _autoConnectStairs = true;
+
+        [Header("🚫 NavMesh Obstacles")]
+        [Tooltip("Si true, los GameObjects con tag 'NavMeshObstacle' se ocultarán al cargar el modelo (solo eran para el bake).")]
+        [SerializeField] private bool _hideNavMeshObstacles = true;
+        [Tooltip("Si true, también destruye los Collider de los obstáculos. Déjalo en false si los necesitas para física.")]
+        [SerializeField] private bool _destroyObstacleColliders = false;
 
         private GameObject _currentModel;
         private ARAnchor   _currentAnchor;
@@ -81,37 +89,31 @@ namespace IndoorNavAR.Core.Managers
 
         /// <summary>
         /// FLUJO LIGERO — solo para restaurar sesión guardada.
-        ///
-        /// ✅ FIX #1: Incluye guard contra doble instanciación.
-        ///    Si ya hay un modelo cargado (_currentModel != null), lo destruye
-        ///    antes de instanciar uno nuevo. Esto evita que la escena tenga
-        ///    dos GameObjects del prefab del edificio simultáneamente.
-        ///
-        /// NO publica ModelLoadedEvent (evita disparar NavMeshAgentCoordinator).
-        /// NO crea anclas AR, NO conecta escaleras, NO optimiza sombras.
+        /// NO publica ModelLoadedEvent.
         /// </summary>
         public async Task<bool> RestoreModelTransform(Vector3 position, Quaternion rotation, float scale = 1f)
         {
             try
             {
-                // ✅ FIX #1 — Caso 1: Ya hay modelo en escena → solo reposicionarlo.
-                // No se destruye ni se reinstancia. Esto es el caso ideal.
+                // Caso 1: Ya hay modelo → solo reposicionarlo
                 if (_currentModel != null && _currentModel.activeInHierarchy)
                 {
                     _currentModel.transform.SetPositionAndRotation(position, rotation);
                     _currentModel.transform.localScale = Vector3.one * scale;
                     _isModelLoaded = true;
+
+                    // ✅ Ocultar obstáculos aunque el modelo ya existiera
+                    if (_hideNavMeshObstacles)
+                        HideNavMeshObstacles(_currentModel);
+
                     Debug.Log($"[ModelLoadManager] 📍 Modelo reposicionado en {position}");
-                    // ⚠️ NO publicar ModelLoadedEvent
                     return true;
                 }
 
-                // ✅ FIX #1 — Caso 2: El _currentModel es null pero puede haber
-                // una instancia huérfana en escena (de una sesión anterior en Editor).
-                // Buscarla por tag y destruirla antes de instanciar.
+                // Caso 2: Instancias huérfanas → destruirlas
                 DestroyOrphanModelInstances();
 
-                // Caso 3: No hay modelo — instanciar mínimamente.
+                // Caso 3: Sin modelo → instanciar
                 if (_modelPrefab == null)
                 {
                     Debug.LogError("[ModelLoadManager] ❌ No hay prefab para restaurar.");
@@ -127,16 +129,17 @@ namespace IndoorNavAR.Core.Managers
                 _currentModel.tag  = "3DModel";
                 _isModelLoaded     = true;
 
-                // Solo deshabilitar colliders — mínimo procesamiento
+                // Deshabilitar colliders del modelo base (los de escalera los recrea PersistenceManager)
                 foreach (var col in _currentModel.GetComponentsInChildren<Collider>())
                     col.enabled = false;
 
-                // Yield extra para que Unity propague el transform a los hijos
-                // (NavigationStartPoints necesitan transform.position correcto)
+                // ✅ FIX #2: Ocultar obstáculos de bake
+                if (_hideNavMeshObstacles)
+                    HideNavMeshObstacles(_currentModel);
+
                 await Task.Yield();
 
                 Debug.Log($"[ModelLoadManager] ✅ Modelo restaurado en {position}");
-                // ⚠️ NO publicar ModelLoadedEvent — evita disparar NavMeshAgentCoordinator
                 return true;
             }
             catch (Exception ex)
@@ -146,30 +149,25 @@ namespace IndoorNavAR.Core.Managers
             }
         }
 
-        /// <summary>
-        /// ✅ FIX #1 — Destruye instancias huérfanas del modelo en escena.
-        /// Busca por tag "3DModel". Útil en el Editor donde el modelo puede
-        /// haber sido arrastrado a la jerarquía manualmente durante desarrollo.
-        /// </summary>
         private void DestroyOrphanModelInstances()
         {
             var orphans = GameObject.FindGameObjectsWithTag("3DModel");
             if (orphans.Length == 0) return;
 
-            Debug.LogWarning($"[ModelLoadManager] ⚠️ Encontradas {orphans.Length} instancia(s) huérfana(s) del modelo. Destruyendo...");
+            Debug.LogWarning($"[ModelLoadManager] ⚠️ {orphans.Length} instancia(s) huérfana(s) encontradas. Destruyendo...");
             foreach (var orphan in orphans)
             {
                 if (orphan != _currentModel)
                 {
-                    Debug.Log($"[ModelLoadManager] 🗑️ Destruyendo instancia huérfana: {orphan.name}");
+                    Debug.Log($"[ModelLoadManager] 🗑️ Destruyendo: {orphan.name}");
                     Destroy(orphan);
                 }
             }
         }
 
         /// <summary>
-        /// FLUJO COMPLETO — para primera vez o cuando el usuario coloca el modelo en AR.
-        /// Sí publica ModelLoadedEvent → NavMeshAgentCoordinator generará NavMesh.
+        /// FLUJO COMPLETO — para primera vez o colocación en AR.
+        /// Sí publica ModelLoadedEvent.
         /// </summary>
         public async Task<bool> LoadModel(Vector3 position, Quaternion rotation)
         {
@@ -203,7 +201,6 @@ namespace IndoorNavAR.Core.Managers
 
                 _isModelLoaded = true;
 
-                // ✅ Publicar evento — el coordinador generará NavMesh
                 EventBus.Instance?.Publish(new ModelLoadedEvent
                 {
                     ModelInstance = _currentModel,
@@ -249,6 +246,66 @@ namespace IndoorNavAR.Core.Managers
 
         #endregion
 
+        #region Optimization
+
+        private void OptimizeModel(GameObject model)
+        {
+            var cols  = model.GetComponentsInChildren<Collider>();
+            var rends = model.GetComponentsInChildren<Renderer>();
+            foreach (var c in cols)  c.enabled = false;
+            foreach (var r in rends) r.shadowCastingMode = UnityEngine.Rendering.ShadowCastingMode.Off;
+            Debug.Log($"[ModelLoadManager] 🔧 {cols.Length} colliders, {rends.Length} renderers optimizados");
+
+            // ✅ FIX #2: Ocultar obstáculos de NavMesh (solo eran para el bake)
+            if (_hideNavMeshObstacles)
+                HideNavMeshObstacles(model);
+        }
+
+        /// <summary>
+        /// Oculta visualmente los GameObjects con tag "NavMeshObstacle".
+        /// Solo desactiva Renderer y MeshFilter. Los Collider se preservan
+        /// por defecto (el agente los necesita para no atravesar geometría).
+        ///
+        /// ALTERNATIVA SIN TAG: si prefieres detectar por componente en lugar
+        /// de tag, activa _detectByComponent en el Inspector (ver campo abajo).
+        /// </summary>
+        private void HideNavMeshObstacles(GameObject model)
+        {
+            if (model == null) return;
+
+            int hidden = 0;
+
+            foreach (Transform child in model.GetComponentsInChildren<Transform>(includeInactive: true))
+            {
+                bool isObstacle = child.CompareTag("NavMeshObstacle")
+                               || child.GetComponent<NavMeshObstacle>() != null;
+
+                if (!isObstacle) continue;
+
+                // Ocultar Renderer
+                var rend = child.GetComponent<Renderer>();
+                if (rend != null) rend.enabled = false;
+
+                // Destruir el componente NavMeshObstacle (ya no sirve en runtime)
+                var obstacle = child.GetComponent<NavMeshObstacle>();
+                if (obstacle != null) Destroy(obstacle);
+
+                // Destruir colliders solo si se pidió explícitamente
+                if (_destroyObstacleColliders)
+                {
+                    foreach (var col in child.GetComponents<Collider>())
+                        Destroy(col);
+                }
+
+                hidden++;
+            }
+
+            if (hidden > 0)
+                Debug.Log($"[ModelLoadManager] 🚫 {hidden} NavMeshObstacle(s) ocultos.");
+        }
+
+        #endregion
+
         #region Navigation Integration
 
         private void ConnectNavigationSystems()
@@ -270,19 +327,6 @@ namespace IndoorNavAR.Core.Managers
                 try { sh.Clear(); }
                 catch (Exception ex) { Debug.LogError($"[ModelLoadManager] ❌ Clear escalera: {ex.Message}"); }
             }
-        }
-
-        #endregion
-
-        #region Optimization
-
-        private void OptimizeModel(GameObject model)
-        {
-            var cols  = model.GetComponentsInChildren<Collider>();
-            var rends = model.GetComponentsInChildren<Renderer>();
-            foreach (var c in cols)  c.enabled = false;
-            foreach (var r in rends) r.shadowCastingMode = UnityEngine.Rendering.ShadowCastingMode.Off;
-            Debug.Log($"[ModelLoadManager] 🔧 {cols.Length} colliders, {rends.Length} renderers");
         }
 
         #endregion
@@ -374,9 +418,10 @@ namespace IndoorNavAR.Core.Managers
 
         #region Debug
 
-        [ContextMenu("🔨 Load on Largest Plane")] private void DbgLoad()   => _ = LoadModelOnLargestPlaneAsync();
-        [ContextMenu("🗑️ Unload")]                 private void DbgUnload() => UnloadCurrentModel();
-        [ContextMenu("🔗 Reconnect Stairs")]        private void DbgStairs() => ConnectNavigationSystems();
+        [ContextMenu("🔨 Load on Largest Plane")]   private void DbgLoad()     => _ = LoadModelOnLargestPlaneAsync();
+        [ContextMenu("🗑️ Unload")]                   private void DbgUnload()   => UnloadCurrentModel();
+        [ContextMenu("🔗 Reconnect Stairs")]          private void DbgStairs()   => ConnectNavigationSystems();
+        [ContextMenu("🚫 Hide Obstacles Now")]        private void DbgObstacles() => HideNavMeshObstacles(_currentModel);
         [ContextMenu("ℹ️ Info")]
         private void DbgInfo()
         {

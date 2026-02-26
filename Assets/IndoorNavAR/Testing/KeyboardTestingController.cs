@@ -4,6 +4,7 @@ using UnityEngine;
 using IndoorNavAR.Core.Managers;
 using IndoorNavAR.Navigation;
 using IndoorNavAR.Core.Controllers;
+using UnityEngine.InputSystem;
 
 namespace IndoorNavAR.Testing
 {
@@ -58,75 +59,44 @@ namespace IndoorNavAR.Testing
                 _placementController = FindFirstObjectByType<PlacementController>();
         }
 
-        private void HandleKeyboardInput()
-        {
-            // [W] - Crear Waypoint
-            if (Input.GetKeyDown(KeyCode.W))
-            {
-                CreateWaypointAtRandomPosition();
-            }
+private void HandleKeyboardInput()
+{
+    if (Keyboard.current == null)
+        return;
 
-            // [N] - Generar NavMesh
-            if (Input.GetKeyDown(KeyCode.N))
-            {
-                GenerateNavMesh();
-            }
+    if (Keyboard.current.wKey.wasPressedThisFrame)
+        CreateWaypointAtRandomPosition();
 
-            // [Space] - Navegar al siguiente waypoint
-            if (Input.GetKeyDown(KeyCode.Space))
-            {
-                NavigateToNextWaypoint();
-            }
+    if (Keyboard.current.nKey.wasPressedThisFrame)
+        GenerateNavMesh();
 
-            // [S] - Detener navegación
-            if (Input.GetKeyDown(KeyCode.S))
-            {
-                StopNavigation();
-            }
+    if (Keyboard.current.spaceKey.wasPressedThisFrame)
+        NavigateToNextWaypoint();
 
-            // [C] - Limpiar waypoints
-            if (Input.GetKeyDown(KeyCode.C))
-            {
-                ClearWaypoints();
-            }
+    if (Keyboard.current.sKey.wasPressedThisFrame)
+        StopNavigation();
 
-            // [1-4] - Crear 4 waypoints en grid
-            if (Input.GetKeyDown(KeyCode.Alpha1))
-            {
-                CreateTestGrid();
-            }
+    if (Keyboard.current.cKey.wasPressedThisFrame)
+        ClearWaypoints();
 
-            // [T] - Teleportar agente al origen
-            if (Input.GetKeyDown(KeyCode.T))
-            {
-                TeleportAgentToOrigin();
-            }
+    if (Keyboard.current.digit1Key.wasPressedThisFrame)
+        CreateTestGrid();
 
-            // [H] - Mostrar ayuda
-            if (Input.GetKeyDown(KeyCode.H))
-            {
-                ShowKeyboardInstructions();
-            }
+    if (Keyboard.current.tKey.wasPressedThisFrame)
+        TeleportAgentToOrigin();
 
-            // [P] - Toggle modo placement
-            if (Input.GetKeyDown(KeyCode.P))
-            {
-                TogglePlacementMode();
-            }
+    if (Keyboard.current.hKey.wasPressedThisFrame)
+        ShowKeyboardInstructions();
 
-            // [I] - Info del sistema
-            if (Input.GetKeyDown(KeyCode.I))
-            {
-                ShowSystemInfo();
-            }
+    if (Keyboard.current.pKey.wasPressedThisFrame)
+        TogglePlacementMode();
 
-            // [X] - Limpiar NavMesh
-            if (Input.GetKeyDown(KeyCode.X))
-            {
-                ClearNavMesh();
-            }
-        }
+    if (Keyboard.current.iKey.wasPressedThisFrame)
+        ShowSystemInfo();
 
+    if (Keyboard.current.xKey.wasPressedThisFrame)
+        ClearNavMesh();
+}
         #region Keyboard Actions
 
         private void CreateWaypointAtRandomPosition()
@@ -311,7 +281,7 @@ namespace IndoorNavAR.Testing
 
         private void ShowKeyboardInstructions()
         {
-            if (_instructionsShown && !Input.GetKey(KeyCode.H))
+            if (_instructionsShown && !Keyboard.current.hKey.isPressed)
                 return;
 
             _instructionsShown = true;
