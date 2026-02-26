@@ -10,20 +10,18 @@ namespace IndoorNavAR.Testing
     /// <summary>
     /// Controlador de testing mediante teclado para probar el sistema sin UI.
     /// Permite crear waypoints, generar NavMesh y navegar usando teclas.
-    /// ✅ ACTUALIZADO: Usa MultiMeshWalkableSurfaceGenerator
+    /// ✅ ACTUALIZADO: Usa MultiLevelNavMeshGenerator
     /// </summary>
     public class KeyboardTestingController : MonoBehaviour
     {
         [Header("Referencias")]
         [SerializeField] private WaypointManager _waypointManager;
-        [SerializeField] private MultiMeshWalkableSurfaceGenerator _navMeshGenerator;
+        [SerializeField] private MultiLevelNavMeshGenerator _navMeshGenerator;
         [SerializeField] private NavigationAgent _navigationAgent;
         [SerializeField] private PlacementController _placementController;
 
         [Header("Configuración")]
         [SerializeField] private bool _showInstructions = true;
-        [SerializeField] private float _waypointSpacing = 2f;
-
         private int _currentWaypointIndex = 0;
         private bool _instructionsShown = false;
 
@@ -51,7 +49,7 @@ namespace IndoorNavAR.Testing
                 _waypointManager = FindFirstObjectByType<WaypointManager>();
 
             if (_navMeshGenerator == null)
-                _navMeshGenerator = FindFirstObjectByType<MultiMeshWalkableSurfaceGenerator>();
+                _navMeshGenerator = FindFirstObjectByType<MultiLevelNavMeshGenerator>();
 
             if (_navigationAgent == null)
                 _navigationAgent = FindFirstObjectByType<NavigationAgent>();
@@ -160,16 +158,16 @@ namespace IndoorNavAR.Testing
         {
             if (_navMeshGenerator == null)
             {
-                Debug.LogError("[KeyboardTesting] MultiMeshWalkableSurfaceGenerator no encontrado.");
+                Debug.LogError("[KeyboardTesting] MultiLevelNavMeshGenerator no encontrado.");
                 return;
             }
 
-            Debug.Log("🔧 [N] Generando NavMesh (V4.0 AR Móvil)...");
-            bool success = await _navMeshGenerator.GenerateWalkableSurfaceAsync();
+            Debug.Log("🔧 [N] Generando NavMesh Multi-Nivel...");
+            bool success = await _navMeshGenerator.GenerateMultiLevelNavMeshAsync();
 
             if (success)
             {
-                Debug.Log("✅ [N] NavMesh generado exitosamente!");
+                Debug.Log("✅ [N] NavMesh multi-nivel generado exitosamente!");
             }
             else
             {
@@ -181,7 +179,7 @@ namespace IndoorNavAR.Testing
         {
             if (_navMeshGenerator == null)
             {
-                Debug.LogError("[KeyboardTesting] MultiMeshWalkableSurfaceGenerator no encontrado.");
+                Debug.LogError("[KeyboardTesting] MultiLevelNavMeshGenerator no encontrado.");
                 return;
             }
 
@@ -323,7 +321,7 @@ namespace IndoorNavAR.Testing
             Debug.Log("╠═══════════════════════════════════════════════╣");
             Debug.Log("║  [W]       - Crear Waypoint aleatorio         ║");
             Debug.Log("║  [1]       - Crear grid 2x2 de waypoints      ║");
-            Debug.Log("║  [N]       - Generar NavMesh (V4.0)           ║");
+            Debug.Log("║  [N]       - Generar NavMesh Multi-Nivel      ║");
             Debug.Log("║  [X]       - Limpiar NavMesh                  ║");
             Debug.Log("║  [SPACE]   - Navegar al siguiente waypoint    ║");
             Debug.Log("║  [S]       - Detener navegación               ║");
@@ -356,7 +354,7 @@ namespace IndoorNavAR.Testing
             style.padding = new RectOffset(10, 10, 10, 10);
 
             string info = "CONTROLES:\n" +
-                         "[W] Waypoint | [1] Grid | [N] NavMesh | [X] Clear NavMesh\n" +
+                         "[W] Waypoint | [1] Grid | [N] NavMesh Multi-Nivel | [X] Clear\n" +
                          "[SPACE] Navegar | [S] Stop | [I] Info | [H] Ayuda\n" +
                          "[C] Limpiar | [P] Placement\n\n";
 

@@ -1,626 +1,317 @@
+// File: NavigationAgent.cs
+// ============================================================================
+//  AGENTE DE NAVEGACIÓN INDOOR — IndoorNavAR
+// ============================================================================
+
 using System;
-using System.Collections.Generic;
-using System.Linq;
 using UnityEngine;
 using UnityEngine.AI;
-using IndoorNavAR.Core.Data;
 using IndoorNavAR.Core.Events;
-
+using IndoorNavAR.Core.Data;
 namespace IndoorNavAR.Navigation
 {
-    /// <summary>
-    /// Sistema de navegación OPTIMIZADO para AR con pathfinding inteligente
-    /// ✅ Sin recalculaciones innecesarias cerca de bordes
-    /// ✅ Hysteresis inteligente para estabilidad
-    /// ✅ Path caching y reutilización
-    /// ✅ Corrección predictiva sin lag
-    /// </summary>
     [RequireComponent(typeof(NavMeshAgent))]
-    public class NavigationAgent : MonoBehaviour
+    [RequireComponent(typeof(NavigationPathController))]
+    public sealed class NavigationAgent : MonoBehaviour
     {
-        [Header("🎯 Agente")]
-        [SerializeField] private NavMeshAgent _navMeshAgent;
-        
-        [Header("📊 Visualización de Ruta")]
-        [SerializeField] private LineRenderer _pathLineRenderer;
-        [SerializeField] private Color _pathColor = Color.yellow;
-        [SerializeField] private float _pathWidth = 0.1f;
-        [SerializeField] private float _pathHeightOffset = 0.1f;
+        // ─── Inspector ────────────────────────────────────────────────────────
 
-        [Header("🧠 Pathfinding Inteligente")]
-        [Tooltip("Intervalo mínimo entre recálculos de ruta (segundos)")]
-        [SerializeField] private float _minPathRecalculationInterval = 1.0f;
-        
-        [Tooltip("Distancia mínima para considerar recálculo necesario")]
-        [SerializeField] private float _pathRecalculationThreshold = 2.0f;
-        
-        [Tooltip("Usar hysteresis para evitar oscilaciones")]
-        [SerializeField] private bool _useHysteresis = true;
-        
-        [Tooltip("Margen de hysteresis (m)")]
-        [SerializeField] private float _hysteresisMargin = 0.3f;
-        
-        [Header("🚀 Optimización de Performance")]
-        [Tooltip("Cachear rutas calculadas")]
-        [SerializeField] private bool _enablePathCaching = true;
-        
-        [Tooltip("Tiempo de validez del cache (segundos)")]
-        [SerializeField] private float _pathCacheLifetime = 5.0f;
-        
-        [Tooltip("Usar path smoothing progresivo")]
-        [SerializeField] private bool _enableProgressiveSmoothing = true;
-        
-        [Header("🔧 Configuración de Movimiento")]
-        [SerializeField] private float _arrivalThreshold = 0.5f;
-        [SerializeField] private float _stoppingDistance = 0.3f;
-        
-        [Header("🎨 Animación")]
-        [SerializeField] private Animator _animator;
-        [SerializeField] private string _walkAnimParam = "IsWalking";
+        [Header("Multi-Nivel")]
+        [SerializeField]
+        private bool _detectFloorTransitions = true;
 
-        // Estado de navegación
-        private WaypointData _currentDestination;
-        private bool _isNavigating;
-        private float _navigationStartTime;
-        private float _totalDistance;
-        
-        // Optimización de pathfinding
-        private float _lastPathRecalculationTime;
-        private Vector3 _lastRecalculationPosition;
-        private NavMeshPath _cachedPath;
-        private float _pathCacheTimestamp;
-        private bool _isPathCacheValid;
-        
-        // Hysteresis para estabilidad
-        private bool _wasNearEdge;
-        private float _edgeProximityHysteresis;
-        
-        // Smoothing progresivo
-        private List<Vector3> _smoothedPath = new List<Vector3>();
-        private int _currentPathIndex = 0;
+        [Header("Eventos")]
+        [SerializeField]
+        private bool _publishEvents = true;
 
-        #region Properties
+        [Header("Debug")]
+        [SerializeField]
+        private Transform _debugDestination;
 
-        public bool IsNavigating => _isNavigating;
-        public WaypointData CurrentDestination => _currentDestination;
-        public float DistanceToDestination => _navMeshAgent.remainingDistance;
+        [SerializeField]
+        private bool _logVerbose = false;
+
+        // ─── Eventos públicos ─────────────────────────────────────────────────
+
+        public event Action<Vector3>           OnNavigationStarted;
+        public event Action                    OnArrived;
+        public event Action<NavMeshPathStatus> OnNavigationFailed;
+
+        // ─── Propiedades ──────────────────────────────────────────────────────
+
+        public bool IsNavigating       => _pathController != null && _pathController.IsNavigating;
+        public float RemainingDistance => _pathController != null ? _pathController.RemainingDistance : -1f;
+        public float CurrentSpeed      => _pathController != null ? _pathController.CurrentSpeed : 0f;
+        public Vector3 LastDestination { get; private set; }
+        public int CurrentLevel        { get; private set; } = 0;
+
+        /// <summary>Distancia restante al destino (alias para compatibilidad con KeyboardTestingController).</summary>
+        public float DistanceToDestination => RemainingDistance >= 0f ? RemainingDistance : 0f;
+
+        /// <summary>Progreso de la navegación [0–1]. 0 = inicio, 1 = llegada.</summary>
         public float ProgressPercent
         {
             get
             {
-                if (!_isNavigating || _totalDistance <= 0) return 0f;
-                return Mathf.Clamp01((_totalDistance - _navMeshAgent.remainingDistance) / _totalDistance);
+                if (!IsNavigating || _pathController?.CurrentPath == null) return 0f;
+                float total = _pathController.CurrentPath.TotalLength;
+                if (total <= 0f) return 1f;
+                return Mathf.Clamp01(1f - DistanceToDestination / total);
             }
         }
 
-        #endregion
+        // ─── Componentes ──────────────────────────────────────────────────────
 
-        #region Unity Lifecycle
+        private NavigationPathController _pathController;
+        private NavMeshAgent             _navAgent;
+
+        // ─────────────────────────────────────────────────────────────────────
+        //  UNITY LIFECYCLE
+        // ─────────────────────────────────────────────────────────────────────
 
         private void Awake()
         {
-            ValidateDependencies();
-            SetupPathVisualization();
-            InitializeOptimizedSystems();
+            _navAgent       = GetComponent<NavMeshAgent>();
+            _pathController = GetComponent<NavigationPathController>()
+                           ?? gameObject.AddComponent<NavigationPathController>();
+
+            _pathController.OnPathStarted     += HandlePathStarted;
+            _pathController.OnPathCompleted   += HandlePathCompleted;
+            _pathController.OnPathFailed      += HandlePathFailed;
+            _pathController.OnWaypointReached += HandleWaypointReached;
+        }
+
+        private void OnDestroy()
+        {
+            if (_pathController == null) return;
+            _pathController.OnPathStarted     -= HandlePathStarted;
+            _pathController.OnPathCompleted   -= HandlePathCompleted;
+            _pathController.OnPathFailed      -= HandlePathFailed;
+            _pathController.OnWaypointReached -= HandleWaypointReached;
         }
 
         private void Update()
         {
-            if (_isNavigating)
-            {
-                UpdateOptimizedNavigation();
-                UpdatePathVisualization();
-                UpdateAnimations();
-            }
+            if (!IsNavigating) return;
+            if (_detectFloorTransitions)
+                UpdateCurrentLevel();
         }
 
-        #endregion
+        // ─────────────────────────────────────────────────────────────────────
+        //  API PÚBLICA — NAVEGACIÓN
+        // ─────────────────────────────────────────────────────────────────────
 
-        #region Initialization
-
-        private void ValidateDependencies()
+        /// <summary>Inicia la navegación hacia una posición world-space.</summary>
+        public void StartNavigation(Vector3 destination)
         {
-            if (_navMeshAgent == null) _navMeshAgent = GetComponent<NavMeshAgent>();
-            if (_animator == null) _animator = GetComponent<Animator>();
-            
-            if (_navMeshAgent == null)
-            {
-                Debug.LogError("[NavigationAgent] NavMeshAgent no encontrado.");
-                enabled = false;
-            }
+            LastDestination = destination;
+            if (_logVerbose)
+                Debug.Log($"[NavigationAgent] StartNavigation → {destination:F2}");
+            _pathController.NavigateTo(destination);
         }
 
-        private void SetupPathVisualization()
-        {
-            if (_pathLineRenderer == null)
-                _pathLineRenderer = gameObject.AddComponent<LineRenderer>();
-
-            _pathLineRenderer.startWidth = _pathWidth;
-            _pathLineRenderer.endWidth = _pathWidth;
-            _pathLineRenderer.material = new Material(Shader.Find("Universal Render Pipeline/Lit"));
-            _pathLineRenderer.startColor = _pathColor;
-            _pathLineRenderer.endColor = _pathColor;
-            _pathLineRenderer.positionCount = 0;
-            _pathLineRenderer.enabled = false;
-        }
-
-        private void InitializeOptimizedSystems()
-        {
-            _lastPathRecalculationTime = -_minPathRecalculationInterval;
-            _lastRecalculationPosition = transform.position;
-            _isPathCacheValid = false;
-            _wasNearEdge = false;
-            _edgeProximityHysteresis = 0f;
-            
-            // Configurar NavMeshAgent para estabilidad
-            _navMeshAgent.stoppingDistance = _stoppingDistance;
-            _navMeshAgent.autoBraking = true;
-            _navMeshAgent.autoRepath = false; // ✅ Control manual para evitar recálculos constantes
-            
-            Debug.Log("[NavigationAgent] Sistema optimizado inicializado");
-            Debug.Log($"  • Recálculo mínimo: {_minPathRecalculationInterval}s");
-            Debug.Log($"  • Threshold: {_pathRecalculationThreshold}m");
-            Debug.Log($"  • Hysteresis: {(_useHysteresis ? "Activo" : "Inactivo")}");
-        }
-
-        #endregion
-
-        #region Public API - Navigation
-
+        /// <summary>
+        /// Navega hacia un WaypointData. Retorna true si el path se inició correctamente.
+        /// </summary>
         public bool NavigateToWaypoint(WaypointData waypoint)
         {
-            if (waypoint == null || !waypoint.IsNavigable) return false;
-            if (!_navMeshAgent.isOnNavMesh) return false;
-            
-            return NavigateToPosition(waypoint.Position, waypoint);
-        }
-
-        public bool NavigateToPosition(Vector3 destination, WaypointData waypointData = null)
-        {
-            // Validar que el destino esté en NavMesh
-            if (!NavMesh.SamplePosition(destination, out NavMeshHit hit, 2f, NavMesh.AllAreas))
+            if (waypoint == null)
             {
-                Debug.LogWarning($"[NavigationAgent] Destino fuera de NavMesh: {destination}");
+                Debug.LogWarning("[NavigationAgent] NavigateToWaypoint: waypoint es null.");
                 return false;
             }
 
-            // Intentar usar path cacheado si es válido
-            NavMeshPath pathToUse = null;
-            
-            if (_enablePathCaching && _isPathCacheValid && 
-                (Time.time - _pathCacheTimestamp) < _pathCacheLifetime &&
-                _currentDestination?.Position == destination)
+            LastDestination = waypoint.Position;
+
+            if (_logVerbose)
+                Debug.Log($"[NavigationAgent] NavigateToWaypoint → {waypoint.WaypointName} @ {waypoint.Position:F2}");
+
+            _pathController.NavigateTo(waypoint.Position);
+            return _pathController.IsNavigating;
+        }
+
+        /// <summary>Cambia el destino mientras el agente navega (recálculo inmediato).</summary>
+        public void SetDestination(Vector3 newDestination)
+        {
+            if (_logVerbose)
+                Debug.Log($"[NavigationAgent] SetDestination → {newDestination:F2}");
+            LastDestination = newDestination;
+            _pathController.NavigateTo(newDestination, forceRecalculate: true);
+        }
+
+        /// <summary>Detiene la navegación inmediatamente.</summary>
+        public void StopNavigation()
+        {
+            if (_logVerbose) Debug.Log("[NavigationAgent] StopNavigation");
+            _pathController.StopNavigation();
+        }
+
+        /// <summary>Detiene la navegación con un motivo (compatible con KeyboardTestingController y NavigationManager).</summary>
+        public void StopNavigation(string reason)
+        {
+            if (_logVerbose) Debug.Log($"[NavigationAgent] StopNavigation: {reason}");
+            _pathController.StopNavigation();
+
+            if (_publishEvents)
+                EventBus.Instance?.Publish(new NavigationCancelledEvent { Reason = reason });
+        }
+
+        /// <summary>Navega al StartPoint del nivel indicado.</summary>
+        public void NavigateToLevel(int levelIndex)
+        {
+            var startPoints = NavigationStartPointManager.GetAllStartPoints();
+            foreach (var pt in startPoints)
             {
-                pathToUse = _cachedPath;
-                Debug.Log("[NavigationAgent] Usando path cacheado");
+                if (pt.Level == levelIndex)
+                {
+                    StartNavigation(pt.Position);
+                    return;
+                }
             }
-            else
+            Debug.LogWarning($"[NavigationAgent] No hay StartPoint para nivel {levelIndex}");
+        }
+
+        // ─────────────────────────────────────────────────────────────────────
+        //  API PÚBLICA — TELEPORT
+        // ─────────────────────────────────────────────────────────────────────
+
+        /// <summary>
+        /// Teleporta el agente a <paramref name="position"/>.
+        /// Requiere que la posición esté sobre el NavMesh (radio de búsqueda 1 m).
+        /// Retorna true si el teleport tuvo éxito.
+        /// </summary>
+        public bool TeleportTo(Vector3 position)
+        {
+            if (!NavMesh.SamplePosition(position, out NavMeshHit hit, 1.0f, NavMesh.AllAreas))
             {
-                // Calcular nueva ruta
-                pathToUse = new NavMeshPath();
-                if (!_navMeshAgent.CalculatePath(hit.position, pathToUse))
-                {
-                    Debug.LogWarning("[NavigationAgent] No se pudo calcular ruta");
-                    return false;
-                }
-                
-                // Cachear ruta
-                if (_enablePathCaching)
-                {
-                    _cachedPath = pathToUse;
-                    _pathCacheTimestamp = Time.time;
-                    _isPathCacheValid = true;
-                }
+                Debug.LogWarning($"[NavigationAgent] TeleportTo: sin NavMesh en {position:F2}");
+                return false;
             }
 
-            // Procesar y aplicar ruta
-            ProcessAndApplyPath(pathToUse, hit.position, waypointData);
-            
+            if (IsNavigating)
+                _pathController.StopNavigation();
+
+            transform.position = hit.position;
+            _navAgent.Warp(hit.position);
+
+            if (_logVerbose)
+                Debug.Log($"[NavigationAgent] Teleport exitoso a {hit.position:F2}");
+
             return true;
         }
 
-        public void StopNavigation(string reason = "Usuario canceló navegación")
+        // ─────────────────────────────────────────────────────────────────────
+        //  DETECCIÓN DE NIVEL ACTUAL
+        // ─────────────────────────────────────────────────────────────────────
+
+        private void UpdateCurrentLevel()
         {
-            if (!_isNavigating) return;
+            var startPoints = NavigationStartPointManager.GetAllStartPoints();
+            if (startPoints.Count == 0) return;
 
-            _navMeshAgent.ResetPath();
-            _isNavigating = false;
-            _currentDestination = null;
-            _smoothedPath.Clear();
-            _currentPathIndex = 0;
-            _isPathCacheValid = false;
+            float agentY    = transform.position.y;
+            int   bestLevel = 0;
+            float bestDist  = float.MaxValue;
 
-            if (_pathLineRenderer != null) _pathLineRenderer.enabled = false;
-            
-            UpdateAnimations();
-            
-            EventBus.Instance.Publish(new NavigationCancelledEvent { Reason = reason });
-            
-            Debug.Log($"[NavigationAgent] Navegación detenida: {reason}");
+            foreach (var pt in startPoints)
+            {
+                float dist = Mathf.Abs(agentY - pt.FloorHeight);
+                if (dist < bestDist) { bestDist = dist; bestLevel = pt.Level; }
+            }
+
+            if (bestLevel != CurrentLevel)
+            {
+                int previousLevel = CurrentLevel;
+                CurrentLevel      = bestLevel;
+
+                if (_logVerbose)
+                    Debug.Log($"[NavigationAgent] Transición nivel {previousLevel} → {bestLevel}");
+
+                if (_publishEvents)
+                    EventBus.Instance?.Publish(new FloorTransitionEvent
+                    {
+                        FromLevel     = previousLevel,
+                        ToLevel       = bestLevel,
+                        AgentPosition = transform.position
+                    });
+            }
         }
 
-        #endregion
+        // ─────────────────────────────────────────────────────────────────────
+        //  HANDLERS DEL PATH CONTROLLER
+        // ─────────────────────────────────────────────────────────────────────
 
-        #region Path Processing
-
-        private void ProcessAndApplyPath(NavMeshPath path, Vector3 finalDestination, WaypointData waypointData)
+        private void HandlePathStarted(Vector3 destination)
         {
-            // Aplicar smoothing progresivo si está habilitado
-            if (_enableProgressiveSmoothing && path.corners.Length > 2)
-            {
-                _smoothedPath = ApplyProgressiveSmoothing(path.corners.ToList());
-            }
-            else
-            {
-                _smoothedPath = path.corners.ToList();
-            }
-            
-            // Iniciar navegación
-            StartNavigationSequence(finalDestination, waypointData, path);
-        }
+            OnNavigationStarted?.Invoke(destination);
 
-        /// <summary>
-        /// Smoothing progresivo que no sobrecarga el sistema
-        /// </summary>
-        private List<Vector3> ApplyProgressiveSmoothing(List<Vector3> corners)
-        {
-            if (corners.Count < 3) return corners;
-
-            List<Vector3> smoothed = new List<Vector3> { corners[0] };
-
-            for (int i = 0; i < corners.Count - 1; i++)
-            {
-                Vector3 p0 = i > 0 ? corners[i - 1] : corners[i];
-                Vector3 p1 = corners[i];
-                Vector3 p2 = corners[i + 1];
-                Vector3 p3 = (i + 2 < corners.Count) ? corners[i + 2] : p2;
-
-                // Interpolar con Catmull-Rom (suavizado)
-                int segments = 3; // Menos segmentos = mejor performance
-                
-                for (int s = 1; s <= segments; s++)
+            if (_publishEvents)
+                EventBus.Instance?.Publish(new NavigationStartedEvent
                 {
-                    float t = s / (float)segments;
-                    Vector3 point = CatmullRom(p0, p1, p2, p3, t);
-                    smoothed.Add(point);
-                }
-            }
-
-            smoothed.Add(corners[corners.Count - 1]);
-            return smoothed;
+                    DestinationWaypointId = string.Empty,
+                    StartPosition         = transform.position,
+                    DestinationPosition   = destination,
+                    EstimatedDistance     = Vector3.Distance(transform.position, destination)
+                });
         }
 
-        private Vector3 CatmullRom(Vector3 p0, Vector3 p1, Vector3 p2, Vector3 p3, float t)
+        private void HandlePathCompleted()
         {
-            float t2 = t * t;
-            float t3 = t2 * t;
-            
-            return 0.5f * (
-                (2f * p1) + 
-                (-p0 + p2) * t + 
-                (2f * p0 - 5f * p1 + 4f * p2 - p3) * t2 + 
-                (-p0 + 3f * p1 - 3f * p2 + p3) * t3
-            );
+            OnArrived?.Invoke();
+
+            if (_publishEvents)
+                EventBus.Instance?.Publish(new NavigationCompletedEvent
+                {
+                    DestinationWaypointId = string.Empty,
+                    TotalDistance         = _pathController?.CurrentPath?.TotalLength ?? 0f,
+                    TotalTime             = 0f
+                });
         }
 
-        private void StartNavigationSequence(Vector3 destination, WaypointData waypointData, NavMeshPath originalPath)
+        private void HandlePathFailed(NavMeshPathStatus status)
         {
-            _currentDestination = waypointData;
-            _isNavigating = true;
-            _navigationStartTime = Time.time;
-            _totalDistance = CalculatePathLength(originalPath);
-            _lastPathRecalculationTime = Time.time;
-            _lastRecalculationPosition = transform.position;
-            _currentPathIndex = 0;
-            
-            // Aplicar ruta al agente
-            _navMeshAgent.SetPath(originalPath);
+            OnNavigationFailed?.Invoke(status);
+            Debug.LogWarning($"[NavigationAgent] Navegación fallida. Status={status}. Destino: {LastDestination:F2}");
+        }
 
-            if (_pathLineRenderer != null) _pathLineRenderer.enabled = true;
+        private void HandleWaypointReached(int index, Vector3 position)
+        {
+            if (_logVerbose)
+                Debug.Log($"[NavigationAgent] Waypoint {index} alcanzado @ {position:F2}");
+        }
 
-            EventBus.Instance.Publish(new NavigationStartedEvent
+        // ─────────────────────────────────────────────────────────────────────
+        //  CONTEXT MENU (Debug)
+        // ─────────────────────────────────────────────────────────────────────
+
+        [ContextMenu("Start Navigation (Debug)")]
+        private void DebugStartNavigation()
+        {
+            if (_debugDestination == null)
             {
-                DestinationWaypointId = waypointData?.WaypointId ?? "",
-                StartPosition = transform.position,
-                DestinationPosition = destination,
-                EstimatedDistance = _totalDistance
-            });
-            
-            Debug.Log($"[NavigationAgent] Navegación iniciada a: {waypointData?.WaypointName ?? "Posición"}");
-        }
-
-        #endregion
-
-        #region Optimized Navigation Update
-
-        private void UpdateOptimizedNavigation()
-        {
-            // Verificar llegada
-            if (!_navMeshAgent.pathPending && _navMeshAgent.remainingDistance <= _arrivalThreshold)
-            {
-                OnArrivalAtDestination();
+                Debug.LogWarning("[NavigationAgent] Asignar _debugDestination en el Inspector.");
                 return;
             }
-
-            // Sistema INTELIGENTE de recálculo de ruta
-            CheckAndRecalculatePathIfNeeded();
+            StartNavigation(_debugDestination.position);
         }
 
-        /// <summary>
-        /// ✅ SISTEMA CLAVE: Recálculo inteligente con hysteresis para evitar oscilaciones
-        /// </summary>
-        private void CheckAndRecalculatePathIfNeeded()
+        [ContextMenu("Stop Navigation")]
+        private void DebugStopNavigation() => StopNavigation();
+
+        [ContextMenu("Log Path Status")]
+        private void DebugLogStatus()
         {
-            float timeSinceLastRecalc = Time.time - _lastPathRecalculationTime;
-            
-            // Respetar intervalo mínimo (evita spam de recálculos)
-            if (timeSinceLastRecalc < _minPathRecalculationInterval)
-                return;
+            Debug.Log($"[NavigationAgent] IsNavigating={IsNavigating}, " +
+                      $"Level={CurrentLevel}, " +
+                      $"Remaining={RemainingDistance:F2}m, " +
+                      $"Progress={ProgressPercent * 100f:F0}%, " +
+                      $"Speed={CurrentSpeed:F2}m/s");
 
-            // Verificar si estamos cerca de un borde del NavMesh
-            bool isNearEdge = IsNearNavMeshEdge();
-            
-            // Aplicar HYSTERESIS para evitar oscilaciones
-            if (_useHysteresis)
+            if (_pathController?.CurrentPath != null)
             {
-                if (isNearEdge && !_wasNearEdge)
-                {
-                    // Acabamos de acercarnos al borde - incrementar hysteresis
-                    _edgeProximityHysteresis += _hysteresisMargin;
-                }
-                else if (!isNearEdge && _wasNearEdge)
-                {
-                    // Acabamos de alejarnos del borde - decrementar hysteresis
-                    _edgeProximityHysteresis -= _hysteresisMargin;
-                }
-                
-                _wasNearEdge = isNearEdge;
-            }
-
-            // Calcular distancia recorrida desde último recálculo
-            float distanceMoved = Vector3.Distance(transform.position, _lastRecalculationPosition);
-            
-            // Threshold adaptativo según proximidad a borde
-            float adaptiveThreshold = _pathRecalculationThreshold + _edgeProximityHysteresis;
-            
-            // Decidir si recalcular
-            bool shouldRecalculate = false;
-            
-            // Condición 1: Nos hemos movido suficiente Y no estamos oscilando en borde
-            if (distanceMoved > adaptiveThreshold)
-            {
-                shouldRecalculate = true;
-            }
-            
-            // Condición 2: Hay un camino significativamente mejor disponible
-            if (!shouldRecalculate && CheckForBetterPath())
-            {
-                shouldRecalculate = true;
-            }
-
-            if (shouldRecalculate)
-            {
-                RecalculatePathOptimized();
+                OptimizedPath p = _pathController.CurrentPath;
+                Debug.Log($"  Path: {p.Waypoints.Count} waypoints, {p.TotalLength:F1}m total, status={p.Status}");
             }
         }
-
-        /// <summary>
-        /// Detecta si estamos cerca de un borde del NavMesh
-        /// </summary>
-        private bool IsNearNavMeshEdge()
-        {
-            // Raycast en varias direcciones para detectar bordes
-            Vector3[] directions = new Vector3[]
-            {
-                transform.forward,
-                -transform.forward,
-                transform.right,
-                -transform.right
-            };
-
-            float edgeCheckDistance = _navMeshAgent.radius * 2f;
-
-            foreach (Vector3 dir in directions)
-            {
-                Vector3 checkPos = transform.position + (dir * edgeCheckDistance);
-                
-                if (!NavMesh.SamplePosition(checkPos, out NavMeshHit hit, edgeCheckDistance * 0.5f, NavMesh.AllAreas))
-                {
-                    // No hay NavMesh en esta dirección = estamos cerca de un borde
-                    return true;
-                }
-            }
-
-            return false;
-        }
-
-        /// <summary>
-        /// Verifica si hay una ruta significativamente mejor disponible
-        /// </summary>
-        private bool CheckForBetterPath()
-        {
-            if (_currentDestination == null) return false;
-
-            NavMeshPath candidatePath = new NavMeshPath();
-            
-            if (!_navMeshAgent.CalculatePath(_currentDestination.Position, candidatePath))
-                return false;
-
-            float candidateLength = CalculatePathLength(candidatePath);
-            float currentLength = _navMeshAgent.remainingDistance;
-
-            // Si la nueva ruta es 15% más corta, vale la pena recalcular
-            return candidateLength < currentLength * 0.85f;
-        }
-
-        /// <summary>
-        /// Recálculo optimizado de ruta
-        /// </summary>
-        private void RecalculatePathOptimized()
-        {
-            if (_currentDestination == null) return;
-
-            NavMeshPath newPath = new NavMeshPath();
-            
-            if (_navMeshAgent.CalculatePath(_currentDestination.Position, newPath))
-            {
-                // Aplicar nueva ruta
-                _navMeshAgent.SetPath(newPath);
-                
-                // Actualizar cache
-                if (_enablePathCaching)
-                {
-                    _cachedPath = newPath;
-                    _pathCacheTimestamp = Time.time;
-                }
-                
-                // Actualizar smoothing
-                if (_enableProgressiveSmoothing)
-                {
-                    _smoothedPath = ApplyProgressiveSmoothing(newPath.corners.ToList());
-                }
-                
-                // Actualizar estado de recálculo
-                _lastPathRecalculationTime = Time.time;
-                _lastRecalculationPosition = transform.position;
-                
-                Debug.Log("[NavigationAgent] Ruta recalculada (optimizado)");
-            }
-        }
-
-        #endregion
-
-        #region Arrival Handling
-
-        private void OnArrivalAtDestination()
-        {
-            float totalTime = Time.time - _navigationStartTime;
-            
-            EventBus.Instance.Publish(new NavigationCompletedEvent
-            {
-                DestinationWaypointId = _currentDestination?.WaypointId ?? "",
-                TotalDistance = _totalDistance,
-                TotalTime = totalTime
-            });
-
-            _isNavigating = false;
-            _currentDestination = null;
-            _smoothedPath.Clear();
-            _isPathCacheValid = false;
-
-            if (_pathLineRenderer != null) _pathLineRenderer.enabled = false;
-            
-            UpdateAnimations();
-            
-            Debug.Log($"[NavigationAgent] ✅ Llegada exitosa en {totalTime:F1}s");
-        }
-
-        #endregion
-
-        #region Visualization
-
-        private void UpdatePathVisualization()
-        {
-            if (_pathLineRenderer == null || !_pathLineRenderer.enabled) return;
-
-            // Usar path suavizado si está disponible
-            List<Vector3> pathToShow = _smoothedPath.Count > 0 
-                ? _smoothedPath 
-                : _navMeshAgent.path.corners.ToList();
-
-            if (pathToShow.Count < 2)
-            {
-                _pathLineRenderer.positionCount = 0;
-                return;
-            }
-
-            _pathLineRenderer.positionCount = pathToShow.Count;
-            
-            for (int i = 0; i < pathToShow.Count; i++)
-            {
-                Vector3 pos = pathToShow[i];
-                pos.y += _pathHeightOffset;
-                _pathLineRenderer.SetPosition(i, pos);
-            }
-        }
-
-        private void UpdateAnimations()
-        {
-            if (_animator == null || string.IsNullOrEmpty(_walkAnimParam)) return;
-            
-            bool isWalking = _isNavigating && _navMeshAgent.velocity.magnitude > 0.1f;
-            _animator.SetBool(_walkAnimParam, isWalking);
-        }
-
-        #endregion
-
-        #region Utilities
-
-        private float CalculatePathLength(NavMeshPath path)
-        {
-            if (path.corners.Length < 2) return 0f;
-            
-            float length = 0f;
-            for (int i = 0; i < path.corners.Length - 1; i++)
-                length += Vector3.Distance(path.corners[i], path.corners[i + 1]);
-            
-            return length;
-        }
-
-        public bool TeleportTo(Vector3 position)
-        {
-            if (NavMesh.SamplePosition(position, out NavMeshHit hit, 2f, NavMesh.AllAreas))
-            {
-                _navMeshAgent.Warp(hit.position);
-                _isPathCacheValid = false; // Invalidar cache después de teleport
-                return true;
-            }
-            return false;
-        }
-
-        #endregion
-
-        #region Debug Visualization
-
-        private void OnDrawGizmos()
-        {
-            if (!_isNavigating || _navMeshAgent == null) return;
-
-            // Path actual
-            Gizmos.color = Color.yellow;
-            NavMeshPath path = _navMeshAgent.path;
-            if (path != null && path.corners.Length > 1)
-            {
-                for (int i = 0; i < path.corners.Length - 1; i++)
-                    Gizmos.DrawLine(path.corners[i], path.corners[i + 1]);
-            }
-
-            // Path suavizado
-            if (_smoothedPath.Count > 1)
-            {
-                Gizmos.color = Color.cyan;
-                for (int i = 0; i < _smoothedPath.Count - 1; i++)
-                    Gizmos.DrawLine(_smoothedPath[i], _smoothedPath[i + 1]);
-            }
-
-            // Destino
-            Gizmos.color = Color.green;
-            Gizmos.DrawWireSphere(_navMeshAgent.destination, 0.3f);
-
-            // Radio de detección de bordes
-            Gizmos.color = IsNearNavMeshEdge() ? Color.red : Color.green;
-            Gizmos.DrawWireSphere(transform.position, _navMeshAgent.radius * 2f);
-
-            #if UNITY_EDITOR
-            // Información de estado
-            string status = $"Dist: {_navMeshAgent.remainingDistance:F1}m\n";
-            status += $"Próx. borde: {(IsNearNavMeshEdge() ? "SÍ" : "NO")}\n";
-            status += $"Hysteresis: {_edgeProximityHysteresis:F2}m";
-            
-            UnityEditor.Handles.Label(transform.position + Vector3.up * 2f, status);
-            #endif
-        }
-
-        #endregion
     }
 }

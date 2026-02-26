@@ -31,8 +31,6 @@ namespace IndoorNavAR.Core.Loaders
 
         [Header("Materiales")]
         [SerializeField] private Material _defaultMaterial;
-        [SerializeField] private bool _createMaterialsFromTextures = true;
-
         [Header("Referencias")]
         [SerializeField] private Transform _modelsParent;
 

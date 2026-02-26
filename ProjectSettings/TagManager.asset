@@ -6,16 +6,19 @@ TagManager:
   tags:
   - WayPoint
   - NavMeshObstacle
+  - 3DModel
+  - StairHelper
+  - StairGeometry
   layers:
   - Default
   - TransparentFX
   - Ignore Raycast
-  - 
+  - WayPoints
   - Water
   - UI
-  - WayPoints
-  - 
-  - 
+  - NavMesh
+  - Navigation Ignore
+  - NavigationHelpers
   - 
   - 
   - 

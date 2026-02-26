@@ -130,7 +130,7 @@ namespace IndoorNavAR.Navigation
             volumeSize.y = Mathf.Max(volumeSize.y * 2f, 3f);
             
             navMeshSurface.size = volumeSize;
-            navMeshSurface.center = new Vector3(0, volumeSize.y / 2f, 0);
+            navMeshSurface.center = Vector3.zero;
         }
 
         #endregion
@@ -244,16 +244,4 @@ namespace IndoorNavAR.Navigation
 
         #endregion
     }
-
-    #region Data Structures
-
-    public class NavMeshBakingStats
-    {
-        public float BakingTime;
-        public int VertexCount;
-        public int TriangleCount;
-        public float Area;
-    }
-
-    #endregion
 }

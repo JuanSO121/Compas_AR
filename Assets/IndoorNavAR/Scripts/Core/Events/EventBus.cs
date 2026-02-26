@@ -1,3 +1,4 @@
+// File: EventBus.cs
 using System;
 using System.Collections.Generic;
 using UnityEngine;
@@ -6,7 +7,6 @@ namespace IndoorNavAR.Core.Events
 {
     /// <summary>
     /// Sistema centralizado de eventos para comunicación desacoplada entre componentes.
-    /// ✅ FIXED: DontDestroyOnLoad solo en builds, evita warnings en Editor
     /// </summary>
     public class EventBus : MonoBehaviour
     {
@@ -22,11 +22,10 @@ namespace IndoorNavAR.Core.Events
                     {
                         GameObject go = new GameObject("[EventBus]");
                         _instance = go.AddComponent<EventBus>();
-                        
-                        // ✅ FIXED: Solo usar DontDestroyOnLoad en builds
-                        #if !UNITY_EDITOR
+
+#if !UNITY_EDITOR
                         DontDestroyOnLoad(go);
-                        #endif
+#endif
                     }
                 }
                 return _instance;
@@ -40,20 +39,17 @@ namespace IndoorNavAR.Core.Events
 
         private void Awake()
         {
-            // ✅ NUEVO: Prevenir duplicados en Editor
             if (_instance != null && _instance != this)
             {
                 Debug.LogWarning("[EventBus] Instancia duplicada detectada. Destruyendo...");
                 Destroy(gameObject);
                 return;
             }
-            
             _instance = this;
         }
 
         private void OnDestroy()
         {
-            // ✅ FIXED: Limpiar solo si somos la instancia activa
             if (_instance == this)
             {
                 ClearAll();
@@ -61,74 +57,56 @@ namespace IndoorNavAR.Core.Events
             }
         }
 
+#if UNITY_EDITOR
+        [UnityEngine.RuntimeInitializeOnLoadMethod(RuntimeInitializeLoadType.SubsystemRegistration)]
+        private static void ResetStaticInstance()
+        {
+            _instance = null;
+        }
+#endif
+
         #endregion
 
         #region Subscription Management
 
-        /// <summary>
-        /// Suscribe un handler a un evento específico.
-        /// </summary>
         public void Subscribe<T>(Action<T> handler) where T : struct
         {
             Type eventType = typeof(T);
-            
-            if (_eventDelegates.TryGetValue(eventType, out Delegate existingDelegate))
-            {
-                _eventDelegates[eventType] = Delegate.Combine(existingDelegate, handler);
-            }
+            if (_eventDelegates.TryGetValue(eventType, out Delegate existing))
+                _eventDelegates[eventType] = Delegate.Combine(existing, handler);
             else
-            {
                 _eventDelegates[eventType] = handler;
-            }
         }
 
-        /// <summary>
-        /// Desuscribe un handler de un evento específico.
-        /// </summary>
         public void Unsubscribe<T>(Action<T> handler) where T : struct
         {
             Type eventType = typeof(T);
-            
-            if (_eventDelegates.TryGetValue(eventType, out Delegate existingDelegate))
+            if (_eventDelegates.TryGetValue(eventType, out Delegate existing))
             {
-                Delegate newDelegate = Delegate.Remove(existingDelegate, handler);
-                
+                Delegate newDelegate = Delegate.Remove(existing, handler);
                 if (newDelegate == null)
-                {
                     _eventDelegates.Remove(eventType);
-                }
                 else
-                {
                     _eventDelegates[eventType] = newDelegate;
-                }
             }
         }
 
-        /// <summary>
-        /// Publica un evento a todos los suscriptores.
-        /// </summary>
         public void Publish<T>(T eventData) where T : struct
         {
             Type eventType = typeof(T);
-            
-            if (_eventDelegates.TryGetValue(eventType, out Delegate existingDelegate))
+            if (_eventDelegates.TryGetValue(eventType, out Delegate existing))
             {
-                Action<T> callback = existingDelegate as Action<T>;
-                
                 try
                 {
-                    callback?.Invoke(eventData);
+                    (existing as Action<T>)?.Invoke(eventData);
                 }
                 catch (Exception ex)
                 {
-                    Debug.LogError($"[EventBus] Error al ejecutar evento {eventType.Name}: {ex.Message}\n{ex.StackTrace}");
+                    Debug.LogError($"[EventBus] Error en evento {eventType.Name}: {ex.Message}\n{ex.StackTrace}");
                 }
             }
         }
 
-        /// <summary>
-        /// Limpia todas las suscripciones.
-        /// </summary>
         public void ClearAll()
         {
             _eventDelegates.Clear();
@@ -141,7 +119,7 @@ namespace IndoorNavAR.Core.Events
     #region Event Definitions
 
     // ========== AR Events ==========
-    
+
     public struct PlaneDetectedEvent
     {
         public UnityEngine.XR.ARFoundation.ARPlane Plane;
@@ -162,7 +140,7 @@ namespace IndoorNavAR.Core.Events
     }
 
     // ========== Waypoint Events ==========
-    
+
     public struct WaypointPlacedEvent
     {
         public string WaypointId;
@@ -184,7 +162,7 @@ namespace IndoorNavAR.Core.Events
     }
 
     // ========== Model Events ==========
-    
+
     public struct ModelLoadedEvent
     {
         public GameObject ModelInstance;
@@ -199,7 +177,7 @@ namespace IndoorNavAR.Core.Events
     }
 
     // ========== NavMesh Events ==========
-    
+
     public struct NavMeshGeneratedEvent
     {
         public int SurfaceCount;
@@ -213,7 +191,7 @@ namespace IndoorNavAR.Core.Events
     }
 
     // ========== Navigation Events ==========
-    
+
     public struct NavigationStartedEvent
     {
         public string DestinationWaypointId;
@@ -241,8 +219,19 @@ namespace IndoorNavAR.Core.Events
         public Vector3 CurrentPosition;
     }
 
+    /// <summary>
+    /// Publicado cuando el agente transiciona entre pisos.
+    /// ✅ Requerido por NavigationAgent.UpdateCurrentLevel()
+    /// </summary>
+    public struct FloorTransitionEvent
+    {
+        public int FromLevel;
+        public int ToLevel;
+        public Vector3 AgentPosition;
+    }
+
     // ========== UI Events ==========
-    
+
     public struct AppModeChangedEvent
     {
         public AppMode PreviousMode;

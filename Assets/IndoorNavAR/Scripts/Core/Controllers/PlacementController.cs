@@ -24,7 +24,6 @@ namespace IndoorNavAR.Core.Controllers
         
         [Header("Configuración")]
         [SerializeField] private float _maxRaycastDistance = 10f;
-        [SerializeField] private bool _requirePlaneHit = true;
 
         private GameObject _placementIndicator;
         private bool _isPlacementActive;
@@ -71,8 +70,8 @@ namespace IndoorNavAR.Core.Controllers
 
         private void OnDisable()
         {
-            EnhancedTouchSupport.Disable();
-            UnsubscribeFromEvents();
+            UnsubscribeFromEvents();  // ✅ PRIMERO desuscribir (mientras está habilitado)
+            EnhancedTouchSupport.Disable();  // ✅ DESPUÉS deshabilitar
         }
 
         private void Update()
