@@ -156,14 +156,6 @@ La escena habilitada en Build Settings es:
 
 ---
 
-
-## Integración con app Flutter (`flutter_voice_robot`)
-
-Se añadió una guía técnica paso a paso para integrar IndoorNavAR con Flutter usando **Unity as a Library** y comunicación por `MethodChannel` + `UnitySendMessage`:
-
-- Guía: `docs/INTEGRACION_FLUTTER_UNITY.md`
-- Bridge Unity: `Assets/IndoorNavAR/Scripts/Integration/FlutterUnityBridge.cs`
-
 ## Estado actual y hoja de ruta
 
 ### Estado actual

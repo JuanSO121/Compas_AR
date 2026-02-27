@@ -1,19 +1,15 @@
 // File: NavMeshAgentCoordinator.cs
-// ✅ FIX v2 — Prevención del ciclo de degradación del NavMesh.
+// ✅ FIX v3 — Modo "solo renderizado": en mobile con sesión restaurada,
+//             nunca genera obstáculos ni bake. Solo carga el NavMesh desde disco.
 //
 //  CAMBIO PRINCIPAL:
-//    GenerateAndSave() ahora llama _persistenceManager.NotifyNavMeshBaked()
-//    ANTES de SaveSession(). Sin esta llamada, PersistenceManager v3 no
-//    sobreescribe navmesh_data.bin (lo preserva del bake anterior).
-//    Con esta llamada, PersistenceManager sabe que el NavMesh activo es
-//    un bake real y puede guardarlo con confianza.
+//    _renderOnlyMode (bool, default true en builds mobile):
+//      - Si true Y _setupAlreadyDone: OnModelLoaded ignora completamente el evento.
+//      - Si true en ExecuteFullSetup: solo carga NavMesh desde disco, nunca bake.
+//      - El flag se activa automáticamente en builds non-Editor.
 //
-//    RegenerateNavMeshOnly() recibe el mismo tratamiento.
-//
-//  LO QUE NO CAMBIA:
-//    Toda la lógica de orquestación, guards, timeouts y retries.
-//    La llamada a LoadNavMeshFromFile() sigue sin activar el flag
-//    (PersistenceManager lo desactiva en esa ruta, como es correcto).
+//    _autoFindProxyMeshes queda como false por defecto en runtime:
+//      Los tags NavMeshObstacle no deben procesarse en mobile, ya están en el NavMesh bakeado.
 
 using System.Threading.Tasks;
 using UnityEngine;
@@ -34,6 +30,11 @@ namespace IndoorNavAR.Navigation
         [SerializeField] private bool  _autoExecuteOnModelLoad = true;
         [SerializeField] private float _modelLoadDelay         = 1.0f;
 
+        [Header("📱 Modo Mobile")]
+        [Tooltip("En builds de dispositivo, nunca regenera obstáculos ni hace bake.\n" +
+                 "Solo carga el NavMesh guardado. Se activa automáticamente fuera del Editor.")]
+        [SerializeField] private bool _renderOnlyMode = true;
+
         [Header("🔧 Timeouts")]
         [SerializeField] private float _generationTimeout = 30f;
         [SerializeField] private int   _maxRetryAttempts  = 2;
@@ -48,7 +49,17 @@ namespace IndoorNavAR.Navigation
 
         #region Lifecycle
 
-        private void Awake()     => FindComponents();
+        private void Awake()
+        {
+            FindComponents();
+
+#if !UNITY_EDITOR
+            // Fuera del Editor, forzar render-only: nunca generar obstáculos en device.
+            _renderOnlyMode = true;
+            Log("📱 Build de dispositivo detectado → _renderOnlyMode = true");
+#endif
+        }
+
         private void OnEnable()  => EventBus.Instance?.Subscribe<ModelLoadedEvent>(OnModelLoaded);
         private void OnDisable() => EventBus.Instance?.Unsubscribe<ModelLoadedEvent>(OnModelLoaded);
 
@@ -85,6 +96,14 @@ namespace IndoorNavAR.Navigation
 
         private async void OnModelLoaded(ModelLoadedEvent evt)
         {
+            // FIX v3: En modo render-only con setup ya completo, ignorar completamente.
+            // El modelo se renderiza pero no se toca el NavMesh ni los obstáculos.
+            if (_renderOnlyMode && _setupAlreadyDone)
+            {
+                Log("📱 ModelLoadedEvent ignorado — render-only mode, NavMesh ya activo.");
+                return;
+            }
+
             if (_setupAlreadyDone)
             {
                 Log("📦 ModelLoadedEvent ignorado — setup ya completado (sesión restaurada).");
@@ -97,11 +116,7 @@ namespace IndoorNavAR.Navigation
             _lastLoadedModel = evt.ModelInstance;
             await Task.Delay((int)(_modelLoadDelay * 1000));
 
-            if (_setupAlreadyDone)
-            {
-                Log("📦 Setup completado durante el delay — ignorando.");
-                return;
-            }
+            if (_setupAlreadyDone) { Log("📦 Setup completado durante el delay — ignorando."); return; }
 
             await ExecuteFullSetup();
         }
@@ -110,10 +125,6 @@ namespace IndoorNavAR.Navigation
 
         #region Main Flow
 
-        /// <summary>
-        /// Llamado por NavigationManager cuando restaura desde sesión guardada.
-        /// Bloquea OnModelLoaded para que no re-ejecute el setup.
-        /// </summary>
         public void MarkSetupDone()
         {
             _setupAlreadyDone = true;
@@ -135,42 +146,68 @@ namespace IndoorNavAR.Navigation
             try
             {
                 Log("═══════════════════════════════");
-                Log("🚀 INICIANDO SETUP MULTI-NIVEL");
+                Log(_renderOnlyMode ? "📱 SETUP — MODO RENDER ONLY" : "🚀 INICIANDO SETUP MULTI-NIVEL");
                 Log("═══════════════════════════════");
 
-                // ── PASO 1: NavMesh ───────────────────────────────────────
-                bool navMeshOk;
                 bool hasSaved = _persistenceManager != null && _persistenceManager.HasSavedNavMesh;
 
-                if (hasSaved)
+                if (_renderOnlyMode)
                 {
-                    Log("💾 [1/2] Cargando NavMesh desde disco...");
-                    navMeshOk = await _persistenceManager.LoadNavMeshFromFile();
-                    // LoadNavMeshFromFile() pone _navMeshWasBaked = false internamente.
-                    // Si falla, caemos a GenerateAndSave() que sí activa el flag.
-                    if (!navMeshOk)
+                    // ── MODO RENDER-ONLY ──────────────────────────────────
+                    // Solo carga el NavMesh desde disco. Jamás genera obstáculos.
+                    if (hasSaved)
                     {
-                        Log("⚠️ Fallo carga disco → generando NavMesh...");
-                        navMeshOk = await GenerateAndSave();
+                        Log("💾 [render-only] Cargando NavMesh desde disco...");
+                        bool loaded = await _persistenceManager.LoadNavMeshFromFile();
+                        if (!loaded)
+                        {
+                            Debug.LogError("[Coordinator] ❌ Falló carga NavMesh (render-only)");
+                            PublishMessage("Error cargando navegación guardada", MessageType.Error);
+                            return false;
+                        }
+                        Log("✅ NavMesh cargado en modo render-only.");
                     }
-                    else Log("✅ NavMesh restaurado desde archivo.");
+                    else
+                    {
+                        // Sin NavMesh guardado en render-only: no podemos generar.
+                        // Avisamos al usuario y retornamos false.
+                        Debug.LogWarning("[Coordinator] ⚠️ render-only pero sin NavMesh guardado.");
+                        PublishMessage("Sin NavMesh guardado. Escanea primero en Editor.", MessageType.Warning);
+                        return false;
+                    }
                 }
                 else
                 {
-                    Log("🔨 [1/2] Sin NavMesh guardado → generando...");
-                    navMeshOk = await GenerateAndSave();
+                    // ── MODO COMPLETO (Editor / primera vez) ──────────────
+                    bool navMeshOk;
+                    if (hasSaved)
+                    {
+                        Log("💾 [1/2] Cargando NavMesh desde disco...");
+                        navMeshOk = await _persistenceManager.LoadNavMeshFromFile();
+                        if (!navMeshOk)
+                        {
+                            Log("⚠️ Fallo carga disco → generando NavMesh...");
+                            navMeshOk = await GenerateAndSave();
+                        }
+                        else Log("✅ NavMesh restaurado desde archivo.");
+                    }
+                    else
+                    {
+                        Log("🔨 [1/2] Sin NavMesh guardado → generando...");
+                        navMeshOk = await GenerateAndSave();
+                    }
+
+                    if (!navMeshOk)
+                    {
+                        Debug.LogError("[Coordinator] ❌ Falló NavMesh");
+                        PublishMessage("Error generando navegación", MessageType.Error);
+                        return false;
+                    }
                 }
 
-                if (!navMeshOk)
-                {
-                    Debug.LogError("[Coordinator] ❌ Falló NavMesh");
-                    PublishMessage("Error generando navegación", MessageType.Error);
-                    return false;
-                }
-
-                // ── PASO 2: Posicionar agente ─────────────────────────────
+                // ── Posicionar agente (común en ambos modos) ──────────────
                 await Task.Delay(300);
-                Log("📍 [2/2] Posicionando agente...");
+                Log("📍 Posicionando agente...");
                 var sp = NavigationStartPointManager.GetStartPointForLevel(0);
                 if (sp != null) sp.ReteleportAgent();
                 else Debug.LogWarning("[Coordinator] ⚠️ Sin NavigationStartPoint");
@@ -190,27 +227,18 @@ namespace IndoorNavAR.Navigation
         }
 
         /// <summary>
-        /// Genera el NavMesh y lo guarda.
-        /// ✅ FIX v2: Llama NotifyNavMeshBaked() antes de SaveSession() para que
-        /// PersistenceManager sepa que puede sobreescribir navmesh_data.bin con
-        /// datos frescos del bake (no con el NavMesh degradado de una carga previa).
+        /// Genera el NavMesh y lo guarda. Solo llamado en modo completo (no render-only).
+        /// ✅ FIX v2: Llama NotifyNavMeshBaked() antes de SaveSession().
         /// </summary>
         private async Task<bool> GenerateAndSave()
         {
             bool ok = await GenerateNavMeshWithRetry();
-
             if (ok && _persistenceManager != null)
             {
-                // ✅ FIX: Activar flag ANTES de guardar.
-                // Sin esta llamada, PersistenceManager v3 preserva el .bin anterior
-                // en lugar de sobreescribirlo, lo cual es correcto para cargas pero
-                // incorrecto para bakes frescos.
                 _persistenceManager.NotifyNavMeshBaked();
-
                 Log("💾 Auto-guardando NavMesh bakeado...");
                 await _persistenceManager.SaveSession();
             }
-
             return ok;
         }
 
@@ -272,9 +300,6 @@ namespace IndoorNavAR.Navigation
             return true;
         }
 
-        /// <summary>
-        /// ✅ FIX v2: También activa NotifyNavMeshBaked() aquí, por consistencia.
-        /// </summary>
         public async Task<bool> RegenerateNavMeshOnly()
         {
             _setupAlreadyDone = false;
@@ -289,6 +314,16 @@ namespace IndoorNavAR.Navigation
 
         public bool IsSystemReady() =>
             _isInitialized && !_isExecuting && _multiLevelGenerator != null && _navigationAgent != null;
+
+        /// <summary>
+        /// Activa/desactiva el modo render-only en tiempo de ejecución.
+        /// Útil para forzar un re-bake desde el Editor aunque _renderOnlyMode fuera true.
+        /// </summary>
+        public void SetRenderOnlyMode(bool renderOnly)
+        {
+            _renderOnlyMode = renderOnly;
+            Log($"📱 renderOnlyMode = {renderOnly}");
+        }
 
         #endregion
 
@@ -319,10 +354,14 @@ namespace IndoorNavAR.Navigation
         [ContextMenu("ℹ️ Status")]
         private void DebugStatus()
         {
-            Debug.Log($"[Coordinator] Inicializado={_isInitialized} | Ejecutando={_isExecuting} | SetupDone={_setupAlreadyDone}");
+            Debug.Log($"[Coordinator] Inicializado={_isInitialized} | Ejecutando={_isExecuting} | " +
+                      $"SetupDone={_setupAlreadyDone} | RenderOnly={_renderOnlyMode}");
             Debug.Log($"[Coordinator] Modelo={IsModelLoaded()} | Listo={IsSystemReady()}");
             Debug.Log($"[Coordinator] NavMesh guardado: {NavMeshSerializer.HasSavedNavMesh}");
         }
+
+        [ContextMenu("📱 Toggle RenderOnly Mode")]
+        private void DebugToggleRenderOnly() => SetRenderOnlyMode(!_renderOnlyMode);
 
         #endregion
     }

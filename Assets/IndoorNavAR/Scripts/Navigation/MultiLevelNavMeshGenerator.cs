@@ -1,17 +1,16 @@
 // File: MultiLevelNavMeshGenerator.cs
-// ✅ FIX v2 — Migración a BakeGlobalAsync() para garantizar propagación completa
-//             del NavMeshWorld antes de verificar y serializar.
+// ✅ FIX v3 — Modo render-only: en builds de dispositivo no crea ni muestra
+//             obstáculos (cuadros rojos), no procesa proxy meshes/tags,
+//             y oculta los GameObjects de debug.
 //
-//   CAMBIO PRINCIPAL:
-//     GenerateMultiLevelNavMesh() ahora es async (GenerateMultiLevelNavMeshAsync ya lo era).
-//     Usa _globalBaker.BakeGlobalAsync() en lugar de BakeGlobal() síncrono.
-//     Esto resuelve la race condition de Unity 6.3+ donde CalculateTriangulation()
-//     llamado en el mismo frame que BuildNavMesh() puede devolver datos parciales
-//     (solo el último tile = Level1), haciendo que PersistenceManager guarde
-//     únicamente el piso superior.
-//
-//   El ContextMenu "Generate Multi-Level NavMesh" también llama la versión async
-//   para garantizar consistencia entre bakes desde Editor y desde runtime.
+//   CAMBIOS:
+//     - _renderOnlyMode (bool): si true, GenerateMultiLevelNavMeshAsync() omite
+//       la creación de WallObstacles, FurnitureObstacles y ProxyObstacles.
+//       Los GameObjects de superficie sí se crean (el NavMesh los necesita),
+//       pero los obstáculos de debug no aparecen en pantalla.
+//     - _autoFindProxyMeshes = false por defecto en builds (no escanea tags).
+//     - _showDebugVisualization = false por defecto en builds.
+//     - Se activa automáticamente fuera del Editor con #if !UNITY_EDITOR.
 
 using System;
 using System.Collections.Generic;
@@ -148,12 +147,18 @@ namespace IndoorNavAR.Navigation
 
         #endregion
 
-        #region Configuration — Debug
+        #region Configuration — Debug / Mobile
 
         [Header("🐛 Debug")]
         [SerializeField] private bool _showDebugVisualization   = true;
         [SerializeField] private bool _logDetailedAnalysis      = false;
         [SerializeField] private bool _enableRuntimeDiagnostics = true;
+
+        [Header("📱 Modo Mobile")]
+        [Tooltip("Si true: no crea obstáculos visuales (cuadros rojos) ni procesa proxy tags.\n" +
+                 "El NavMesh sigue funcionando: los obstáculos existen en el bake guardado.\n" +
+                 "Se activa automáticamente en builds fuera del Editor.")]
+        [SerializeField] private bool _renderOnlyMode = false;
 
         #endregion
 
@@ -173,9 +178,6 @@ namespace IndoorNavAR.Navigation
         private List<StairWithLandingHelper> _detectedStairs = new List<StairWithLandingHelper>();
         private DiagnosticData _diagnostics = new();
 
-        /// <summary>
-        /// Número de niveles navegables detectados en el último bake.
-        /// </summary>
         public int DetectedLevelCount => _levels?.Count ?? 0;
 
         #endregion
@@ -184,6 +186,17 @@ namespace IndoorNavAR.Navigation
 
         private void Awake()
         {
+#if !UNITY_EDITOR
+            // FIX: Forzar flags ANTES de InitializeServices() para que los servicios
+            // se construyan ya con showDebug=false. Si se hacía después, _surfaceService
+            // y _obstacleService se creaban con _showDebugVisualization=true (valor del
+            // Inspector/prefab) y podían instanciar MeshRenderers de debug en runtime.
+            _renderOnlyMode           = true;
+            _showDebugVisualization   = false;
+            _autoFindProxyMeshes      = false;
+            _debugDrawOpeningRaycasts = false;
+            Debug.Log("[MultiLevel] 📱 Build de dispositivo → renderOnlyMode=true, debug visual=false");
+#endif
             InitializeServices();
             _openingGenerator = GetComponent<SecondFloorOpeningGenerator>()
                              ?? gameObject.AddComponent<SecondFloorOpeningGenerator>();
@@ -246,7 +259,8 @@ namespace IndoorNavAR.Navigation
 
             _primaryMesh = _meshProcessor.FindPrimaryMesh(meshFilters);
 
-            if (_autoFindProxyMeshes)
+            // FIX v3: En render-only no buscar proxies — evita procesar tag NavMeshObstacle
+            if (_autoFindProxyMeshes && !_renderOnlyMode)
                 FindProxyMeshes();
         }
 
@@ -345,13 +359,18 @@ namespace IndoorNavAR.Navigation
 
         #region ✅ Pipeline Principal de Generación
 
-        /// <summary>
-        /// ✅ FIX v2: Ahora es async y usa BakeGlobalAsync() para garantizar
-        /// que los datos del NavMeshWorld estén completamente propagados antes
-        /// de que el caller pueda serializar con NavMeshSerializer.Save().
-        /// </summary>
         public async Task<bool> GenerateMultiLevelNavMeshAsync()
         {
+            // FIX: En render-only con NavMesh guardado en disco, no generar nada.
+            // El Coordinator ya no debería llamar este método, pero por seguridad
+            // lo bloqueamos aquí también para no instanciar obstáculos accidentalmente.
+            if (_renderOnlyMode && NavMeshSerializer.HasSavedNavMesh)
+            {
+                Debug.LogWarning("[MultiLevel] ⚠️ GenerateMultiLevelNavMeshAsync bloqueado: " +
+                                 "render-only mode con NavMesh en disco. Usa LoadNavMeshFromFile().");
+                return false;
+            }
+
             Debug.Log("[MultiLevel] 🚀 Iniciando generación MULTI-NIVEL async (Unity 6.3+)...");
             float startTime = Time.realtimeSinceStartup;
             _diagnostics = new DiagnosticData { startTime = startTime };
@@ -359,7 +378,9 @@ namespace IndoorNavAR.Navigation
             try
             {
                 if (!ValidateInputMesh()) return false;
-                if (_autoFindProxyMeshes) FindProxyMeshes();
+
+                // FIX v3: En render-only no procesar proxies
+                if (_autoFindProxyMeshes && !_renderOnlyMode) FindProxyMeshes();
 
                 ConfigureNavMeshAgentSettings();
                 DetectStairHelpers();
@@ -393,15 +414,19 @@ namespace IndoorNavAR.Navigation
                     _openingGenerator.GenerateOpeningsForAllStairs();
                 }
 
-                List<GameObject> allObstacles = _levels
-                    .SelectMany(l => l.WallObstacles.Concat(l.FurnitureObstacles).Concat(l.ProxyObstacles))
-                    .ToList();
+                // FIX v3: En render-only la lista de obstáculos está vacía —
+                // no se crean GameObjects rojos, pero el bake del NavMesh guardado
+                // ya los tiene incorporados como área no-walkable.
+                List<GameObject> allObstacles = _renderOnlyMode
+                    ? new List<GameObject>()
+                    : _levels
+                        .SelectMany(l => l.WallObstacles.Concat(l.FurnitureObstacles).Concat(l.ProxyObstacles))
+                        .ToList();
 
                 Debug.Log($"[MultiLevel] 🔧 Bake GLOBAL ASYNC: {_levels.Count} niveles, " +
-                          $"{allObstacles.Count} obstáculos, " +
+                          $"{allObstacles.Count} obstáculos{(_renderOnlyMode ? " (render-only: sin obstáculos)" : "")}, " +
                           $"{_detectedStairs.Count} escaleras");
 
-                // ✅ FIX: Usar BakeGlobalAsync() para evitar race condition post-bake
                 var (bakeOk, bakeStats) = await _globalBaker.BakeGlobalAsync(
                     navigableLevels,
                     allObstacles,
@@ -445,14 +470,8 @@ namespace IndoorNavAR.Navigation
             }
         }
 
-        /// <summary>
-        /// Versión síncrona (llamada desde ContextMenu o código legacy).
-        /// Internamente llama la versión async. En Editor este comportamiento es seguro.
-        /// </summary>
         public bool GenerateMultiLevelNavMesh()
         {
-            // En Editor, Schedule para el siguiente frame y ejecutar sync no es ideal.
-            // Pero el ContextMenu requiere sync. Usamos la versión sync de BakeGlobal.
             Debug.Log("[MultiLevel] 🚀 Iniciando generación MULTI-NIVEL (sync, Unity 6.3+)...");
             float startTime = Time.realtimeSinceStartup;
             _diagnostics = new DiagnosticData { startTime = startTime };
@@ -460,7 +479,7 @@ namespace IndoorNavAR.Navigation
             try
             {
                 if (!ValidateInputMesh()) return false;
-                if (_autoFindProxyMeshes) FindProxyMeshes();
+                if (_autoFindProxyMeshes && !_renderOnlyMode) FindProxyMeshes();
 
                 ConfigureNavMeshAgentSettings();
                 DetectStairHelpers();
@@ -494,16 +513,15 @@ namespace IndoorNavAR.Navigation
                     _openingGenerator.GenerateOpeningsForAllStairs();
                 }
 
-                List<GameObject> allObstacles = _levels
-                    .SelectMany(l => l.WallObstacles.Concat(l.FurnitureObstacles).Concat(l.ProxyObstacles))
-                    .ToList();
+                List<GameObject> allObstacles = _renderOnlyMode
+                    ? new List<GameObject>()
+                    : _levels
+                        .SelectMany(l => l.WallObstacles.Concat(l.FurnitureObstacles).Concat(l.ProxyObstacles))
+                        .ToList();
 
                 Debug.Log($"[MultiLevel] 🔧 Bake GLOBAL SYNC: {_levels.Count} niveles, " +
                           $"{allObstacles.Count} obstáculos");
 
-                // Versión sync — puede tener race condition en Unity 6.3+
-                // Para serialización correcta, SaveSession debería llamarse
-                // después de GenerateMultiLevelNavMeshAsync()
                 bool bakeOk = _globalBaker.BakeGlobal(
                     navigableLevels,
                     allObstacles,
@@ -573,6 +591,14 @@ namespace IndoorNavAR.Navigation
             levelData.WalkableSurface = surface;
             levelData.NavMeshSurface  = navMeshSurface;
 
+            // FIX v3: En render-only, no crear ningún obstáculo visual.
+            // Los obstáculos ya están bakeados en el NavMesh guardado en disco.
+            if (_renderOnlyMode)
+            {
+                Debug.Log($"[MultiLevel] 📱 Nivel {navLevel.LevelIndex} — render-only: sin obstáculos.");
+                return levelData;
+            }
+
             List<WallPlane> walls = _meshProcessor.DetectWallPlanesForLevel(_primaryMesh, navLevel);
             _diagnostics.wallPlanesDetected += walls.Count;
 
@@ -635,6 +661,21 @@ namespace IndoorNavAR.Navigation
             NavigationStartPointManager.ClearAll();
 
             Debug.Log("[MultiLevel] 🧹 Limpiado (incluyendo NavigationStartPointManager)");
+        }
+
+        /// <summary>
+        /// Activa/desactiva el modo render-only en tiempo de ejecución.
+        /// </summary>
+        public void SetRenderOnlyMode(bool renderOnly)
+        {
+            _renderOnlyMode = renderOnly;
+            if (renderOnly)
+            {
+                _showDebugVisualization   = false;
+                _autoFindProxyMeshes      = false;
+                _debugDrawOpeningRaycasts = false;
+            }
+            Debug.Log($"[MultiLevel] 📱 renderOnlyMode = {renderOnly}");
         }
 
         #endregion
@@ -733,7 +774,8 @@ namespace IndoorNavAR.Navigation
 
         private void OnDrawGizmos()
         {
-            if (!_showDebugVisualization) return;
+            // FIX v3: En render-only no dibujar gizmos de debug
+            if (!_showDebugVisualization || _renderOnlyMode) return;
             for (int i = 0; i < _levels.Count; i++)
             {
                 LevelData level = _levels[i];
@@ -794,6 +836,9 @@ namespace IndoorNavAR.Navigation
 
         [ContextMenu("🧹 Post Bake Cleanup")]
         private void ContextPostBakeCleanup() => PostBakeCleanup();
+
+        [ContextMenu("📱 Toggle RenderOnly Mode")]
+        private void ContextToggleRenderOnly() => SetRenderOnlyMode(!_renderOnlyMode);
 
         #endregion
     }

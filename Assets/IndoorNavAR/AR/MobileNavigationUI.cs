@@ -178,7 +178,7 @@ namespace IndoorNavAR.AR
         private float _sheetHalfY;
         private float _sheetFullY;
         private float _sheetPeekY;
-
+        private float _sheetTotalHeight; // altura total del sheet
         // ─── Canvas ───────────────────────────────────────────────────────────
         private Canvas       _canvas;
         private CanvasScaler _scaler;
@@ -342,6 +342,20 @@ namespace IndoorNavAR.AR
             yield return null;
             yield return null;
             yield return null;
+
+            // FIX: Recalcular layout AHORA que el Canvas ya tiene su RectTransform final.
+            // En Awake, GetCanvasHeight() devuelve REF_H porque el Canvas aún no se inicializó.
+            // Aquí ya tiene el tamaño real de la pantalla.
+            CalculateAdaptiveLayout();
+            if (_sheet != null)
+            {
+                _sheet.sizeDelta = new Vector2(0, _sheetTotalHeight);
+            }
+            if (_statusBar != null)
+            {
+                _statusBar.sizeDelta = new Vector2(0, _statusHeight);
+            }
+
             DiagnoseWaypointManager();
             RefreshWaypointList();
             RefreshFavoriteList();
@@ -398,35 +412,40 @@ namespace IndoorNavAR.AR
         /// </summary>
         private void CalculateAdaptiveLayout()
         {
-            float safeTop    = SafeTop();
             float safeBottom = SafeBottom();
+            float safeTop    = SafeTop();
 
-            // Status bar: notch + padding fijo. Clamp para notches muy grandes (tablets sin notch).
             _statusHeight = Mathf.Clamp(safeTop + 80f, 80f, 140f);
-
-            // Área que ocupan los FABs desde el borde inferior
             float fabAreaH = FAB_SIZE + FAB_PAD * 2f + safeBottom;
 
-            // Peek: el borde superior del sheet en estado Collapsed queda
-            // exactamente sobre los FABs con 8u de margen
-            _peekH     = fabAreaH + 8f;
-            _sheetPeekY = _peekH;
+            // ── ARQUITECTURA CORRECTA DE BOTTOM SHEET ──────────────────────
+            // pivot=(0.5,0), anchorMin/Max=(0,0)/(1,0)
+            // anchoredPosition.y = posición del BORDE INFERIOR del sheet
+            // Para que solo "visible" unidades aparezcan en pantalla:
+            //   anchoredPosition.y = -(sheetTotalH - visible)
+            // Valor negativo → sheet empuja hacia abajo, casi todo fuera de pantalla.
 
-            // El área lógica disponible entre status bar y FABs
-            float availableH = REF_H - _statusHeight - fabAreaH;
+            float canvasH = GetCanvasHeight();  // altura REAL del canvas en unidades lógicas
 
-            // Half: 38% del área disponible (antes era 30% de REF_H → muy pequeño en tablets)
-            _sheetHalfY = _peekH + availableH * 0.38f;
+            _peekH            = fabAreaH + 8f;              // solo el handle + tabs (~148u)
+            float halfVis     = canvasH * 0.38f;             // 38% de la pantalla real
+            float fullVis     = canvasH - _statusHeight - 28f; // hasta casi la status bar
 
-            // Full: 72% del área disponible, con tope duro 24u bajo la status bar
-            float maxFullY = REF_H - _statusHeight - 24f - fabAreaH;
-            _sheetFullY = Mathf.Min(_peekH + availableH * 0.72f, maxFullY);
+            _sheetTotalHeight = fullVis + 80f;               // margen extra para que el contenido no se corte
 
-            // Garantía final: Full > Half > Peek
-            _sheetHalfY = Mathf.Clamp(_sheetHalfY, _sheetPeekY + 80f, _sheetFullY - 60f);
+            // Valores NEGATIVOS: cuánto se desplaza el sheet hacia abajo
+            _sheetPeekY = -(_sheetTotalHeight - _peekH);
+            _sheetHalfY = -(_sheetTotalHeight - halfVis);
+            _sheetFullY = -(_sheetTotalHeight - fullVis);
 
-            // NavPanel hidden: suficientemente abajo para no ser visible
             _navPanelHiddenY = -(280f + safeBottom + 20f);
+        }
+
+        private float GetCanvasHeight()
+        {
+            if (_canvas == null) return REF_H;
+            var rt = _canvas.GetComponent<RectTransform>();
+            return (rt != null && rt.rect.height > 100f) ? rt.rect.height : REF_H;
         }
 
         /// <summary>
@@ -438,8 +457,7 @@ namespace IndoorNavAR.AR
 
             if (_sheet != null)
             {
-                float sheetH = _sheetFullY + 20f;
-                _sheet.sizeDelta = new Vector2(0, sheetH);
+                _sheet.sizeDelta = new Vector2(0, _sheetTotalHeight);
                 SnapSheet(_sheetState, instant: true);
             }
 
@@ -742,8 +760,8 @@ namespace IndoorNavAR.AR
 
         private void BuildSheet()
         {
-            // FIX 2: usa valores adaptativos calculados
-            float sheetH = _sheetFullY + 20f;
+            // FIX: usa _sheetTotalHeight calculado en CalculateAdaptiveLayout
+            float sheetH = _sheetTotalHeight;
 
             _sheet = Mk("Sheet", transform);
             _sheet.anchorMin = new Vector2(0, 0); _sheet.anchorMax = new Vector2(1, 0);
@@ -1364,7 +1382,9 @@ namespace IndoorNavAR.AR
         private float GetSheetTopScreenY()
         {
             if (_sheet == null) return 0;
-            return (_sheet.anchoredPosition.y + _sheet.rect.height) * _canvas.scaleFactor;
+            // anchoredPosition.y es negativo; borde superior = pos + height
+            float topLogical = _sheet.anchoredPosition.y + _sheet.rect.height;
+            return topLogical * _canvas.scaleFactor;
         }
 
         private bool IsPointerOverInteractableUI(Vector2 sp)
@@ -2226,8 +2246,11 @@ namespace IndoorNavAR.AR
 
         private static void Vibrate()
         {
-#if (UNITY_ANDROID || UNITY_IOS) && !UNITY_EDITOR
-            UnityEngine.InputSystem.Handheld.Vibrate(0.1f);
+#if UNITY_ANDROID && !UNITY_EDITOR
+            // Unity 6: Handheld está en UnityEngine, no en UnityEngine.InputSystem
+            UnityEngine.Handheld.Vibrate();
+#elif UNITY_IOS && !UNITY_EDITOR
+            UnityEngine.Handheld.Vibrate();
 #endif
         }
 
@@ -2284,17 +2307,19 @@ namespace IndoorNavAR.AR
             cg.alpha = a;
         }
 
-        // FIX 2: SafeTop/Bottom en unidades de referencia del canvas, no en píxeles físicos
-        private static float SafeTop()
+        // Devuelve el inset superior del safe area en unidades lógicas del canvas.
+        private float SafeTop()
         {
-            float ratio = Screen.safeArea.yMin / Screen.height;
-            return ratio * REF_H * 0.5f; // × 0.5 porque matchWidthOrHeight = 0.618 ≈ 0.5 para alto
+            if (Screen.height <= 0) return 0f;
+            float canvasH = GetCanvasHeight();
+            return (Screen.safeArea.yMin / Screen.height) * canvasH;
         }
 
-        private static float SafeBottom()
+        private float SafeBottom()
         {
-            float ratio = (Screen.height - Screen.safeArea.yMax) / Screen.height;
-            return ratio * REF_H * 0.5f;
+            if (Screen.height <= 0) return 0f;
+            float canvasH = GetCanvasHeight();
+            return ((Screen.height - Screen.safeArea.yMax) / Screen.height) * canvasH;
         }
 
         // ─── Data ─────────────────────────────────────────────────────────────
