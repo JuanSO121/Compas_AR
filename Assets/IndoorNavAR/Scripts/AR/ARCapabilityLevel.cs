@@ -78,8 +78,7 @@ namespace IndoorNavAR.AR
         yield return ARSession.Install();
     }
 
-    if (_planeManager == null)
-        _planeManager = FindObjectOfType<ARPlaneManager>();
+    _planeManager ??= FindAnyObjectByType<ARPlaneManager>();
 
     if (_planeManager == null)
     {
