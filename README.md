@@ -9,7 +9,7 @@ Este repositorio corresponde al módulo de realidad aumentada y navegación en i
 - generación de rutas navegables sobre NavMesh multinivel,
 - persistencia de sesiones de navegación.
 
-> Próximamente, este módulo se integrará con un componente de la app movil de flutter y el de reconocimiento de obstáculos para recálculo dinámico de rutas y mejora de seguridad en movilidad.
+> Próximamente, este módulo se integrará con un componente de reconocimiento de obstáculos para recálculo dinámico de rutas y mejora de seguridad en movilidad.
 
 ---
 
