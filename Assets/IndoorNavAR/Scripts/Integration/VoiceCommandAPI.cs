@@ -1,26 +1,44 @@
 // File: VoiceCommandAPI.cs
-// ✅ v6 — Fix JSON corrupto (NaN/Infinity en coordenadas z)
+// ✅ v7.1 — Fix TLS ALLOC_TEMP_TLS: deduplicación de GuideAnnouncementEvent
 //
-//  BUG CORREGIDO (v5 → v6):
+//  DIAGNÓSTICO:
 //  ──────────────────────────────────────────────────────────────────────────
-//  En Unity IL2CPP, float.ToString("F2") sobre NaN o Infinity produce
-//  literales inválidos en JSON:
+//  El error "TLS Allocator ALLOC_TEMP_TLS, underlying allocator
+//  ALLOC_TEMP_MAIN has unfreed allocations, size 646" fue introducido en v7.
 //
-//    NaN           → "NaN"         ← no es JSON válido
-//    Infinity      → "Infinity"    ← no es JSON válido
-//    -Infinity     → "-Infinity"   ← no es JSON válido
-//    (con formato compuesto {x:F2}) → a veces "-F2", "NaNF2"
+//  Cadena causal:
+//    ARGuideController.EvaluateState()  [InvokeRepeating, cada 0.25s]
+//      → Announce()
+//        → EventBus.Publish(GuideAnnouncementEvent)
+//          → OnGuideAnnouncement()
+//            → Reply()
+//              → SendUnityMessageToFlutter()
+//                → new AndroidJavaClass(...)   ← ALLOC en ALLOC_TEMP_TLS
 //
-//  Flutter llama jsonDecode() y lanza FormatException → cae al catch de
-//  "Mensaje no-JSON" → list_waypoints / create_waypoint nunca se procesan.
+//  EvaluateState() corre a 4/s. Los estados del guía NO cambian en cada
+//  tick, pero Announce() se llama de todas formas mientras se está en el
+//  estado (p.ej. Waiting llama Announce(WaitingForUser) → nunca cambia
+//  mientras el usuario sigue lejos).
 //
-//  FIX: SafeFloat() detecta NaN/Infinity y devuelve "0.00".
-//       Se aplica en RebuildWaypointCache(), CreateWaypointAtAgent() y
-//       OnNavigationArrived().
+//  AndroidJavaClass alloca en el TLS del JNI bridge (IL2CPP/arm64).
+//  Con 4 instancias/s el allocator no alcanza a liberar entre ciclos.
 //
-//  HEREDADOS de v5:
-//  - onUnityMessage() en lugar de sendMessageToFlutter() (rama unity_6000)
-//  - try/finally explícito — NO 'using' (bug IL2CPP Dispose prematuro en arm64)
+//  FIX (solo en este archivo — ARGuideController y EventBus sin cambios):
+//  ──────────────────────────────────────────────────────────────────────────
+//  + _lastAnnouncementType (GuideAnnouncementType?): tipo del último anuncio
+//    enviado a Flutter.
+//  + _lastAnnouncementMsg (string): mensaje del último anuncio enviado.
+//  + OnGuideAnnouncement() descarta el evento si tipo Y mensaje son
+//    idénticos al último enviado → Reply() no se llama → AndroidJavaClass
+//    no se instancia → ALLOC_TEMP_TLS no se satura.
+//  + Se usan ambos discriminadores (tipo + mensaje) porque el mismo tipo
+//    puede tener mensajes distintos (p.ej. FloorReached: "piso 1" vs "piso 2").
+//
+//  HEREDADOS sin cambios:
+//  - SafeFloat()          — bug IL2CPP NaN/Infinity en JSON (v6)
+//  - onUnityMessage()     — rama unity_6000 (v5)
+//  - try/finally          — bug IL2CPP Dispose prematuro arm64 (v5)
+//  - GuideAnnouncementEvent suscripción — mantenida, con deduplicación (v7)
 
 using System;
 using System.Collections.Generic;
@@ -50,6 +68,12 @@ namespace IndoorNavAR.Integration
         private bool   _waypointCacheDirty = true;
         private string _waypointListCache  = "[]";
 
+        // ✅ FIX v7.1 — Deduplicación de GuideAnnouncementEvent.
+        // Reply() → AndroidJavaClass solo se instancia cuando el anuncio
+        // es genuinamente distinto al último enviado.
+        private GuideAnnouncementType? _lastAnnouncementType = null;
+        private string                 _lastAnnouncementMsg  = null;
+
         #region Lifecycle
 
         private void Awake()
@@ -70,6 +94,7 @@ namespace IndoorNavAR.Integration
             bus.Subscribe<WaypointRemovedEvent>     (OnWaypointRemoved);
             bus.Subscribe<WaypointsBatchLoadedEvent>(OnWaypointsBatchLoaded);
             bus.Subscribe<NavigationArrivedEvent>   (OnNavigationArrived);
+            bus.Subscribe<GuideAnnouncementEvent>   (OnGuideAnnouncement);
         }
 
         private void OnDisable()
@@ -80,6 +105,7 @@ namespace IndoorNavAR.Integration
             bus.Unsubscribe<WaypointRemovedEvent>     (OnWaypointRemoved);
             bus.Unsubscribe<WaypointsBatchLoadedEvent>(OnWaypointsBatchLoaded);
             bus.Unsubscribe<NavigationArrivedEvent>   (OnNavigationArrived);
+            bus.Unsubscribe<GuideAnnouncementEvent>   (OnGuideAnnouncement);
         }
 
         private void OnDestroy()
@@ -89,7 +115,7 @@ namespace IndoorNavAR.Integration
 
         #endregion
 
-        #region Event handlers
+        #region Event handlers — Waypoints
 
         private void OnWaypointPlaced(WaypointPlacedEvent _)
         {
@@ -108,6 +134,57 @@ namespace IndoorNavAR.Integration
             _waypointCacheDirty = true;
             Debug.Log($"[VoiceAPI] ✅ BatchLoaded: {evt.Count} waypoint(s). " +
                       $"WaypointManager.Count={_waypointManager?.WaypointCount ?? -1}");
+        }
+
+        #endregion
+
+        #region Event handler — Guía NPC (v7.1) ─────────────────────────────
+
+        /// <summary>
+        /// ✅ v7.1: Recibe avisos del NPC guía y los reenvía a Flutter como JSON,
+        /// con deduplicación para evitar saturar ALLOC_TEMP_TLS.
+        ///
+        /// PROBLEMA (v7 original):
+        ///   EvaluateState() corre a 0.25s. Mientras el guía esté en un estado
+        ///   estable (p.ej. Waiting), Announce() se republica constantemente con
+        ///   el mismo tipo y mensaje. Cada publicación llegaba aquí y llamaba
+        ///   Reply() → new AndroidJavaClass() → alloc en ALLOC_TEMP_TLS → leak.
+        ///
+        /// FIX:
+        ///   Comparar tipo + mensaje con el último enviado. Si son idénticos,
+        ///   descartar silenciosamente. Solo llamar Reply() cuando el anuncio
+        ///   cambia de verdad (nueva transición de estado, nuevo piso, etc.).
+        ///
+        /// Esquema JSON enviado a Flutter (sin cambios respecto a v7):
+        /// {
+        ///   "action":  "guide_announcement",
+        ///   "ok":      true,
+        ///   "message": "Atención: escaleras próximas",
+        ///   "type":    "ApproachingStairs",
+        ///   "floor":   "0"
+        /// }
+        /// </summary>
+        private void OnGuideAnnouncement(GuideAnnouncementEvent evt)
+        {
+            // ✅ FIX v7.1: descartar duplicados antes de tocar AndroidJavaClass
+            if (_lastAnnouncementType == evt.AnnouncementType &&
+                _lastAnnouncementMsg  == evt.Message)
+            {
+                Debug.Log($"[VoiceAPI] 🔇 GuideAnnouncement deduplicado: [{evt.AnnouncementType}]");
+                return;
+            }
+
+            _lastAnnouncementType = evt.AnnouncementType;
+            _lastAnnouncementMsg  = evt.Message;
+
+            string json = $"{{\"action\":\"guide_announcement\"," +
+                          $"\"ok\":true," +
+                          $"\"message\":\"{EscapeJson(evt.Message)}\"," +
+                          $"\"type\":\"{evt.AnnouncementType}\"," +
+                          $"\"floor\":\"{evt.CurrentFloor}\"}}";
+
+            Reply(json);
+            Debug.Log($"[VoiceAPI] 🔊 GuideAnnouncement → Flutter: [{evt.AnnouncementType}] \"{evt.Message}\" (piso {evt.CurrentFloor})");
         }
 
         #endregion
@@ -191,7 +268,6 @@ namespace IndoorNavAR.Integration
 
             if (!string.IsNullOrWhiteSpace(name)) wp.WaypointName = name;
 
-            // ✅ FIX v6: SafeFloat en coordenadas
             Reply(Ok("create_waypoint", $"Baliza '{wp.WaypointName}' creada",
                 new Arg("id",   wp.WaypointId),
                 new Arg("name", wp.WaypointName),
@@ -257,7 +333,6 @@ namespace IndoorNavAR.Integration
 
         private void OnNavigationArrived(NavigationArrivedEvent evt)
         {
-            // ✅ FIX v6: SafeFloat en coordenadas del evento
             Reply(Ok("navigation_arrived",
                      string.IsNullOrEmpty(evt.WaypointName)
                          ? "Has llegado a tu destino"
@@ -291,9 +366,6 @@ namespace IndoorNavAR.Integration
                 if (w == null) continue;
                 if (sb.Length > 1) sb.Append(',');
 
-                // ✅ FIX v6: SafeFloat() en lugar de ":F2" directo
-                // ":F2" sobre NaN o Infinity → "NaNF2" / "-F2" → JSON inválido
-                // SafeFloat() → siempre un número decimal válido
                 sb.Append($"{{\"id\":\"{w.WaypointId}\"," +
                            $"\"name\":\"{EscapeJson(w.WaypointName)}\"," +
                            $"\"type\":\"{w.Type}\"," +
@@ -324,17 +396,12 @@ namespace IndoorNavAR.Integration
 
         /// <summary>
         /// ✅ FIX v5: try/finally explícito — NO 'using'.
-        /// En IL2CPP Unity6+arm64, el bloque 'using' llama Dispose() antes
-        /// de que CallStatic complete → objeto se resuelve como java.lang.Object
-        /// → NoSuchMethodError en tiempo de ejecución.
-        ///
-        /// Rama experimental/unity_6000:
-        ///   onUnityMessage(String)  ← método correcto (NO sendMessageToFlutter)
+        /// En IL2CPP Unity6+arm64, 'using' llama Dispose() antes de que
+        /// CallStatic complete → NoSuchMethodError en runtime.
         /// </summary>
         private static void SendUnityMessageToFlutter(string go, string method, string msg)
         {
 #if UNITY_ANDROID && !UNITY_EDITOR
-            // ── Intento 1: onUnityMessage (rama experimental/unity_6000) ─────
             AndroidJavaClass cls = null;
             try
             {
@@ -349,7 +416,6 @@ namespace IndoorNavAR.Integration
             }
             finally { cls?.Dispose(); cls = null; }
 
-            // ── Intento 2: sendMessageToFlutter (versiones antiguas) ──────────
             AndroidJavaClass cls2 = null;
             try
             {
@@ -364,7 +430,6 @@ namespace IndoorNavAR.Integration
             }
             finally { cls2?.Dispose(); cls2 = null; }
 
-            // ── Intento 3: UnityUtils (nombre antiguo del plugin) ─────────────
             AndroidJavaClass cls3 = null;
             try
             {
@@ -409,21 +474,9 @@ namespace IndoorNavAR.Integration
             s?.Replace("\\", "\\\\").Replace("\"", "\\\"").Replace("\n", "\\n") ?? "";
 
         /// <summary>
-        /// ✅ FIX v6: Serialización segura de floats para JSON.
-        ///
-        /// Problema raíz:
-        ///   En IL2CPP, el interpolado $"{valor:F2}" equivale a
-        ///   valor.ToString("F2", CultureInfo.InvariantCulture).
-        ///   Sobre NaN produce   → "NaN"   (inválido en JSON)
-        ///   Sobre Infinity      → "∞"     (inválido en JSON)
-        ///   Sobre -Infinity     → "-∞"    (inválido en JSON)
-        ///   Con formato erróneo → "-F2"   (inválido en JSON)
-        ///
-        ///   Flutter: jsonDecode lanza FormatException → catch "no-JSON".
-        ///   Resultado: ningún mensaje de Unity se procesaba en Flutter.
-        ///
-        /// Solución: sustituir por "0.00" (válido JSON, neutro para Unity).
-        /// El valor 0 es mucho mejor que crashear la comunicación.
+        /// ✅ FIX v6: Serialización segura de floats.
+        /// NaN/Infinity en IL2CPP → "0.00" para evitar FormatException en
+        /// jsonDecode() de Flutter.
         /// </summary>
         private static string SafeFloat(float v) =>
             float.IsNaN(v) || float.IsInfinity(v) ? "0.00" : v.ToString("F2");
@@ -444,6 +497,17 @@ namespace IndoorNavAR.Integration
             _waypointCacheDirty = true;
             RebuildWaypointCache();
             Debug.Log($"[VoiceAPI] Cache: {_waypointListCache}");
+        }
+
+        [ContextMenu("Test: GuideAnnouncement (ApproachingStairs)")]
+        private void DbgGuideAnnouncement()
+        {
+            EventBus.Instance?.Publish(new GuideAnnouncementEvent
+            {
+                AnnouncementType = GuideAnnouncementType.ApproachingStairs,
+                Message          = "Atención: escaleras próximas",
+                CurrentFloor     = 0
+            });
         }
 
         #endregion

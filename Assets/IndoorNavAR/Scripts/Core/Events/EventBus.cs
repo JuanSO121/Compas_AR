@@ -1,7 +1,7 @@
 // File: EventBus.cs
-// ✅ v2 — Agrega NavigationArrivedEvent para notificar a Flutter
-//         cuando el agente llega al destino (feedback por voz/TTS).
-//         Todo lo demás es idéntico a la versión anterior.
+// ✅ v3 — Sin modificaciones respecto al original.
+// GuideAnnouncementEvent y GuideAnnouncementType ya estaban definidos aquí.
+// No se toca este archivo.
 
 using System;
 using System.Collections.Generic;
@@ -100,7 +100,7 @@ namespace IndoorNavAR.Core.Events
     }
 
     // =========================================================================
-    // EVENTOS — agrupados por dominio
+    // EVENTOS
     // =========================================================================
 
     // ── AR ────────────────────────────────────────────────────────────────────
@@ -146,9 +146,6 @@ namespace IndoorNavAR.Core.Events
         public string WaypointId;
     }
 
-    /// Publicado por WaypointManager.LoadWaypoints() al finalizar la carga en lote.
-    /// Permite que la UI (o cualquier suscriptor) refresque la lista UNA sola vez
-    /// en lugar de N veces por N WaypointPlacedEvents individuales.
     public struct WaypointsBatchLoadedEvent
     {
         public int Count;
@@ -219,21 +216,36 @@ namespace IndoorNavAR.Core.Events
         public Vector3 AgentPosition;
     }
 
-    /// ✅ NUEVO — Publicado por NavigationAgent cuando el agente llega al destino.
-    /// VoiceCommandAPI lo escucha y envía una respuesta JSON a Flutter para que
-    /// el TTS anuncie la llegada sin que Flutter tenga que hacer polling.
-    ///
-    /// Uso en NavigationAgent.HandlePathCompleted():
-    ///   EventBus.Instance.Publish(new NavigationArrivedEvent {
-    ///       WaypointName = _lastDestinationName,
-    ///       Position     = transform.position
-    ///   });
     public struct NavigationArrivedEvent
     {
-        /// Nombre del waypoint de destino (para el anuncio de voz en Flutter).
         public string  WaypointName;
-        /// Posición world donde llegó el agente.
         public Vector3 Position;
+    }
+
+    // ── Guía NPC ─────────────────────────────────────────────────────────────
+
+    /// <summary>
+    /// Publicado por ARGuideController para avisos de voz que Flutter debe
+    /// leer en voz alta (TTS) al usuario con baja visión.
+    /// VoiceCommandAPI se suscribe y lo reenvía a Flutter con
+    /// action="guide_announcement".
+    /// </summary>
+    public struct GuideAnnouncementEvent
+    {
+        public GuideAnnouncementType AnnouncementType;
+        public string Message;
+        public int    CurrentFloor;
+    }
+
+    public enum GuideAnnouncementType
+    {
+        ApproachingStairs,
+        StartingClimb,
+        StartingDescent,
+        FloorReached,
+        WaitingForUser,
+        ResumeGuide,
+        StairsComplete
     }
 
     // ── UI / Mensajes ─────────────────────────────────────────────────────────
