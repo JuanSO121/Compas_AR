@@ -47,9 +47,8 @@ namespace IndoorNavAR.AR
             StartCoroutine(DetectRoutine());
         }
 
-        private IEnumerator DetectRoutine()
+private IEnumerator DetectRoutine()
 {
-    // 🔹 Forzado manual
     if (_forceLevel >= 0 && _forceLevel <= 2)
     {
         Current = (ARCapabilityLevel)_forceLevel;
@@ -60,6 +59,8 @@ namespace IndoorNavAR.AR
 #if UNITY_EDITOR
     Current = ARCapabilityLevel.FullAR;
     IsReady = true;
+    Log($"Capacidad AR detectada → {Current}");
+    yield break;
 #else
 
     yield return ARSession.CheckAvailability();
@@ -74,8 +75,39 @@ namespace IndoorNavAR.AR
 
     if (ARSession.state == ARSessionState.NeedsInstall)
     {
-        Log("AR necesita instalación...");
+        Log("AR necesita instalación, solicitando...");
         yield return ARSession.Install();
+
+        // ✅ NUEVO: verificar resultado de la instalación
+        if (ARSession.state != ARSessionState.Ready &&
+            ARSession.state != ARSessionState.SessionInitializing &&
+            ARSession.state != ARSessionState.SessionTracking)
+        {
+            Log($"Instalación AR rechazada o fallida (state={ARSession.state}) → NoAR");
+            Current = ARCapabilityLevel.NoAR;
+            IsReady = true;
+            yield break;
+        }
+    }
+
+    // ✅ NUEVO: esperar a que la sesión realmente arranque (timeout 5s)
+    float timeout = 5f;
+    while (ARSession.state == ARSessionState.SessionInitializing && timeout > 0f)
+    {
+        timeout -= Time.deltaTime;
+        yield return null;
+    }
+
+    // ✅ NUEVO: si no está tracked/ready después del timeout → NoAR
+    bool sessionActive = ARSession.state == ARSessionState.SessionTracking ||
+                         ARSession.state == ARSessionState.Ready;
+
+    if (!sessionActive)
+    {
+        Log($"Sesión AR no activa tras timeout (state={ARSession.state}) → NoAR");
+        Current = ARCapabilityLevel.NoAR;
+        IsReady = true;
+        yield break;
     }
 
     _planeManager ??= FindAnyObjectByType<ARPlaneManager>();
@@ -84,13 +116,13 @@ namespace IndoorNavAR.AR
     {
         Current = ARCapabilityLevel.ARWithoutPlanes;
         IsReady = true;
+        Log($"Capacidad AR detectada → {Current}");
         yield break;
     }
 
     yield return new WaitForSeconds(1f);
 
     var descriptor = _planeManager.descriptor;
-
     bool supportsPlanes =
         descriptor != null &&
         (descriptor.supportsHorizontalPlaneDetection ||
@@ -101,11 +133,11 @@ namespace IndoorNavAR.AR
         : ARCapabilityLevel.ARWithoutPlanes;
 
     IsReady = true;
+    Log($"Capacidad AR detectada → {Current}");
 
 #endif
-
-    Log($"Capacidad AR detectada → {Current}");
 }
+
 
         public IEnumerator WaitUntilReady()
         {

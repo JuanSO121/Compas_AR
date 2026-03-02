@@ -1,20 +1,35 @@
 // File: AROriginAligner.cs
-// ✅ FIX v2 — Modo fallback "No AR": si ARCapabilityDetector detecta que el
-//             dispositivo no soporta ARCore, el XR Origin se ancla al
-//             NavigationAgent y lo sigue cada frame (modo espectador).
+// ✅ FIX v3 — Modo No-AR se activa automáticamente sin necesitar ModelLoadedEvent.
 //
-//  COMPORTAMIENTO:
-//    FullAR         → comportamiento original: AR tracking real + alineación al StartPoint
-//    ARWithoutPlanes→ igual que FullAR pero sin detección de planos
-//    NoAR           → XR Origin se fija al agente. La cámara sigue al personaje
-//                     con un offset configurable (altura del ojo, ángulo de vista).
-//                     El usuario puede ver el recorrido completo aunque no tenga ARCore.
+//  PROBLEMA CORREGIDO (v2 → v3):
+//    En el flujo de sesión guardada, NavigationManager.InitializeFromSavedSession()
+//    llama directamente a PersistenceManager.LoadSession() sin publicar
+//    ModelLoadedEvent. Por tanto, OnModelLoaded() nunca se disparaba,
+//    AlignWhenReady() nunca corría y el modo No-AR nunca se activaba
+//    a menos que el usuario lo forzara manualmente desde el Inspector.
+//
+//  FIX v3:
+//    - En Start(), se lanza InitializeCapabilityAsync() que espera a que
+//      ARCapabilityDetector termine su detección y activa el modo No-AR
+//      si corresponde, INDEPENDIENTEMENTE de si llega un ModelLoadedEvent.
+//    - ModelLoadedEvent sigue siendo atendido para el flujo de carga de
+//      modelo nuevo (sin sesión guardada), pero ahora también se suscribe
+//      a NavMeshReadyForAlignmentEvent para poder alinear al StartPoint
+//      cuando el NavMesh ya está inyectado en el flujo de sesión guardada.
+//    - Se añade método público NotifySessionRestored() para que
+//      NavigationManager lo llame al final de InitializeFromSavedSession(),
+//      disparando la alineación post-restauración.
+//
+//  COMPORTAMIENTO POR MODO:
+//    FullAR / ARWithoutPlanes → comportamiento original: AR tracking + alineación StartPoint
+//    NoAR                     → XR Origin sigue al agente cada frame (modo espectador)
 //
 //  INTEGRACIÓN:
-//    Requiere ARCapabilityDetector en escena.
-//    Si ARCapabilityDetector no está disponible, asume FullAR (comportamiento original).
+//    NavigationManager debe llamar _arOriginAligner.NotifySessionRestored()
+//    al final de InitializeFromSavedSession() para disparar la alineación.
 
 using System.Collections;
+using System.Threading.Tasks;
 using UnityEngine;
 using UnityEngine.XR.ARFoundation;
 using IndoorNavAR.Core.Events;
@@ -66,8 +81,9 @@ namespace IndoorNavAR.AR
 
         // ─── Estado interno ────────────────────────────────────────────────
         private bool               _aligned      = false;
-        private bool               _noArMode     = false;   // true cuando ARCapability = NoAR
-        private bool               _followActive = false;   // true cuando el loop de seguimiento corre
+        private bool               _noArMode     = false;
+        private bool               _followActive = false;
+        private bool               _capabilityResolved = false; // ✅ FIX v3
         private ARCapabilityDetector _capDetector;
 
         #region Unity Lifecycle
@@ -75,6 +91,15 @@ namespace IndoorNavAR.AR
         private void Awake()
         {
             FindComponents();
+        }
+
+        private void Start()
+        {
+            // ✅ FIX v3: Resolver capacidad AR automáticamente en Start(),
+            // sin esperar ningún evento externo. Esto garantiza que el modo
+            // No-AR se activa aunque no llegue ModelLoadedEvent (flujo de
+            // sesión guardada) y aunque el usuario no pulse nada en el Inspector.
+            StartCoroutine(InitializeCapabilityRoutine());
         }
 
         private void OnEnable()
@@ -119,6 +144,61 @@ namespace IndoorNavAR.AR
 
         #endregion
 
+        #region Capability Initialization (FIX v3)
+
+        /// <summary>
+        /// Corre en Start(). Espera a que ARCapabilityDetector termine,
+        /// luego configura el modo (FullAR o No-AR) sin depender de eventos externos.
+        /// Si el modo es No-AR, activa el seguimiento inmediatamente.
+        /// Si el modo es FullAR/ARWithoutPlanes, espera a que llegue ModelLoadedEvent
+        /// o a que NotifySessionRestored() sea llamado externamente.
+        /// </summary>
+        private IEnumerator InitializeCapabilityRoutine()
+        {
+            // Esperar al menos un frame para que Awake() de otros componentes termine
+            yield return null;
+
+            // Esperar a que ARCapabilityDetector resuelva la detección
+            if (_capDetector != null)
+                yield return _capDetector.WaitUntilReady();
+
+            ARCapabilityLevel level = _capDetector != null
+                ? _capDetector.Current
+                : ARCapabilityLevel.FullAR;
+
+            Log($"📡 [Start] Capacidad AR resuelta: {level}");
+            _capabilityResolved = true;
+
+            if (level == ARCapabilityLevel.NoAR)
+            {
+                Log("📵 [Start] Dispositivo sin ARCore → activando modo No-AR automáticamente.");
+                _noArMode = true;
+
+                // Si ya hay un modelo cargado (sesión restaurada), activar seguimiento.
+                // Si no, ActivateNoArMode() se llamará cuando llegue ModelLoadedEvent
+                // o NotifySessionRestored().
+                var modelMgr = FindFirstObjectByType<IndoorNavAR.Core.Managers.ModelLoadManager>();
+                if (modelMgr != null && modelMgr.IsModelLoaded)
+                {
+                    Log("📵 [Start] Modelo ya cargado → activando seguimiento No-AR ahora.");
+                    ActivateNoArMode();
+                }
+                else
+                {
+                    Log("📵 [Start] Modo No-AR configurado. Esperando modelo para activar seguimiento...");
+                    // El seguimiento se activará cuando llegue ModelLoadedEvent o NotifySessionRestored()
+                }
+            }
+            else
+            {
+                _noArMode = false;
+                _followActive = false;
+                Log($"📡 [Start] Modo AR normal ({level}) — listo para alinear cuando llegue el modelo.");
+            }
+        }
+
+        #endregion
+
         #region Event Handlers
 
         private void OnModelLoaded(ModelLoadedEvent evt)
@@ -143,6 +223,17 @@ namespace IndoorNavAR.AR
             AlignToStartPoint();
         }
 
+        /// <summary>
+        /// ✅ FIX v3: Llamar desde NavigationManager al final de InitializeFromSavedSession().
+        /// Dispara la alineación o el modo No-AR para el flujo de sesión restaurada,
+        /// donde ModelLoadedEvent nunca se publica.
+        /// </summary>
+        public void NotifySessionRestored()
+        {
+            Log("📂 NotifySessionRestored() recibido.");
+            StartCoroutine(AlignWhenReady());
+        }
+
         #endregion
 
         #region Core Alignment
@@ -156,16 +247,16 @@ namespace IndoorNavAR.AR
             for (int i = 0; i < _delayFrames; i++)
                 yield return null;
 
-            // Si hay detector, esperar a que termine la detección
-            if (_capDetector != null)
+            // Si el detector aún no terminó, esperar
+            if (_capDetector != null && !_capabilityResolved)
                 yield return _capDetector.WaitUntilReady();
 
-            // Decidir modo
+            // Decidir modo (puede haber sido resuelto ya por InitializeCapabilityRoutine)
             ARCapabilityLevel level = _capDetector != null
                 ? _capDetector.Current
                 : ARCapabilityLevel.FullAR;
 
-            Log($"📡 Modo AR detectado: {level}");
+            Log($"📡 [AlignWhenReady] Modo AR: {level}");
 
             if (level == ARCapabilityLevel.NoAR)
             {
@@ -246,7 +337,6 @@ namespace IndoorNavAR.AR
             }
 
             // Desactivar ARSession para que no intente hacer tracking
-            // (ahorra batería y evita que sobreescriba la posición del Origin)
             var arSession = FindFirstObjectByType<ARSession>();
             if (arSession != null)
             {
@@ -269,7 +359,6 @@ namespace IndoorNavAR.AR
                 startPoint.ConfirmModelPositioned();
                 startPoint.ReteleportAgent();
 
-                // Posicionar cámara sobre el agente inmediatamente (sin lerp)
                 if (_navigationAgent != null)
                 {
                     Vector3 agentPos = _navigationAgent.transform.position;
@@ -293,7 +382,6 @@ namespace IndoorNavAR.AR
 
         /// <summary>
         /// Llamado cada Update() en modo No-AR.
-        /// Mueve el XR Origin para que la cámara siga al agente con suavizado.
         /// </summary>
         private void FollowAgent()
         {
@@ -301,20 +389,18 @@ namespace IndoorNavAR.AR
 
             Transform agentTf = _navigationAgent.transform;
 
-            // Calcular la posición deseada de la cámara
             Vector3 agentPos     = agentTf.position;
             Vector3 agentForward = agentTf.forward;
             Vector3 desiredCamPos = agentPos
                 + Vector3.up    * _noArCameraHeight
                 - agentForward  * _noArCameraBack;
 
-            // Calcular la rotación deseada de la cámara
             Quaternion desiredCamRot;
             if (_noArFollowRotation && agentForward != Vector3.zero)
             {
                 Vector3 lookDir = agentForward;
                 if (_noArCameraBack > 0)
-                    lookDir = (agentPos - desiredCamPos).normalized; // mira hacia el agente
+                    lookDir = (agentPos - desiredCamPos).normalized;
                 desiredCamRot = Quaternion.LookRotation(lookDir) *
                                 Quaternion.Euler(_noArPitchAngle, 0, 0);
             }
@@ -323,8 +409,6 @@ namespace IndoorNavAR.AR
                 desiredCamRot = _xrOrigin.Camera.transform.rotation;
             }
 
-            // Mover el XR Origin para que la cámara quede en desiredCamPos/Rot
-            // usando la API oficial de AR Foundation (no modificar transform directamente)
             float t = _noArFollowSmooth > 0
                 ? Time.deltaTime * _noArFollowSmooth
                 : 1f;
@@ -337,7 +421,6 @@ namespace IndoorNavAR.AR
 
             _xrOrigin.MoveCameraToWorldLocation(smoothPos);
 
-            // Rotar solo el Camera offset, no el Origin completo
             if (_noArFollowRotation)
                 _xrOrigin.MatchOriginUpCameraForward(Vector3.up, smoothRot * Vector3.forward);
         }
@@ -382,16 +465,17 @@ namespace IndoorNavAR.AR
             Debug.Log("══════════════════════════════════════");
             Debug.Log("  AROriginAligner — Estado");
             Debug.Log("══════════════════════════════════════");
-            Debug.Log($"  Modo AR:         {level}");
-            Debug.Log($"  Modo No-AR:      {_noArMode}");
-            Debug.Log($"  Seguimiento:     {_followActive}");
-            Debug.Log($"  XR Origin:       {(_xrOrigin != null ? _xrOrigin.gameObject.name : "NULL")}");
-            Debug.Log($"  AR Camera pos:   {(_xrOrigin?.Camera?.transform.position.ToString() ?? "N/A")}");
-            Debug.Log($"  StartPoint:      {(startPoint != null ? startPoint.gameObject.name : "No encontrado")}");
-            Debug.Log($"  SP posición:     {(startPoint != null ? startPoint.transform.position.ToString() : "N/A")}");
-            Debug.Log($"  Agente pos:      {(_navigationAgent != null ? _navigationAgent.transform.position.ToString() : "N/A")}");
-            Debug.Log($"  Nivel target:    {_targetLevel}");
-            Debug.Log($"  Alineado:        {_aligned}");
+            Debug.Log($"  Modo AR:              {level}");
+            Debug.Log($"  Modo No-AR:           {_noArMode}");
+            Debug.Log($"  Seguimiento activo:   {_followActive}");
+            Debug.Log($"  Capacidad resuelta:   {_capabilityResolved}");
+            Debug.Log($"  XR Origin:            {(_xrOrigin != null ? _xrOrigin.gameObject.name : "NULL")}");
+            Debug.Log($"  AR Camera pos:        {(_xrOrigin?.Camera?.transform.position.ToString() ?? "N/A")}");
+            Debug.Log($"  StartPoint:           {(startPoint != null ? startPoint.gameObject.name : "No encontrado")}");
+            Debug.Log($"  SP posición:          {(startPoint != null ? startPoint.transform.position.ToString() : "N/A")}");
+            Debug.Log($"  Agente pos:           {(_navigationAgent != null ? _navigationAgent.transform.position.ToString() : "N/A")}");
+            Debug.Log($"  Nivel target:         {_targetLevel}");
+            Debug.Log($"  Alineado:             {_aligned}");
             Debug.Log("══════════════════════════════════════");
         }
 

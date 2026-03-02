@@ -1,0 +1,74 @@
+{
+    "version": "2.0",
+    "timestamp": "2026-03-01 21:32:01",
+    "waypointCount": 2,
+    "waypoints": [
+        {
+            "id": "4190fccc-42c3-42f1-acc6-5a2509fd638b",
+            "name": "Entrada / Salida",
+            "type": 1,
+            "position": {
+                "x": 5.619339942932129,
+                "y": 0.0,
+                "z": -2.622380018234253
+            },
+            "rotation": {
+                "x": 0.0,
+                "y": 0.0,
+                "z": 0.0,
+                "w": 1.0
+            },
+            "color": {
+                "r": 0.0,
+                "g": 1.0,
+                "b": 0.0,
+                "a": 0.800000011920929
+            },
+            "height": 0.5,
+            "radius": 0.15000000596046449,
+            "description": "",
+            "isNavigable": true
+        },
+        {
+            "id": "79c000b9-01a5-416e-b0c9-be95c51bad6e",
+            "name": "Habitación 2° Piso",
+            "type": 5,
+            "position": {
+                "x": 3.200000047683716,
+                "y": 3.4800000190734865,
+                "z": -3.259999990463257
+            },
+            "rotation": {
+                "x": 0.0,
+                "y": 0.0,
+                "z": 0.0,
+                "w": 1.0
+            },
+            "color": {
+                "r": 0.800000011920929,
+                "g": 0.4000000059604645,
+                "b": 0.800000011920929,
+                "a": 0.800000011920929
+            },
+            "height": 0.5,
+            "radius": 0.15000000596046449,
+            "description": "",
+            "isNavigable": true
+        }
+    ],
+    "hasModel": true,
+    "modelName": "Biblioteca_F_V2",
+    "modelPosition": {
+        "x": 0.0,
+        "y": 0.0,
+        "z": 0.0
+    },
+    "modelRotation": {
+        "x": 0.0,
+        "y": 0.0,
+        "z": 0.0,
+        "w": 1.0
+    },
+    "modelScale": 1.0,
+    "hasNavMesh": true
+}

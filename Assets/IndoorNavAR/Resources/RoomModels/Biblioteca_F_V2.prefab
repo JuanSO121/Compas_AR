@@ -20250,6 +20250,7 @@ MonoBehaviour:
   _waitForNavMesh: 1
   _initialDelay: 0.5
   _navMeshTimeout: 30
+  _autoTeleportOnStart: 1
   _maxVerticalDeviation: 1
   _maxHorizontalRadius: 5
   _showGizmo: 1
@@ -22623,6 +22624,7 @@ MonoBehaviour:
   _waitForNavMesh: 1
   _initialDelay: 0.5
   _navMeshTimeout: 30
+  _autoTeleportOnStart: 1
   _maxVerticalDeviation: 1
   _maxHorizontalRadius: 5
   _showGizmo: 1
@@ -24574,7 +24576,7 @@ GameObject:
   m_Icon: {fileID: 0}
   m_NavMeshLayer: 0
   m_StaticEditorFlags: 0
-  m_IsActive: 1
+  m_IsActive: 0
 --- !u!4 &852644101117156476
 Transform:
   m_ObjectHideFlags: 0
@@ -30050,7 +30052,7 @@ GameObject:
   m_Icon: {fileID: 0}
   m_NavMeshLayer: 0
   m_StaticEditorFlags: 0
-  m_IsActive: 1
+  m_IsActive: 0
 --- !u!4 &8863029352316427083
 Transform:
   m_ObjectHideFlags: 0

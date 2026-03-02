@@ -250,18 +250,19 @@ namespace IndoorNavAR.Core.Data
     /// <summary>
     /// Estructura serializable para guardar/cargar waypoints.
     /// </summary>
+    // WaypointData.cs — solo cambiar struct → class
     [Serializable]
-    public struct WaypointSaveData
+    public class WaypointSaveData          // ✅ class, no struct
     {
-        public string id;
-        public string name;
+        public string     id;
+        public string     name;
         public WaypointType type;
-        public Vector3 position;
+        public Vector3    position;
         public Quaternion rotation;
-        public Color color;
-        public float height;
-        public float radius;
-        public string description;
-        public bool isNavigable;
+        public Color      color;
+        public float      height;
+        public float      radius;
+        public string     description;
+        public bool       isNavigable;
     }
 }

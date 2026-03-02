@@ -1,35 +1,26 @@
 // File: NavigationAgent.cs
-// ============================================================================
-//  AGENTE DE NAVEGACIÓN INDOOR — IndoorNavAR
-// ============================================================================
 
 using System;
 using UnityEngine;
 using UnityEngine.AI;
 using IndoorNavAR.Core.Events;
 using IndoorNavAR.Core.Data;
+
 namespace IndoorNavAR.Navigation
 {
     [RequireComponent(typeof(NavMeshAgent))]
     [RequireComponent(typeof(NavigationPathController))]
     public sealed class NavigationAgent : MonoBehaviour
     {
-        // ─── Inspector ────────────────────────────────────────────────────────
-
         [Header("Multi-Nivel")]
-        [SerializeField]
-        private bool _detectFloorTransitions = true;
+        [SerializeField] private bool _detectFloorTransitions = true;
 
         [Header("Eventos")]
-        [SerializeField]
-        private bool _publishEvents = true;
+        [SerializeField] private bool _publishEvents = true;
 
         [Header("Debug")]
-        [SerializeField]
-        private Transform _debugDestination;
-
-        [SerializeField]
-        private bool _logVerbose = false;
+        [SerializeField] private Transform _debugDestination;
+        [SerializeField] private bool      _logVerbose = false;
 
         // ─── Eventos públicos ─────────────────────────────────────────────────
 
@@ -39,16 +30,14 @@ namespace IndoorNavAR.Navigation
 
         // ─── Propiedades ──────────────────────────────────────────────────────
 
-        public bool IsNavigating       => _pathController != null && _pathController.IsNavigating;
-        public float RemainingDistance => _pathController != null ? _pathController.RemainingDistance : -1f;
-        public float CurrentSpeed      => _pathController != null ? _pathController.CurrentSpeed : 0f;
-        public Vector3 LastDestination { get; private set; }
-        public int CurrentLevel        { get; private set; } = 0;
+        public bool    IsNavigating       => _pathController != null && _pathController.IsNavigating;
+        public float   RemainingDistance  => _pathController != null ? _pathController.RemainingDistance : -1f;
+        public float   CurrentSpeed       => _pathController != null ? _pathController.CurrentSpeed : 0f;
+        public Vector3 LastDestination    { get; private set; }
+        public int     CurrentLevel       { get; private set; } = 0;
 
-        /// <summary>Distancia restante al destino (alias para compatibilidad con KeyboardTestingController).</summary>
         public float DistanceToDestination => RemainingDistance >= 0f ? RemainingDistance : 0f;
 
-        /// <summary>Progreso de la navegación [0–1]. 0 = inicio, 1 = llegada.</summary>
         public float ProgressPercent
         {
             get
@@ -60,14 +49,15 @@ namespace IndoorNavAR.Navigation
             }
         }
 
-        // ─── Componentes ──────────────────────────────────────────────────────
+        // ─── Campos privados ──────────────────────────────────────────────────
 
         private NavigationPathController _pathController;
         private NavMeshAgent             _navAgent;
 
-        // ─────────────────────────────────────────────────────────────────────
-        //  UNITY LIFECYCLE
-        // ─────────────────────────────────────────────────────────────────────
+        // ✅ Guarda el nombre del waypoint de destino para NavigationArrivedEvent
+        private string _lastDestinationName = string.Empty;
+
+        // ─── Lifecycle ────────────────────────────────────────────────────────
 
         private void Awake()
         {
@@ -93,26 +83,19 @@ namespace IndoorNavAR.Navigation
         private void Update()
         {
             if (!IsNavigating) return;
-            if (_detectFloorTransitions)
-                UpdateCurrentLevel();
+            if (_detectFloorTransitions) UpdateCurrentLevel();
         }
 
-        // ─────────────────────────────────────────────────────────────────────
-        //  API PÚBLICA — NAVEGACIÓN
-        // ─────────────────────────────────────────────────────────────────────
+        // ─── API pública — Navegación ─────────────────────────────────────────
 
-        /// <summary>Inicia la navegación hacia una posición world-space.</summary>
         public void StartNavigation(Vector3 destination)
         {
-            LastDestination = destination;
-            if (_logVerbose)
-                Debug.Log($"[NavigationAgent] StartNavigation → {destination:F2}");
+            LastDestination      = destination;
+            _lastDestinationName = string.Empty; // posición directa, sin nombre de waypoint
+            if (_logVerbose) Debug.Log($"[NavigationAgent] StartNavigation → {destination:F2}");
             _pathController.NavigateTo(destination);
         }
 
-        /// <summary>
-        /// Navega hacia un WaypointData. Retorna true si el path se inició correctamente.
-        /// </summary>
         public bool NavigateToWaypoint(WaypointData waypoint)
         {
             if (waypoint == null)
@@ -121,7 +104,8 @@ namespace IndoorNavAR.Navigation
                 return false;
             }
 
-            LastDestination = waypoint.Position;
+            LastDestination      = waypoint.Position;
+            _lastDestinationName = waypoint.WaypointName; // ✅ guardado aquí
 
             if (_logVerbose)
                 Debug.Log($"[NavigationAgent] NavigateToWaypoint → {waypoint.WaypointName} @ {waypoint.Position:F2}");
@@ -130,56 +114,40 @@ namespace IndoorNavAR.Navigation
             return _pathController.IsNavigating;
         }
 
-        /// <summary>Cambia el destino mientras el agente navega (recálculo inmediato).</summary>
         public void SetDestination(Vector3 newDestination)
         {
-            if (_logVerbose)
-                Debug.Log($"[NavigationAgent] SetDestination → {newDestination:F2}");
-            LastDestination = newDestination;
+            LastDestination      = newDestination;
+            _lastDestinationName = string.Empty;
+            if (_logVerbose) Debug.Log($"[NavigationAgent] SetDestination → {newDestination:F2}");
             _pathController.NavigateTo(newDestination, forceRecalculate: true);
         }
 
-        /// <summary>Detiene la navegación inmediatamente.</summary>
         public void StopNavigation()
         {
             if (_logVerbose) Debug.Log("[NavigationAgent] StopNavigation");
             _pathController.StopNavigation();
         }
 
-        /// <summary>Detiene la navegación con un motivo (compatible con KeyboardTestingController y NavigationManager).</summary>
         public void StopNavigation(string reason)
         {
             if (_logVerbose) Debug.Log($"[NavigationAgent] StopNavigation: {reason}");
             _pathController.StopNavigation();
-
             if (_publishEvents)
                 EventBus.Instance?.Publish(new NavigationCancelledEvent { Reason = reason });
         }
 
-        /// <summary>Navega al StartPoint del nivel indicado.</summary>
         public void NavigateToLevel(int levelIndex)
         {
             var startPoints = NavigationStartPointManager.GetAllStartPoints();
             foreach (var pt in startPoints)
             {
-                if (pt.Level == levelIndex)
-                {
-                    StartNavigation(pt.Position);
-                    return;
-                }
+                if (pt.Level == levelIndex) { StartNavigation(pt.Position); return; }
             }
             Debug.LogWarning($"[NavigationAgent] No hay StartPoint para nivel {levelIndex}");
         }
 
-        // ─────────────────────────────────────────────────────────────────────
-        //  API PÚBLICA — TELEPORT
-        // ─────────────────────────────────────────────────────────────────────
+        // ─── API pública — Teleport ───────────────────────────────────────────
 
-        /// <summary>
-        /// Teleporta el agente a <paramref name="position"/>.
-        /// Requiere que la posición esté sobre el NavMesh (radio de búsqueda 1 m).
-        /// Retorna true si el teleport tuvo éxito.
-        /// </summary>
         public bool TeleportTo(Vector3 position)
         {
             if (!NavMesh.SamplePosition(position, out NavMeshHit hit, 1.0f, NavMesh.AllAreas))
@@ -188,28 +156,23 @@ namespace IndoorNavAR.Navigation
                 return false;
             }
 
-            if (IsNavigating)
-                _pathController.StopNavigation();
+            if (IsNavigating) _pathController.StopNavigation();
 
             transform.position = hit.position;
             _navAgent.Warp(hit.position);
 
-            if (_logVerbose)
-                Debug.Log($"[NavigationAgent] Teleport exitoso a {hit.position:F2}");
-
+            if (_logVerbose) Debug.Log($"[NavigationAgent] Teleport exitoso a {hit.position:F2}");
             return true;
         }
 
-        // ─────────────────────────────────────────────────────────────────────
-        //  DETECCIÓN DE NIVEL ACTUAL
-        // ─────────────────────────────────────────────────────────────────────
+        // ─── Detección de nivel ───────────────────────────────────────────────
 
         private void UpdateCurrentLevel()
         {
             var startPoints = NavigationStartPointManager.GetAllStartPoints();
             if (startPoints.Count == 0) return;
 
-            float agentY    = transform.position.y;
+            float agentY   = transform.position.y;
             int   bestLevel = 0;
             float bestDist  = float.MaxValue;
 
@@ -219,27 +182,24 @@ namespace IndoorNavAR.Navigation
                 if (dist < bestDist) { bestDist = dist; bestLevel = pt.Level; }
             }
 
-            if (bestLevel != CurrentLevel)
-            {
-                int previousLevel = CurrentLevel;
-                CurrentLevel      = bestLevel;
+            if (bestLevel == CurrentLevel) return;
 
-                if (_logVerbose)
-                    Debug.Log($"[NavigationAgent] Transición nivel {previousLevel} → {bestLevel}");
+            int prev  = CurrentLevel;
+            CurrentLevel = bestLevel;
 
-                if (_publishEvents)
-                    EventBus.Instance?.Publish(new FloorTransitionEvent
-                    {
-                        FromLevel     = previousLevel,
-                        ToLevel       = bestLevel,
-                        AgentPosition = transform.position
-                    });
-            }
+            if (_logVerbose)
+                Debug.Log($"[NavigationAgent] Transición nivel {prev} → {bestLevel}");
+
+            if (_publishEvents)
+                EventBus.Instance?.Publish(new FloorTransitionEvent
+                {
+                    FromLevel     = prev,
+                    ToLevel       = bestLevel,
+                    AgentPosition = transform.position
+                });
         }
 
-        // ─────────────────────────────────────────────────────────────────────
-        //  HANDLERS DEL PATH CONTROLLER
-        // ─────────────────────────────────────────────────────────────────────
+        // ─── Handlers del PathController ──────────────────────────────────────
 
         private void HandlePathStarted(Vector3 destination)
         {
@@ -258,6 +218,13 @@ namespace IndoorNavAR.Navigation
         private void HandlePathCompleted()
         {
             OnArrived?.Invoke();
+
+            // ✅ Notifica a Flutter con el nombre del waypoint para TTS de llegada
+            EventBus.Instance?.Publish(new NavigationArrivedEvent
+            {
+                WaypointName = _lastDestinationName,
+                Position     = transform.position
+            });
 
             if (_publishEvents)
                 EventBus.Instance?.Publish(new NavigationCompletedEvent
@@ -280,18 +247,13 @@ namespace IndoorNavAR.Navigation
                 Debug.Log($"[NavigationAgent] Waypoint {index} alcanzado @ {position:F2}");
         }
 
-        // ─────────────────────────────────────────────────────────────────────
-        //  CONTEXT MENU (Debug)
-        // ─────────────────────────────────────────────────────────────────────
+        // ─── ContextMenu ──────────────────────────────────────────────────────
 
         [ContextMenu("Start Navigation (Debug)")]
         private void DebugStartNavigation()
         {
             if (_debugDestination == null)
-            {
-                Debug.LogWarning("[NavigationAgent] Asignar _debugDestination en el Inspector.");
-                return;
-            }
+            { Debug.LogWarning("[NavigationAgent] Asignar _debugDestination en el Inspector."); return; }
             StartNavigation(_debugDestination.position);
         }
 
@@ -302,14 +264,12 @@ namespace IndoorNavAR.Navigation
         private void DebugLogStatus()
         {
             Debug.Log($"[NavigationAgent] IsNavigating={IsNavigating}, " +
-                      $"Level={CurrentLevel}, " +
-                      $"Remaining={RemainingDistance:F2}m, " +
-                      $"Progress={ProgressPercent * 100f:F0}%, " +
-                      $"Speed={CurrentSpeed:F2}m/s");
+                      $"Level={CurrentLevel}, Remaining={RemainingDistance:F2}m, " +
+                      $"Progress={ProgressPercent * 100f:F0}%, Speed={CurrentSpeed:F2}m/s");
 
             if (_pathController?.CurrentPath != null)
             {
-                OptimizedPath p = _pathController.CurrentPath;
+                var p = _pathController.CurrentPath;
                 Debug.Log($"  Path: {p.Waypoints.Count} waypoints, {p.TotalLength:F1}m total, status={p.Status}");
             }
         }

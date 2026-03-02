@@ -1,7 +1,35 @@
 // File: WaypointManager.cs
-// ✅ FIX v3 — Añadido WaypointsBatchLoadedEvent al final de LoadWaypoints()
-//    para que MobileNavigationUI pueda refrescar la lista UNA SOLA VEZ
-//    en lugar de N veces (una por cada WaypointPlacedEvent individual).
+// ✅ FIX v5 — Diagnóstico completo de elementos recibidos + validación NaN
+//
+//  CAMBIOS (v4 → v5):
+//  ─────────────────────────────────────────────────────────────────────────────
+//  v4 tenía logs post-carga y guard _isLoadingBatch.
+//  v5 añade:
+//
+//  1) Log diagnóstico PRE-carga: imprime CADA elemento recibido en saveData
+//     con su índice, id (primeros 8 chars), name y posición. Esto permite
+//     detectar en el logcat si el truncamiento ocurre ANTES de llegar a
+//     LoadWaypoints (problema de JsonUtility/PersistenceManager) o DENTRO
+//     (problema de la propia lógica de creación).
+//
+//  2) Validación de posición NaN: JsonUtility en IL2CPP puede generar
+//     Vector3 con componentes NaN cuando el campo Color serializado tiene
+//     valores en representación ARM64 no alineada (bug conocido en Unity
+//     2021-2022 con structs anidados que mezclan float y bool). Si se
+//     pasa una posición NaN a NavMesh.SamplePosition(), Unity lanza una
+//     excepción no capturada que rompe el flujo de carga completo.
+//
+//  3) Validación de id y name vacíos: elementos deserializados con campos
+//     string vacíos pueden causar colisiones de GUID en _waypoints Dictionary,
+//     sobreescribiendo silenciosamente waypoints válidos.
+//
+//  4) Log de resumen mejorado: distingue entre elementos recibidos, válidos,
+//     creados y omitidos para facilitar el diagnóstico.
+//
+//  HEREDADOS de v4:
+//  - Guard _isLoadingBatch contra carga re-entrante
+//  - WaypointsBatchLoadedEvent al finalizar
+//  - Log de verificación post-carga
 
 using System;
 using System.Collections.Generic;
@@ -21,8 +49,11 @@ namespace IndoorNavAR.Core.Managers
         [SerializeField] private Transform _waypointsParent;
         [SerializeField] private int _maxWaypoints = 50;
 
-        private readonly Dictionary<string, WaypointData> _waypoints = new Dictionary<string, WaypointData>();
-        private readonly List<WaypointData> _waypointsList = new List<WaypointData>();
+        private readonly Dictionary<string, WaypointData> _waypoints     = new Dictionary<string, WaypointData>();
+        private readonly List<WaypointData>               _waypointsList = new List<WaypointData>();
+
+        // ✅ v4: Guard contra carga batch re-entrante
+        private bool _isLoadingBatch = false;
 
         #region Properties
 
@@ -274,36 +305,151 @@ namespace IndoorNavAR.Core.Managers
 
         /// <summary>
         /// Carga waypoints desde datos serializados.
-        /// ✅ FIX v3: Publica WaypointsBatchLoadedEvent al FINALIZAR la carga
-        ///    para que la UI refresque la lista una sola vez en lugar de N veces.
+        ///
+        /// ✅ FIX v5: Log diagnóstico PRE-carga de cada elemento recibido.
+        ///            Validación de posición NaN, id vacío y name vacío.
+        ///            Distingue entre recibidos, válidos, creados y omitidos.
+        /// ✅ FIX v4: Guard _isLoadingBatch para evitar doble carga concurrente.
+        /// ✅ FIX v3: Publica WaypointsBatchLoadedEvent al FINALIZAR la carga.
         /// </summary>
         public void LoadWaypoints(List<WaypointSaveData> saveData)
         {
-            // 1. Limpiar existentes (genera WaypointRemovedEvents — la UI los ignora con debounce)
-            ClearAllWaypoints();
-
-            // 2. Crear cada waypoint (genera WaypointPlacedEvents — la UI los ignora con debounce)
-            foreach (var data in saveData)
+            // ✅ v4: Guard contra carga batch re-entrante
+            if (_isLoadingBatch)
             {
-                WaypointData waypoint = CreateWaypoint(data.position, data.rotation);
-                if (waypoint != null)
-                    waypoint.LoadFromSaveData(data);
+                Debug.LogWarning("[WaypointManager] ⚠️ LoadWaypoints ya en progreso — llamada ignorada.");
+                return;
             }
+            _isLoadingBatch = true;
 
-            Debug.Log($"[WaypointManager] {saveData.Count} waypoints cargados.");
-
-            // 3. Notificar que la carga en LOTE terminó
-            // ✅ FIX v3: Este evento cancela el debounce en MobileNavigationUI y
-            //    dispara RefreshWaypointList() UNA SOLA VEZ con todos los datos listos.
-            EventBus.Instance.Publish(new WaypointsBatchLoadedEvent { Count = saveData.Count });
-
-            // 4. Mensaje informativo (ShowMessageEvent — ya manejado por la UI vía toast)
-            EventBus.Instance.Publish(new ShowMessageEvent
+            try
             {
-                Message  = $"{saveData.Count} waypoints cargados exitosamente.",
-                Type     = MessageType.Success,
-                Duration = 3f
-            });
+                if (saveData == null || saveData.Count == 0)
+                {
+                    Debug.LogWarning("[WaypointManager] LoadWaypoints: saveData nulo o vacío.");
+                    EventBus.Instance.Publish(new WaypointsBatchLoadedEvent { Count = 0 });
+                    return;
+                }
+
+                // ✅ FIX v5: Log diagnóstico PRE-carga — imprime CADA elemento
+                // recibido. Si aquí aparecen menos elementos que los guardados,
+                // el problema está en JsonUtility/PersistenceManager (truncamiento).
+                // Si aparecen todos pero alguno es inválido, el problema está aquí.
+                Debug.Log($"[WaypointManager] 📍 Recibidos {saveData.Count} elemento(s) para cargar:");
+                for (int i = 0; i < saveData.Count; i++)
+                {
+                    var d = saveData[i];
+                    if (d == null)
+                    {
+                        Debug.Log($"[WaypointManager]   [{i}] ⚠️ ELEMENTO NULL");
+                        continue;
+                    }
+
+                    bool hasValidId   = !string.IsNullOrEmpty(d.id);
+                    bool hasValidName = !string.IsNullOrEmpty(d.name);
+                    bool hasValidPos  = !float.IsNaN(d.position.x)
+                                    && !float.IsNaN(d.position.y)
+                                    && !float.IsNaN(d.position.z);
+
+                    string idPreview = hasValidId
+                        ? d.id.Substring(0, Math.Min(8, d.id.Length))
+                        : "VACÍO";
+
+                    Debug.Log($"[WaypointManager]   [{i}] " +
+                              $"id={idPreview} " +
+                              $"name='{(hasValidName ? d.name : "VACÍO")}' " +
+                              $"pos={d.position} " +
+                              $"type={d.type} " +
+                              $"navigable={d.isNavigable} " +
+                              $"→ {(hasValidId && hasValidName && hasValidPos ? "✅ VÁLIDO" : "❌ INVÁLIDO")}");
+                }
+
+                Debug.Log($"[WaypointManager] 📍 Iniciando carga de {saveData.Count} waypoint(s)...");
+
+                // 1. Limpiar existentes
+                ClearAllWaypoints();
+
+                // 2. Crear cada waypoint con validación completa
+                int received = saveData.Count;
+                int created  = 0;
+                int skipped  = 0;
+
+                foreach (var data in saveData)
+                {
+                    // ✅ FIX v5: Validación defensiva completa
+                    if (data == null)
+                    {
+                        Debug.LogWarning("[WaypointManager] ⚠️ WaypointSaveData null, omitiendo.");
+                        skipped++;
+                        continue;
+                    }
+
+                    if (string.IsNullOrEmpty(data.id))
+                    {
+                        Debug.LogWarning($"[WaypointManager] ⚠️ Waypoint '{data.name}' tiene id vacío, omitiendo.");
+                        skipped++;
+                        continue;
+                    }
+
+                    if (string.IsNullOrEmpty(data.name))
+                    {
+                        Debug.LogWarning($"[WaypointManager] ⚠️ Waypoint con id '{data.id.Substring(0, 8)}' tiene name vacío, omitiendo.");
+                        skipped++;
+                        continue;
+                    }
+
+                    // ✅ FIX v5: Detectar posiciones NaN que JsonUtility puede generar
+                    // en IL2CPP cuando structs anidados (Color + Vector3) tienen alineación
+                    // incorrecta en ARM64. Pasar NaN a NavMesh.SamplePosition() crashea Unity.
+                    if (float.IsNaN(data.position.x) || float.IsNaN(data.position.y) || float.IsNaN(data.position.z))
+                    {
+                        Debug.LogWarning($"[WaypointManager] ⚠️ Waypoint '{data.name}' tiene posición NaN " +
+                                         $"({data.position}), omitiendo. Posible bug de JsonUtility en IL2CPP.");
+                        skipped++;
+                        continue;
+                    }
+
+                    WaypointData waypoint = CreateWaypoint(data.position, data.rotation);
+                    if (waypoint != null)
+                    {
+                        waypoint.LoadFromSaveData(data);
+                        created++;
+                    }
+                    else
+                    {
+                        Debug.LogWarning($"[WaypointManager] ⚠️ CreateWaypoint retornó null para '{data.name}' " +
+                                         $"(¿límite alcanzado? actual={_waypoints.Count}/{_maxWaypoints})");
+                        skipped++;
+                    }
+                }
+
+                // ✅ FIX v5: Log de resumen mejorado con distinción entre recibidos/válidos/creados
+                Debug.Log($"[WaypointManager] ✅ LoadWaypoints COMPLETO: " +
+                          $"recibidos={received}, creados={created}, omitidos={skipped}. " +
+                          $"En memoria: _waypoints={_waypoints.Count}, _waypointsList={_waypointsList.Count}");
+
+                if (created < received)
+                {
+                    Debug.LogWarning($"[WaypointManager] ⚠️ Solo se crearon {created} de {received} waypoints. " +
+                                     $"Revisar logs anteriores para identificar los omitidos.");
+                }
+
+                // 3. Notificar que la carga en lote terminó
+                EventBus.Instance.Publish(new WaypointsBatchLoadedEvent { Count = created });
+
+                // 4. Mensaje informativo
+                EventBus.Instance.Publish(new ShowMessageEvent
+                {
+                    Message  = $"{created} waypoints cargados exitosamente.",
+                    Type     = MessageType.Success,
+                    Duration = 3f
+                });
+            }
+            finally
+            {
+                // ✅ v4: Liberar siempre, incluso si hay excepción
+                _isLoadingBatch = false;
+            }
         }
 
         #endregion
@@ -313,9 +459,19 @@ namespace IndoorNavAR.Core.Managers
         [ContextMenu("Debug: List All Waypoints")]
         public void DebugListWaypoints()
         {
-            Debug.Log($"[WaypointManager] Total waypoints: {_waypoints.Count}");
+            Debug.Log($"[WaypointManager] Total waypoints: _waypoints={_waypoints.Count}, " +
+                      $"_waypointsList={_waypointsList.Count}");
             foreach (var wp in _waypointsList)
-                Debug.Log($"  - {wp.WaypointName} ({wp.Type}) at {wp.Position}");
+                Debug.Log($"  - {wp?.WaypointName ?? "NULL"} ({wp?.Type}) at {wp?.Position}");
+        }
+
+        [ContextMenu("Debug: Verify Consistency")]
+        public void DebugVerifyConsistency()
+        {
+            bool ok = _waypoints.Count == _waypointsList.Count;
+            Debug.Log($"[WaypointManager] Consistencia: " +
+                      $"_waypoints={_waypoints.Count}, _waypointsList={_waypointsList.Count} " +
+                      $"→ {(ok ? "✅ OK" : "❌ INCONSISTENTE")}");
         }
 
         #endregion

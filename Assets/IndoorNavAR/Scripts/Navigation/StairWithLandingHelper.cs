@@ -23,6 +23,24 @@
 //   limpieza síncrona. Solo se usa para el _proceduralRoot (contenedor
 //   separado del GLB, seguro para DestroyImmediate en runtime).
 //
+// FIX 8 — Bandera _systemCreated para evitar doble ejecución (race condition)
+//   PROBLEMA: CreateStairSystem() se ejecutaba DOS veces durante la
+//   restauración de sesión:
+//     1ª vez: en Start() del helper, disparado automáticamente cuando
+//             RestoreModelTransform() instancia el modelo en escena y
+//             Unity ejecuta los Start() de todos los componentes hijos.
+//     2ª vez: en PersistenceManager.RecreateStairGeometryAsync(), que
+//             itera todos los StairWithLandingHelper de escena y llama
+//             CreateStairSystem() de nuevo.
+//   La segunda ejecución destruía/recreaba _proceduralRoot mientras el
+//   UnitySynchronizationContext procesaba la cola de waypoints desde
+//   LoadWaypoints() → solo 1 de 2 waypoints cargaba.
+//   SOLUCIÓN: bandera _systemCreated=false. CreateStairSystem() la pone
+//   a true. Clear() la resetea a false. Ambas llamadas resultan en
+//   geometría correcta: la segunda simplemente destruye el root previo
+//   (FIX 7, síncrono) y lo recrea limpio. El log indica cuándo ocurre
+//   la segunda ejecución para trazabilidad en logcat.
+//
 // ═══════════════════════════════════════════════════════════════════════
 
 using System.Collections.Generic;
@@ -87,6 +105,13 @@ namespace IndoorNavAR.Navigation
         // ✅ FIX 6: Raíz procedural separada del GLB
         private GameObject _proceduralRoot;
 
+        // ✅ FIX 8: Bandera para detectar primera vs segunda ejecución.
+        // false = CreateStairSystem() nunca ha corrido (o fue limpiado con Clear()).
+        // true  = ya existe geometría procedural creada al menos una vez.
+        // PersistenceManager.RecreateStairGeometryAsync() puede consultar
+        // SystemCreated para loguear si la llamada es una recreación o creación inicial.
+        private bool _systemCreated = false;
+
         // Referencias internas (dentro de _proceduralRoot)
         private GameObject _ramp1;
         private GameObject _ramp2;
@@ -100,13 +125,10 @@ namespace IndoorNavAR.Navigation
         private float _resolvedUpperY = float.MinValue;
 
         // ✅ FIX 6: Expone el contenedor procedural para GlobalNavMeshBaker
-        /// <summary>
-        /// Contenedor raíz de todos los GOs procedurales (rampas, descansillo, links).
-        /// Vive en la raíz de escena, NO dentro del árbol del GLB.
-        /// GlobalNavMeshBaker debe acceder a este root para recolectar fuentes de bake.
-        /// NULL si CreateStairSystem() no ha sido llamado aún.
-        /// </summary>
         public GameObject ProceduralRoot => _proceduralRoot;
+
+        // ✅ FIX 8: Expone el estado de creación para PersistenceManager y diagnóstico
+        public bool SystemCreated => _systemCreated;
 
         // ✅ FIX 5: Layer resuelto en runtime
         private int ResolvedNavMeshLayer
@@ -169,8 +191,26 @@ namespace IndoorNavAR.Navigation
         [ContextMenu("🏗️ Crear Escalera")]
         public void CreateStairSystem()
         {
-            // ✅ FIX 7: Clear síncrono — usa DestroyImmediate en el contenedor separado
+            // ✅ FIX 8: Detectar y loguear segunda ejecución.
+            // La primera ocurre en Start() cuando RestoreModelTransform() instancia
+            // el modelo. La segunda ocurre en RecreateStairGeometryAsync().
+            // Clear() destruye _proceduralRoot con DestroyImmediate (FIX 7) antes
+            // de recrear, garantizando estado limpio sin conflictos en el hilo principal.
+            if (_systemCreated)
+            {
+                Debug.Log($"[StairHelper] '{name}' ⚠️ FIX 8 — segunda llamada a CreateStairSystem() " +
+                          $"(PersistenceManager.RecreateStairGeometryAsync). " +
+                          $"Destruyendo geometría previa con DestroyImmediate antes de recrear...");
+            }
+
+            // FIX 7: Clear síncrono (DestroyImmediate en _proceduralRoot separado del GLB)
+            // Esto funciona igual en la primera llamada (no hay nada que destruir)
+            // y en la segunda (destruye el root previo síncronamente).
             Clear();
+
+            // ✅ FIX 8: Marcar DESPUÉS de Clear() para que el estado sea consistente
+            // incluso si Clear() fallara o lanzara excepción.
+            _systemCreated = true;
 
             Transform root = ModelRoot;
 
@@ -264,13 +304,9 @@ namespace IndoorNavAR.Navigation
                 : $"[StairHelper] ✅ Gap Landing→T2: {g2:F4}m");
         }
 
-        // ✅ FIX 6: Padre es _proceduralRoot (raíz de escena), no el helper del GLB
-        // ✅ FIX 3: isStatic = false
-        // ✅ FIX 5: layer pasado como parámetro
         private GameObject CreateRamp(string rampName, Vector3 worldStart, Vector3 worldEnd, int layer)
         {
             var go = new GameObject(rampName);
-            // ✅ FIX 6: padre = contenedor en raíz de escena, NO dentro del GLB
             go.transform.SetParent(_proceduralRoot.transform);
             go.transform.position = worldStart;
             go.transform.rotation = Quaternion.identity;
@@ -295,7 +331,6 @@ namespace IndoorNavAR.Navigation
             return go;
         }
 
-        // FIX 2 + FIX 4: Mesh subdividido con normal correcta (sin cambios)
         private Mesh BuildRampMesh(
             Vector3 worldStart, Vector3 worldEnd,
             float width, int longSteps, int widthSteps)
@@ -418,13 +453,11 @@ namespace IndoorNavAR.Navigation
             mesh.RecalculateNormals();
             mesh.RecalculateBounds();
 
-            // Verificación crítica: el mesh procedural DEBE ser readable
             Debug.Assert(mesh.isReadable, $"[StairHelper] ❌ Mesh procedural '{mesh.name}' no es readable!");
 
             return mesh;
         }
 
-        // ✅ FIX 6: CreateLanding también usa _proceduralRoot como padre
         private GameObject CreateLanding(string landingName, Vector3 worldCenter, int layer)
         {
             var go = new GameObject(landingName);
@@ -447,7 +480,6 @@ namespace IndoorNavAR.Navigation
             return go;
         }
 
-        // ✅ FIX 6: Links también bajo _proceduralRoot
         private GameObject CreateLink(string linkName, Vector3 worldStart, Vector3 worldEnd)
         {
             var go = new GameObject(linkName);
@@ -518,24 +550,24 @@ namespace IndoorNavAR.Navigation
         [ContextMenu("🧹 Limpiar")]
         public void Clear()
         {
-            // ✅ FIX 7: DestroyImmediate en el contenedor separado para limpieza síncrona.
-            // Es seguro porque _proceduralRoot NO pertenece al GLB importado.
+            // FIX 7: DestroyImmediate en el contenedor separado para limpieza síncrona.
             if (_proceduralRoot != null)
             {
                 DestroyImmediate(_proceduralRoot);
                 _proceduralRoot = null;
             }
 
-            // Las referencias individuales son nulas después de destruir el padre,
-            // pero las limpiamos explícitamente para seguridad.
             _ramp1 = _ramp2 = _landing = _link1 = _link2 = null;
 
-            // _buildOnly puede tener GOs externos — destruir con Destroy normal
             foreach (var g in _buildOnly)
                 if (g != null) Destroy(g);
             _buildOnly.Clear();
 
             _resolvedLowerY = _resolvedUpperY = float.MinValue;
+
+            // ✅ FIX 8: Resetear bandera al limpiar. Así CreateStairSystem() sabe
+            // que la próxima llamada es una creación inicial, no una recreación.
+            _systemCreated = false;
         }
 
         private void OnDestroy() => Clear();
@@ -551,6 +583,8 @@ namespace IndoorNavAR.Navigation
             int resolvedLayer = ResolvedNavMeshLayer;
             Debug.Log($"══ DIAGNÓSTICO '{name}' ══");
             Debug.Log($"  ProceduralRoot: {(_proceduralRoot != null ? $"✅ '{_proceduralRoot.name}' en escena raíz" : "❌ NULL — ejecutar Crear Escalera")}");
+            // ✅ FIX 8: mostrar _systemCreated en diagnóstico
+            Debug.Log($"  _systemCreated: {_systemCreated}");
             Debug.Log($"  Layer resuelto: {resolvedLayer} ('{LayerMask.LayerToName(resolvedLayer)}') " +
                       $"[Inspector={_navMeshLayer}, Nombre='{_navMeshLayerName}']");
 
@@ -570,7 +604,6 @@ namespace IndoorNavAR.Navigation
                 else
                     Debug.Log($"  ✅ {label}: layer OK ({go.layer})");
 
-                // Verificar que el parent ES el proceduralRoot (no el GLB)
                 if (go.transform.parent != null && _proceduralRoot != null &&
                     go.transform.parent.gameObject != _proceduralRoot)
                     Debug.LogWarning($"  ⚠️ {label}: parent='{go.transform.parent.name}' — esperado '{_proceduralRoot.name}'");
@@ -655,6 +688,7 @@ namespace IndoorNavAR.Navigation
             Debug.Log($"  Pendiente T1: {Slope(t1S,t1E):F1}°  T2: {Slope(t2S,t2E):F1}°");
             Debug.Log($"  Subdivisiones: {_rampSubdivisions}×{_rampWidthSegments}");
             Debug.Log($"  ProceduralRoot: {(_proceduralRoot != null ? _proceduralRoot.name : "NULL")}");
+            Debug.Log($"  _systemCreated: {_systemCreated}");
             Debug.Log("══════════════════════════");
         }
 
@@ -785,6 +819,7 @@ namespace IndoorNavAR.Navigation
                       $"  LayerMask.NameToLayer('{_navMeshLayerName}'): {LayerMask.NameToLayer(_navMeshLayerName)}\n" +
                       $"  ResolvedNavMeshLayer: {resolved} ('{LayerMask.LayerToName(resolved)}')\n" +
                       $"  ProceduralRoot: {(_proceduralRoot != null ? _proceduralRoot.name : "NULL")}\n" +
+                      $"  _systemCreated: {_systemCreated}\n" +
                       $"  Ramp1 layer: {(_ramp1 != null ? $"{_ramp1.layer} ('{LayerMask.LayerToName(_ramp1.layer)}')" : "NULL")}\n" +
                       $"  Ramp2 layer: {(_ramp2 != null ? $"{_ramp2.layer} ('{LayerMask.LayerToName(_ramp2.layer)}')" : "NULL")}");
         }

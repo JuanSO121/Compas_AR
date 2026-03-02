@@ -1,4 +1,8 @@
 // File: EventBus.cs
+// ✅ v2 — Agrega NavigationArrivedEvent para notificar a Flutter
+//         cuando el agente llega al destino (feedback por voz/TTS).
+//         Todo lo demás es idéntico a la versión anterior.
+
 using System;
 using System.Collections.Generic;
 using UnityEngine;
@@ -28,8 +32,8 @@ namespace IndoorNavAR.Core.Events
             }
         }
 
-        private readonly Dictionary<Type, Delegate> _eventDelegates = new Dictionary<Type, Delegate>();
-        private readonly List<Delegate> _delegatesToRemove = new List<Delegate>();
+        private readonly Dictionary<Type, Delegate> _eventDelegates = new();
+        private readonly List<Delegate> _delegatesToRemove = new();
 
         #region Lifecycle
 
@@ -37,7 +41,6 @@ namespace IndoorNavAR.Core.Events
         {
             if (_instance != null && _instance != this)
             {
-                Debug.LogWarning("[EventBus] Instancia duplicada detectada. Destruyendo...");
                 Destroy(gameObject);
                 return;
             }
@@ -55,52 +58,36 @@ namespace IndoorNavAR.Core.Events
 
 #if UNITY_EDITOR
         [UnityEngine.RuntimeInitializeOnLoadMethod(RuntimeInitializeLoadType.SubsystemRegistration)]
-        private static void ResetStaticInstance()
-        {
-            _instance = null;
-        }
+        private static void ResetStaticInstance() => _instance = null;
 #endif
 
         #endregion
 
-        #region Subscription Management
+        #region Pub/Sub
 
         public void Subscribe<T>(Action<T> handler) where T : struct
         {
-            Type eventType = typeof(T);
-            if (_eventDelegates.TryGetValue(eventType, out Delegate existing))
-                _eventDelegates[eventType] = Delegate.Combine(existing, handler);
-            else
-                _eventDelegates[eventType] = handler;
+            var type = typeof(T);
+            _eventDelegates[type] = _eventDelegates.TryGetValue(type, out var existing)
+                ? Delegate.Combine(existing, handler)
+                : handler;
         }
 
         public void Unsubscribe<T>(Action<T> handler) where T : struct
         {
-            Type eventType = typeof(T);
-            if (_eventDelegates.TryGetValue(eventType, out Delegate existing))
-            {
-                Delegate newDelegate = Delegate.Remove(existing, handler);
-                if (newDelegate == null)
-                    _eventDelegates.Remove(eventType);
-                else
-                    _eventDelegates[eventType] = newDelegate;
-            }
+            var type = typeof(T);
+            if (!_eventDelegates.TryGetValue(type, out var existing)) return;
+            var updated = Delegate.Remove(existing, handler);
+            if (updated == null) _eventDelegates.Remove(type);
+            else                 _eventDelegates[type] = updated;
         }
 
         public void Publish<T>(T eventData) where T : struct
         {
-            Type eventType = typeof(T);
-            if (_eventDelegates.TryGetValue(eventType, out Delegate existing))
-            {
-                try
-                {
-                    (existing as Action<T>)?.Invoke(eventData);
-                }
-                catch (Exception ex)
-                {
-                    Debug.LogError($"[EventBus] Error en evento {eventType.Name}: {ex.Message}\n{ex.StackTrace}");
-                }
-            }
+            if (!_eventDelegates.TryGetValue(typeof(T), out var existing)) return;
+            try   { (existing as Action<T>)?.Invoke(eventData); }
+            catch (Exception ex)
+            { Debug.LogError($"[EventBus] {typeof(T).Name}: {ex.Message}\n{ex.StackTrace}"); }
         }
 
         public void ClearAll()
@@ -112,22 +99,24 @@ namespace IndoorNavAR.Core.Events
         #endregion
     }
 
-    #region Event Definitions
+    // =========================================================================
+    // EVENTOS — agrupados por dominio
+    // =========================================================================
 
-    // ========== AR Events ==========
+    // ── AR ────────────────────────────────────────────────────────────────────
 
     public struct PlaneDetectedEvent
     {
         public UnityEngine.XR.ARFoundation.ARPlane Plane;
         public Vector3 Center;
-        public float Area;
+        public float   Area;
     }
 
     public struct PlaneUpdatedEvent
     {
         public UnityEngine.XR.ARFoundation.ARPlane Plane;
         public Vector3 NewCenter;
-        public float NewArea;
+        public float   NewArea;
     }
 
     public struct PlaneRemovedEvent
@@ -135,21 +124,21 @@ namespace IndoorNavAR.Core.Events
         public UnityEngine.XR.ARFoundation.ARPlane Plane;
     }
 
-    // ========== Waypoint Events ==========
+    // ── Waypoints ─────────────────────────────────────────────────────────────
 
     public struct WaypointPlacedEvent
     {
-        public string WaypointId;
-        public Vector3 Position;
+        public string     WaypointId;
+        public Vector3    Position;
         public Quaternion Rotation;
     }
 
     public struct WaypointConfiguredEvent
     {
-        public string WaypointId;
-        public string WaypointName;
+        public string       WaypointId;
+        public string       WaypointName;
         public WaypointType Type;
-        public Color Color;
+        public Color        Color;
     }
 
     public struct WaypointRemovedEvent
@@ -157,22 +146,21 @@ namespace IndoorNavAR.Core.Events
         public string WaypointId;
     }
 
-    // ✅ FIX v3 — NUEVO EVENTO
-    // Publicado por WaypointManager.LoadWaypoints() al finalizar la carga en lote.
-    // MobileNavigationUI lo escucha para refrescar la lista UNA SOLA VEZ,
-    // evitando N refreshes simultáneos por N WaypointPlacedEvents individuales.
+    /// Publicado por WaypointManager.LoadWaypoints() al finalizar la carga en lote.
+    /// Permite que la UI (o cualquier suscriptor) refresque la lista UNA sola vez
+    /// en lugar de N veces por N WaypointPlacedEvents individuales.
     public struct WaypointsBatchLoadedEvent
     {
         public int Count;
     }
 
-    // ========== Model Events ==========
+    // ── Modelo 3D ─────────────────────────────────────────────────────────────
 
     public struct ModelLoadedEvent
     {
         public GameObject ModelInstance;
-        public string ModelName;
-        public Vector3 Position;
+        public string     ModelName;
+        public Vector3    Position;
     }
 
     public struct ModelLoadFailedEvent
@@ -181,13 +169,13 @@ namespace IndoorNavAR.Core.Events
         public string ErrorMessage;
     }
 
-    // ========== NavMesh Events ==========
+    // ── NavMesh ───────────────────────────────────────────────────────────────
 
     public struct NavMeshGeneratedEvent
     {
-        public int SurfaceCount;
+        public int   SurfaceCount;
         public float TotalArea;
-        public bool Success;
+        public bool  Success;
     }
 
     public struct NavMeshGenerationFailedEvent
@@ -195,21 +183,21 @@ namespace IndoorNavAR.Core.Events
         public string ErrorMessage;
     }
 
-    // ========== Navigation Events ==========
+    // ── Navegación ────────────────────────────────────────────────────────────
 
     public struct NavigationStartedEvent
     {
-        public string DestinationWaypointId;
+        public string  DestinationWaypointId;
         public Vector3 StartPosition;
         public Vector3 DestinationPosition;
-        public float EstimatedDistance;
+        public float   EstimatedDistance;
     }
 
     public struct NavigationCompletedEvent
     {
         public string DestinationWaypointId;
-        public float TotalDistance;
-        public float TotalTime;
+        public float  TotalDistance;
+        public float  TotalTime;
     }
 
     public struct NavigationCancelledEvent
@@ -219,19 +207,36 @@ namespace IndoorNavAR.Core.Events
 
     public struct NavigationProgressEvent
     {
-        public float DistanceRemaining;
-        public float ProgressPercent;
+        public float   DistanceRemaining;
+        public float   ProgressPercent;
         public Vector3 CurrentPosition;
     }
 
     public struct FloorTransitionEvent
     {
-        public int FromLevel;
-        public int ToLevel;
+        public int     FromLevel;
+        public int     ToLevel;
         public Vector3 AgentPosition;
     }
 
-    // ========== UI Events ==========
+    /// ✅ NUEVO — Publicado por NavigationAgent cuando el agente llega al destino.
+    /// VoiceCommandAPI lo escucha y envía una respuesta JSON a Flutter para que
+    /// el TTS anuncie la llegada sin que Flutter tenga que hacer polling.
+    ///
+    /// Uso en NavigationAgent.HandlePathCompleted():
+    ///   EventBus.Instance.Publish(new NavigationArrivedEvent {
+    ///       WaypointName = _lastDestinationName,
+    ///       Position     = transform.position
+    ///   });
+    public struct NavigationArrivedEvent
+    {
+        /// Nombre del waypoint de destino (para el anuncio de voz en Flutter).
+        public string  WaypointName;
+        /// Posición world donde llegó el agente.
+        public Vector3 Position;
+    }
+
+    // ── UI / Mensajes ─────────────────────────────────────────────────────────
 
     public struct AppModeChangedEvent
     {
@@ -241,14 +246,14 @@ namespace IndoorNavAR.Core.Events
 
     public struct ShowMessageEvent
     {
-        public string Message;
+        public string      Message;
         public MessageType Type;
-        public float Duration;
+        public float       Duration;
     }
 
-    #endregion
-
-    #region Enums
+    // =========================================================================
+    // ENUMS
+    // =========================================================================
 
     public enum WaypointType
     {
@@ -285,6 +290,4 @@ namespace IndoorNavAR.Core.Events
         Warning,
         Error
     }
-
-    #endregion
 }

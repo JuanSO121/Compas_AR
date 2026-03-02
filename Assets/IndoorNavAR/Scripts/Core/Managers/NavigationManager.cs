@@ -1,8 +1,18 @@
 // File: NavigationManager.cs
-// ✅ FIX #1 — Exclusión mutua estricta: si hay sesión guardada y se restaura con éxito,
-//             NUNCA ejecuta el flujo completo ni _autoLoadModel.
-// ✅ FIX #2 — Llama ConfirmModelPositioned() en todos los StartPoints después de
-//             RestoreModelTransform y ANTES de cargar el NavMesh.
+// ✅ FIX #6 — Llama AROriginAligner.NotifySessionRestored() al final de
+//             InitializeFromSavedSession() para que el modo No-AR (o la
+//             alineación al StartPoint en FullAR) se active correctamente
+//             en el flujo de sesión restaurada, donde ModelLoadedEvent
+//             nunca se publica.
+//
+//  TODOS LOS FIXES ANTERIORES SE MANTIENEN:
+//  ✅ FIX #1 — Exclusión mutua estricta con sesión guardada.
+//  ✅ FIX #2 — ConfirmModelPositioned() antes de cargar NavMesh.
+//  ✅ FIX #3 — ForceRealign() eliminado de InitializeFromSavedSession().
+//  ✅ FIX #4 — Initialize() espera al primer frame antes de arrancar.
+//  ✅ FIX #5 — ConfirmModelPositionedToAllStartPoints() y ReteleportAgent()
+//              eliminados de InitializeFromSavedSession() (gestionados por
+//              PersistenceManager.RecreateStairGeometryAsync()).
 
 using System;
 using System.Threading.Tasks;
@@ -24,7 +34,7 @@ namespace IndoorNavAR.Core
         [SerializeField] private ModelLoadManager      _modelLoadManager;
         [SerializeField] private PlacementController   _placementController;
         [SerializeField] private PersistenceManager    _persistenceManager;
-        [SerializeField] private AROriginAligner _arOriginAligner;
+        [SerializeField] private AROriginAligner       _arOriginAligner;
 
         [Header("🧭 Sistema de Navegación")]
         [SerializeField] private MultiLevelNavMeshGenerator _walkableSurfaceGenerator;
@@ -32,9 +42,8 @@ namespace IndoorNavAR.Core
         [SerializeField] private NavMeshAgentCoordinator    _navMeshCoordinator;
 
         [Header("⚙️ Configuración")]
-        [SerializeField] private bool _autoInitialize  = true;
-        [SerializeField] private bool _autoLoadModel   = true;
-        // _loadPreviousSession ya no se usa — la detección es automática.
+        [SerializeField] private bool _autoInitialize = true;
+        [SerializeField] private bool _autoLoadModel  = true;
 
         [Header("🐛 Debug")]
         [SerializeField] private bool _logDetailedEvents = false;
@@ -44,8 +53,8 @@ namespace IndoorNavAR.Core
 
         #region Properties
 
-        public bool       IsInitialized     => _isInitialized;
-        public AppMode    CurrentState       => _currentState;
+        public bool       IsInitialized    => _isInitialized;
+        public AppMode    CurrentState      => _currentState;
         public ARSessionManager  ARSession  => _arSessionManager;
         public WaypointManager   Waypoints  => _waypointManager;
         public ModelLoadManager  Models     => _modelLoadManager;
@@ -65,7 +74,14 @@ namespace IndoorNavAR.Core
         private void Start()
         {
             if (_autoInitialize)
-                _ = Initialize();
+                // FIX #4: Esperar un frame completo antes de Initialize()
+                StartCoroutine(InitializeAfterFirstFrame());
+        }
+
+        private System.Collections.IEnumerator InitializeAfterFirstFrame()
+        {
+            yield return null;
+            _ = Initialize();
         }
 
         #endregion
@@ -76,17 +92,17 @@ namespace IndoorNavAR.Core
         {
             Log("🔍 Buscando componentes del sistema...");
 
-            _arSessionManager       ??= FindFirstObjectByType<ARSessionManager>();
-            _waypointManager        ??= FindFirstObjectByType<WaypointManager>();
-            _modelLoadManager       ??= FindFirstObjectByType<ModelLoadManager>();
-            _placementController    ??= FindFirstObjectByType<PlacementController>();
-            _persistenceManager     ??= FindFirstObjectByType<PersistenceManager>();
+            _arSessionManager         ??= FindFirstObjectByType<ARSessionManager>();
+            _waypointManager          ??= FindFirstObjectByType<WaypointManager>();
+            _modelLoadManager         ??= FindFirstObjectByType<ModelLoadManager>();
+            _placementController      ??= FindFirstObjectByType<PlacementController>();
+            _persistenceManager       ??= FindFirstObjectByType<PersistenceManager>();
             _walkableSurfaceGenerator ??= FindFirstObjectByType<MultiLevelNavMeshGenerator>();
-            _navigationAgent        ??= FindFirstObjectByType<NavigationAgent>();
-            _navMeshCoordinator     ??= FindFirstObjectByType<NavMeshAgentCoordinator>();
+            _navigationAgent          ??= FindFirstObjectByType<NavigationAgent>();
+            _navMeshCoordinator       ??= FindFirstObjectByType<NavMeshAgentCoordinator>();
+            _arOriginAligner          ??= FindFirstObjectByType<AROriginAligner>();
 
             ValidateComponents();
-            _arOriginAligner ??= FindFirstObjectByType<AROriginAligner>();
         }
 
         private void ValidateComponents()
@@ -137,17 +153,13 @@ namespace IndoorNavAR.Core
             LogEvent($"📦 Modelo cargado: {evt.ModelName}");
             ChangeState(AppMode.ModelPlacement);
 
-            // Alinear XR Origin al StartPoint del modelo recién cargado.
-            // AROriginAligner espera sus propios _delayFrames antes de ejecutar,
-            // dando tiempo a que los transforms del GLB se actualicen.
             if (_arOriginAligner != null)
             {
                 _arOriginAligner.AlignToStartPoint();
-                Debug.Log("[NavManager] 🎯 Alineando XR Origin al StartPoint...");
+                Debug.Log("[NavManager] 🎯 Solicitando alineación XR Origin al StartPoint...");
             }
             else
             {
-                // Si no hay aligner, al menos teleportar el agente (fallback)
                 StartCoroutine(TeleportAgentNextFrame());
             }
         }
@@ -196,7 +208,6 @@ namespace IndoorNavAR.Core
                 Debug.Log("[NavManager] 🚀 INICIANDO SISTEMA AR");
                 ChangeState(AppMode.Initialization);
 
-                // ── Verificar si existe sesión + NavMesh guardados ────────────────
                 bool hasSavedSession = _persistenceManager != null && _persistenceManager.HasSavedSession();
                 bool hasSavedNavMesh = _persistenceManager != null && _persistenceManager.HasSavedNavMesh;
 
@@ -209,15 +220,13 @@ namespace IndoorNavAR.Core
 
                     if (ok)
                     {
-                        // ✅ FIX #1: return INMEDIATO. Nunca continúa al flujo completo.
                         _isInitialized = true;
                         PublishMessage("Sesión restaurada", MessageType.Success);
                         Debug.Log("[NavManager] ✅ RESTAURADO DESDE SESIÓN GUARDADA — FIN");
                         return true;
                     }
 
-                    // La carga rápida falló → limpiar cualquier modelo parcial antes de continuar
-                    Debug.LogWarning("[NavManager] ⚠️ Falló carga rápida — limpiando y continuando con flujo completo.");
+                    Debug.LogWarning("[NavManager] ⚠️ Falló carga rápida → flujo completo.");
                     _modelLoadManager?.UnloadCurrentModel();
                 }
                 else
@@ -225,12 +234,10 @@ namespace IndoorNavAR.Core
                     Debug.Log("[NavManager] ℹ️ Sin sesión guardada completa → flujo completo.");
                 }
 
-                // ── Flujo completo (solo llega aquí si NO hay sesión válida guardada) ──
                 Debug.Log("[NavManager] 📡 Iniciando AR...");
                 await InitializeAR();
                 Debug.Log("[NavManager] ✅ AR lista.");
 
-                // ✅ FIX #1: _autoLoadModel solo se evalúa en el flujo completo.
                 if (_autoLoadModel && _modelLoadManager != null)
                 {
                     Debug.Log("[NavManager] 📦 Cargando modelo automáticamente...");
@@ -253,20 +260,14 @@ namespace IndoorNavAR.Core
             }
         }
 
-        /// <summary>
-        /// Flujo de restauración desde sesión guardada.
-        /// Orden garantizado:
-        ///   1) RestoreModelTransform  → modelo posicionado
-        ///   2) ConfirmModelPositioned → StartPoints conocen su posición mundo real
-        ///   3) LoadNavMeshFromFile    → NavMesh activo
-        ///   4) NotifyNavMeshReady     → StartPoints pueden teleportar al agente
-        ///   5) LoadWaypoints          → balizas recreadas
-        /// </summary>
         private async Task<bool> InitializeFromSavedSession()
         {
             try
             {
-                Debug.Log("[NavManager] 📂 [1/4] Llamando LoadSession...");
+                Debug.Log("[NavManager] 📂 [1/3] Llamando LoadSession...");
+                // LoadSession() internamente llama RestoreModelTransform,
+                // luego LoadNavMeshFromFile → RecreateStairGeometryAsync →
+                // ConfirmModelPositioned → NotifyNavMeshReady (en ese orden correcto).
                 bool sessionLoaded = await _persistenceManager.LoadSession();
                 Debug.Log($"[NavManager] 📂 LoadSession resultado: {sessionLoaded}");
 
@@ -276,32 +277,24 @@ namespace IndoorNavAR.Core
                     return false;
                 }
 
-                // ✅ FIX #2 — Paso 2: Confirmar posición del modelo a todos los StartPoints.
-                // El modelo ya fue instanciado/reposicionado dentro de LoadSession →
-                // RestoreModelTransform. Ahora sus hijos (StartPoints) tienen posición
-                // mundo correcta. Se les notifica para que desbloqueen el teleport.
-                Debug.Log("[NavManager] 📍 [2/4] Confirmando posición del modelo a StartPoints...");
-                ConfirmModelPositionedToAllStartPoints();
-
-                Debug.Log("[NavManager] ✅ [3/4] Sesión cargada — marcando coordinador...");
+                Debug.Log("[NavManager] ✅ [2/3] Marcando coordinador...");
                 _navMeshCoordinator?.MarkSetupDone();
 
-                await Task.Delay(300);
-
-                Debug.Log("[NavManager] 🧭 [4/4] Buscando NavigationStartPoint...");
-                var startPoint = NavigationStartPointManager.GetStartPointForLevel(0);
-                if (startPoint != null)
+                // ✅ FIX #6: Notificar al AROriginAligner que la sesión fue restaurada.
+                // En este flujo, ModelLoadedEvent nunca se publicó, por lo que
+                // AROriginAligner nunca pudo activar el modo No-AR ni alinear la cámara.
+                // NotifySessionRestored() dispara AlignWhenReady() que verifica
+                // ARCapabilityDetector y activa el modo correcto (No-AR o FullAR).
+                if (_arOriginAligner != null)
                 {
-                    Debug.Log($"[NavManager] ✅ StartPoint encontrado: {startPoint.gameObject.name}");
-                    startPoint.ReteleportAgent();
-                    _arOriginAligner?.ForceRealign();
+                    Debug.Log("[NavManager] 🎯 [3/3] Notificando AROriginAligner de sesión restaurada...");
+                    _arOriginAligner.NotifySessionRestored();
                 }
                 else
                 {
-                    Debug.LogWarning("[NavManager] ⚠️ Sin NavigationStartPoint — agente no reposicionado.");
+                    Debug.LogWarning("[NavManager] ⚠️ AROriginAligner no disponible — " +
+                                     "alineación de cámara omitida.");
                 }
-
-                
 
                 ChangeState(AppMode.Navigation);
                 Debug.Log("[NavManager] ✅ InitializeFromSavedSession COMPLETADO.");
@@ -309,22 +302,9 @@ namespace IndoorNavAR.Core
             }
             catch (Exception ex)
             {
-                Debug.LogError($"[NavManager] ❌ InitializeFromSavedSession error: {ex.Message}\n{ex.StackTrace}");
+                Debug.LogError($"[NavManager] ❌ InitializeFromSavedSession: {ex.Message}\n{ex.StackTrace}");
                 return false;
             }
-        }
-
-        /// <summary>
-        /// ✅ FIX #2 — Notifica a todos los NavigationStartPoints que el modelo
-        /// ya está en su posición final. Deben llamar a este método antes de
-        /// leer transform.position si son hijos del modelo.
-        /// </summary>
-        private void ConfirmModelPositionedToAllStartPoints()
-        {
-            var startPoints = NavigationStartPointManager.GetAllStartPoints();
-            Debug.Log($"[NavManager] 📍 Confirmando posición a {startPoints.Count} StartPoint(s)...");
-            foreach (var sp in startPoints)
-                sp?.ConfirmModelPositioned();
         }
 
         private async Task InitializeAR()
@@ -336,7 +316,6 @@ namespace IndoorNavAR.Core
             }
 
             Debug.Log("[NavManager] 📡 Esperando AR Session...");
-
             int timeout = 10;
             while (!_arSessionManager.IsSessionReady && timeout > 0)
             {
@@ -358,13 +337,7 @@ namespace IndoorNavAR.Core
         {
             var prevState = _currentState;
             _currentState = newState;
-
-            EventBus.Instance?.Publish(new AppModeChangedEvent
-            {
-                PreviousMode = prevState,
-                NewMode      = newState
-            });
-
+            EventBus.Instance?.Publish(new AppModeChangedEvent { PreviousMode = prevState, NewMode = newState });
             LogEvent($"🔄 Estado: {prevState} → {newState}");
         }
 
@@ -374,11 +347,7 @@ namespace IndoorNavAR.Core
 
         public async Task<bool> LoadModelOnLargestPlane()
         {
-            if (_modelLoadManager == null)
-            {
-                Debug.LogWarning("[NavManager] ⚠️ ModelLoadManager no disponible");
-                return false;
-            }
+            if (_modelLoadManager == null) { Debug.LogWarning("[NavManager] ⚠️ ModelLoadManager no disponible"); return false; }
             ChangeState(AppMode.ModelPlacement);
             return await _modelLoadManager.LoadModelOnLargestPlaneAsync();
         }
@@ -437,7 +406,6 @@ namespace IndoorNavAR.Core
 
         private void LogEvent(string msg) { if (_logDetailedEvents) Debug.Log($"[NavManager] {msg}"); }
         private void Log(string msg) => Debug.Log($"[NavManager] {msg}");
-
         private void PublishMessage(string msg, MessageType type) =>
             EventBus.Instance?.Publish(new ShowMessageEvent
             { Message = msg, Type = type, Duration = type == MessageType.Error ? 5f : 3f });
@@ -449,23 +417,15 @@ namespace IndoorNavAR.Core
         [ContextMenu("ℹ️ System Info")]
         private void DebugInfo()
         {
-            Debug.Log("══════════════════════════════");
-            Debug.Log("NAVIGATION SYSTEM INFO");
-            Debug.Log("══════════════════════════════");
-            Debug.Log($"Estado:      {_currentState}");
-            Debug.Log($"Inicializado:{_isInitialized}");
-            Debug.Log($"AR Ready:    {_arSessionManager?.IsSessionReady ?? false}");
-            Debug.Log($"Modelo:      {_modelLoadManager?.CurrentModelName ?? "None"}");
-            Debug.Log($"Waypoints:   {_waypointManager?.WaypointCount ?? 0}");
-            Debug.Log($"Navegando:   {_navigationAgent?.IsNavigating ?? false}");
-            Debug.Log("══════════════════════════════");
+            Debug.Log($"Estado: {_currentState} | Init: {_isInitialized} | " +
+                      $"AR: {_arSessionManager?.IsSessionReady ?? false} | " +
+                      $"Modelo: {_modelLoadManager?.CurrentModelName ?? "None"} | " +
+                      $"Waypoints: {_waypointManager?.WaypointCount ?? 0}");
         }
 
-        [ContextMenu("📦 Load Model")]
-        private void DebugLoadModel() => _ = LoadModelOnLargestPlane();
-
-        [ContextMenu("🔄 Reset")]
-        private void DebugReset() => ResetSystem();
+        [ContextMenu("📦 Load Model")]       private void DebugLoadModel()  => _ = LoadModelOnLargestPlane();
+        [ContextMenu("🔄 Reset")]             private void DebugReset()      => ResetSystem();
+        [ContextMenu("🚀 Force Initialize")]  private void DebugForceInit()  { _isInitialized = false; _ = Initialize(); }
 
         #endregion
     }
