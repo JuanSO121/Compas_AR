@@ -224,9 +224,18 @@ namespace IndoorNavAR.AR
         }
 
         /// <summary>
+        /// True si el dispositivo no tiene ARCore y la cámara sigue al agente NPC.
+        /// Leído por UserPositionBridge para diagnóstico y logging.
+        /// </summary>
+        public bool IsNoArMode => _noArMode;
+
+        /// <summary>
+        /// True si ARCore está activo (inverso de IsNoArMode).
+        /// </summary>
+        public bool IsFullARMode => !_noArMode;
+
+        /// <summary>
         /// ✅ FIX v3: Llamar desde NavigationManager al final de InitializeFromSavedSession().
-        /// Dispara la alineación o el modo No-AR para el flujo de sesión restaurada,
-        /// donde ModelLoadedEvent nunca se publica.
         /// </summary>
         public void NotifySessionRestored()
         {

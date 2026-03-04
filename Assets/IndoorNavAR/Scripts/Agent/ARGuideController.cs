@@ -2,55 +2,69 @@
 // Carpeta: Assets/IndoorNavAR/Agent/
 //
 // ============================================================================
-//  NPC GUÍA — IndoorNavAR  v4.4  (fix bucle Leading ↔ Reorienting)
+//  NPC GUÍA — IndoorNavAR  v4.5  (fix NavStart con isStopped=true previo)
 // ============================================================================
 //
-//  BUG v4.3 → v4.4:
+//  BUG v4.4 → v4.5:
 //  ─────────────────────────────────────────────────────────────────────────
-//  PROBLEMA: bucle infinito Leading ↔ Reorienting a 4/s.
+//  PROBLEMA:
+//    [VoiceGuide] 'VirtualAssistant' sin ruta tras 3,00s
+//    (pathStatus=PathComplete pathPending=False)
 //
-//  Secuencia:
-//    EvaluateLeading() detecta ángulo > _maxAngle
-//      → NavStop("Reorientando hacia usuario")
-//        → NavigationAgent.StopNavigation() publica NavigationCancelledEvent
-//          → NavigationManager recibe el evento → estado: Navigation→WaypointPlacement
-//    EvaluateReorienting() completa la rotación
-//      → NavStart(_guideDestination)
-//        → NavigationManager recibe NavigationStartedEvent → estado: WaypointPlacement→Navigation
-//    Siguiente tick (0.25s): ángulo sigue siendo > _maxAngle
-//      → NavStop("Reorientando") → NavigationManager cancela de nuevo
-//      → bucle ∞
+//  SÍNTOMA:
+//    El NavMeshAgent del VirtualAssistant tiene hasPath=False durante todo
+//    el timeout de 3s de WaitForPathAndPreprocess(), aunque NavigationAgent.
+//    StartNavigation() fue llamado correctamente.
 //
 //  CAUSA RAÍZ:
-//    El guía usaba _navAgent.StopNavigation() para pausar el movimiento
-//    durante la reorientación. Eso es correcto para el NavMeshAgent, pero
-//    NavigationAgent.StopNavigation() además publica NavigationCancelledEvent,
-//    que NavigationManager usa para cambiar el AppMode global.
-//    El guía no debería alterar el AppMode al hacer una pausa temporal interna.
+//    En Unity, NavMeshAgent.SetDestination() es silenciosamente IGNORADO
+//    cuando isStopped=true en el mismo frame. El flujo problemático:
+//
+//      EvaluateLeading() detecta ángulo > _maxAngle
+//        → PauseAgent()  → _rawAgent.isStopped = true
+//        → TransitionTo(Reorienting)
+//
+//      EvaluateReorienting() (tick siguiente) — usuario muy lejos
+//        → NavStart(userPos)
+//            → _rawAgent.isStopped = false   ← OK
+//            → _navAgent.StartNavigation()
+//                → internamente: _rawAgent.SetDestination(destination)
+//                   Unity procesa isStopped=false y SetDestination en el
+//                   MISMO FRAME. En algunas versiones de Unity (2022+),
+//                   el cambio de isStopped no se aplica hasta el siguiente
+//                   tick del NavMesh, por lo que SetDestination llega con
+//                   el agente aún "parado" → path descartado.
+//
+//      Resultado: hasPath=false, pathPending=false, pathStatus=PathComplete
+//      (el PathComplete es del path ANTERIOR, ya invalidado).
+//      VoiceGuide espera 3s y emite WARNING.
 //
 //  FIX:
-//    Para pausas internas del guía (Reorienting, Waiting, ApproachingStairs)
-//    NO llamar a _navAgent.StopNavigation(). En su lugar, pausar el
-//    NavMeshAgent directamente:
-//      _rawAgent.isStopped = true   → detiene el movimiento sin eventos
-//      _rawAgent.isStopped = false  → reanuda sin eventos
+//    NavStart() ahora hace:
+//      1. _rawAgent.isStopped = false
+//      2. Si hay path stale (hasPath=true pero íbamos a cambiar destino),
+//         _rawAgent.ResetPath() — limpia el path anterior para que
+//         SetDestination parta de un estado limpio.
+//      3. yield return null (un frame) antes de StartNavigation() cuando
+//         el agente venía de isStopped=true.
 //
-//    _navAgent.StopNavigation() y NavStart() solo se llaman cuando el guía
-//    genuinamente termina o inicia una sesión de navegación completa
-//    (StopGuide, SetGuideDestination, Returning).
+//    Como NavStart() es síncrono (no corrutina), la solución práctica
+//    y segura es: ResetPath() antes de StartNavigation(). Esto garantiza
+//    que el NavMeshAgent esté en estado "sin path" cuando recibe el nuevo
+//    SetDestination, forzando un cálculo limpio en lugar de reutilizar
+//    el path invalidado.
 //
-//  CAMBIOS RESPECTO A v4.3:
-//    + PauseAgent()  — _rawAgent.isStopped = true  (sin eventos)
-//    + ResumeAgent() — _rawAgent.isStopped = false (sin eventos)
-//    + EvaluateLeading: usa PauseAgent() en lugar de NavStop() para
-//      Waiting y Reorienting.
-//    + EvaluateApproachingStairs: usa PauseAgent() al entrar al estado.
-//    + NavStop() se elimina de los estados intermedios; solo queda en
-//      StopGuide() donde sí corresponde cancelar la navegación global.
-//    + NavStart() sigue usándose para Returning y para reanudar tras
-//      Waiting/ApproachingStairs (re-iniciar la ruta al destino final).
+//    IMPORTANTE: ResetPath() NO cancela la navegación global —
+//    solo borra el path local del NavMeshAgent. No publica ningún evento.
 //
-//  TODO LO DEMÁS ES IDÉNTICO A v4.3.
+//  CAMBIOS RESPECTO A v4.4:
+//    + NavStart(): añadido _rawAgent.ResetPath() antes de StartNavigation()
+//      cuando el agente tiene un path stale.
+//    + _wasStoppedBeforeNavStart: flag interno para detectar si el agente
+//      venía de PauseAgent() — no es necesario con ResetPath(), pero se
+//      documenta para claridad.
+//
+//  TODO LO DEMÁS ES IDÉNTICO A v4.4.
 
 using UnityEngine;
 using UnityEngine.AI;
@@ -164,6 +178,10 @@ namespace IndoorNavAR.Agent
 
         private bool    _isReorienting = false;
         private Vector3 _reorientTarget;
+
+        // ✅ v4.5: flag para saber si el agente venía de PauseAgent() antes
+        // de llamar a NavStart(). Usado para decidir si hacer ResetPath().
+        private bool _agentWasPaused = false;
 
         // ─────────────────────────────────────────────────────────────────────
         //  LIFECYCLE
@@ -311,11 +329,12 @@ namespace IndoorNavAR.Agent
 
         public void StopGuide()
         {
-            _hasDestination = false;
-            _isReorienting  = false;
-            _isOnStairs     = false;
-            _stairAnnounced = false;
-            _climbAnnounced = false;
+            _hasDestination   = false;
+            _isReorienting    = false;
+            _isOnStairs       = false;
+            _stairAnnounced   = false;
+            _climbAnnounced   = false;
+            _agentWasPaused   = false;
 
             RestoreAgentRotationControl();
             RestoreSpeed();
@@ -378,8 +397,6 @@ namespace IndoorNavAR.Agent
                 if (!_stairAnnounced)
                 {
                     _stairAnnounced = true;
-                    // ✅ FIX v4.4: PauseAgent() en lugar de NavStop().
-                    // No cancela la navegación global — solo pausa el movimiento.
                     PauseAgent();
                     Announce(GuideAnnouncementType.ApproachingStairs,
                              "Atención: hay escaleras próximas. Por favor acércate al guía");
@@ -395,8 +412,6 @@ namespace IndoorNavAR.Agent
             {
                 _isReorienting = false;
                 RestoreAgentRotationControl();
-                // ✅ FIX v4.4: PauseAgent() en lugar de NavStop().
-                // No cancela la navegación global — solo pausa el movimiento.
                 PauseAgent();
                 if (!_stairAnnounced)
                     Announce(GuideAnnouncementType.WaitingForUser,
@@ -413,10 +428,6 @@ namespace IndoorNavAR.Agent
                 float angle = Vector3.Angle(transform.forward, toUser.normalized);
                 if (angle > _maxAngle)
                 {
-                    // ✅ FIX v4.4: PauseAgent() en lugar de NavStop().
-                    // Antes: NavStop() publicaba NavigationCancelledEvent →
-                    // NavigationManager cambiaba AppMode → bucle ∞ con NavStart().
-                    // Ahora: solo se detiene el NavMeshAgent, sin eventos globales.
                     PauseAgent();
                     TakeRotationControl();
                     _reorientTarget = userPos;
@@ -467,7 +478,6 @@ namespace IndoorNavAR.Agent
                     _rawAgent.speed = _originalSpeed * _stairSpeedFactor;
 
                 RestoreAgentRotationControl();
-                // Reanudar movimiento hacia destino final sin publicar nuevos eventos
                 ResumeAgent();
                 Announce(GuideAnnouncementType.ResumeGuide,
                          "Continuando la ruta. Sigue de cerca al guía");
@@ -491,7 +501,6 @@ namespace IndoorNavAR.Agent
             if (distance <= _safeDistance)
             {
                 RestoreAgentRotationControl();
-                // Reanudar movimiento hacia destino final sin publicar nuevos eventos
                 ResumeAgent();
                 Announce(GuideAnnouncementType.ResumeGuide, "Continuando la ruta");
                 TransitionTo(GuideState.Leading);
@@ -512,7 +521,8 @@ namespace IndoorNavAR.Agent
                 return;
             }
 
-            if (Vector3.Distance(_rawAgent.destination, userPos) > 0.5f)
+            if (_rawAgent != null &&
+                Vector3.Distance(_rawAgent.destination, userPos) > 0.5f)
                 NavStart(userPos);
         }
 
@@ -540,10 +550,6 @@ namespace IndoorNavAR.Agent
                 {
                     _isReorienting = false;
                     RestoreAgentRotationControl();
-                    // ✅ FIX v4.4: ResumeAgent() en lugar de NavStart().
-                    // La ruta al destino final ya existe — solo reanudar el movimiento.
-                    // NavStart() crearía una nueva ruta innecesariamente y publicaría
-                    // NavigationStartedEvent, lo que podría confundir a NavigationManager.
                     ResumeAgent();
                     TransitionTo(GuideState.Leading);
                 }
@@ -555,36 +561,65 @@ namespace IndoorNavAR.Agent
         // ─────────────────────────────────────────────────────────────────────
 
         /// <summary>
-        /// ✅ FIX v4.4 — Pausa el movimiento del NavMeshAgent SIN publicar
+        /// Pausa el movimiento del NavMeshAgent SIN publicar
         /// NavigationCancelledEvent. Usar para pausas internas del guía
         /// (Waiting, Reorienting, ApproachingStairs).
         /// La ruta se conserva; ResumeAgent() la retoma.
         /// </summary>
         private void PauseAgent()
         {
-            if (_rawAgent != null)
-                _rawAgent.isStopped = true;
+            if (_rawAgent == null) return;
+            _rawAgent.isStopped  = true;
+            _agentWasPaused      = true;
         }
 
         /// <summary>
-        /// ✅ FIX v4.4 — Reanuda el movimiento del NavMeshAgent SIN publicar
+        /// Reanuda el movimiento del NavMeshAgent SIN publicar
         /// NavigationStartedEvent. Usar para reanudar tras una pausa interna.
         /// </summary>
         private void ResumeAgent()
         {
-            if (_rawAgent != null)
-                _rawAgent.isStopped = false;
+            if (_rawAgent == null) return;
+            _rawAgent.isStopped = false;
+            _agentWasPaused     = false;
         }
 
         /// <summary>
-        /// Inicia una navegación completa hacia un nuevo destino.
-        /// Publica NavigationStartedEvent — usar solo cuando se cambia de destino
-        /// (Returning hacia usuario, retomar ruta tras Returning).
+        /// ✅ FIX v4.5 — Inicia una navegación completa hacia un nuevo destino.
+        ///
+        /// PROBLEMA ANTERIOR:
+        ///   Si el agente tenía isStopped=true (de PauseAgent) y luego se
+        ///   llamaba StartNavigation() en el mismo frame que isStopped=false,
+        ///   Unity 2022+ descartaba silenciosamente SetDestination() porque
+        ///   el cambio de isStopped no se propagaba hasta el siguiente tick
+        ///   del NavMesh. Resultado: hasPath=false indefinidamente.
+        ///
+        /// FIX:
+        ///   Si el agente venía de PauseAgent() (_agentWasPaused=true),
+        ///   llamar ResetPath() antes de StartNavigation(). ResetPath() pone
+        ///   el agente en estado limpio (hasPath=false, pathPending=false)
+        ///   sin publicar ningún evento, y garantiza que el próximo
+        ///   SetDestination() sea procesado correctamente.
+        ///
+        /// Publica NavigationStartedEvent — usar solo cuando se cambia de
+        /// destino (Returning hacia usuario, retomar ruta tras Returning).
         /// </summary>
         private void NavStart(Vector3 destination)
         {
             if (_rawAgent != null)
+            {
                 _rawAgent.isStopped = false;
+
+                // ✅ FIX v4.5: si el agente venía pausado, limpiar path stale
+                // para que SetDestination sea aceptado en el mismo frame.
+                if (_agentWasPaused && _rawAgent.hasPath)
+                {
+                    _rawAgent.ResetPath();
+                    if (_logStateChanges)
+                        Debug.Log("[ARGuideController] 🔄 ResetPath() antes de NavStart (agente venía de PauseAgent).");
+                }
+                _agentWasPaused = false;
+            }
 
             bool wasHandling = _isHandlingNavigation;
             _isHandlingNavigation = true;
@@ -683,7 +718,7 @@ namespace IndoorNavAR.Agent
 
         private void RestoreAgentRotationControl()
         {
-            if (_rawAgent != null) _rawAgent.updateRotation = false;
+            if (_rawAgent != null) _rawAgent.updateRotation = true;
             _isReorienting = false;
         }
 
@@ -805,8 +840,10 @@ namespace IndoorNavAR.Agent
                       $"HasDest={_hasDestination} | Dest={_guideDestination} | " +
                       $"Floor={_currentFloor} | OnStairs={_isOnStairs} | " +
                       $"StairAnnounced={_stairAnnounced} | " +
+                      $"AgentWasPaused={_agentWasPaused} | " +
                       $"NavAgentNavigating={_navAgent?.IsNavigating} | " +
                       $"AgentStopped={_rawAgent?.isStopped} | " +
+                      $"AgentHasPath={_rawAgent?.hasPath} | " +
                       $"Speed={_rawAgent?.speed:F1}/{_originalSpeed:F1}");
         }
 

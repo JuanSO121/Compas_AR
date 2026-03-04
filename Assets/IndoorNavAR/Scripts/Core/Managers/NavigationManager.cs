@@ -1,9 +1,6 @@
 // File: NavigationManager.cs
-// ✅ FIX #6 — Llama AROriginAligner.NotifySessionRestored() al final de
-//             InitializeFromSavedSession() para que el modo No-AR (o la
-//             alineación al StartPoint en FullAR) se active correctamente
-//             en el flujo de sesión restaurada, donde ModelLoadedEvent
-//             nunca se publica.
+// ✅ FIX #7 — Integración NavigationVoiceGuide.TriggerFromWaypoint()
+//             en NavigateToWaypoint() para activar el guía de voz.
 //
 //  TODOS LOS FIXES ANTERIORES SE MANTIENEN:
 //  ✅ FIX #1 — Exclusión mutua estricta con sesión guardada.
@@ -11,8 +8,13 @@
 //  ✅ FIX #3 — ForceRealign() eliminado de InitializeFromSavedSession().
 //  ✅ FIX #4 — Initialize() espera al primer frame antes de arrancar.
 //  ✅ FIX #5 — ConfirmModelPositionedToAllStartPoints() y ReteleportAgent()
-//              eliminados de InitializeFromSavedSession() (gestionados por
-//              PersistenceManager.RecreateStairGeometryAsync()).
+//              eliminados de InitializeFromSavedSession().
+//  ✅ FIX #6 — AROriginAligner.NotifySessionRestored() al final de
+//              InitializeFromSavedSession().
+//  ✅ FIX #7 — NavigationVoiceGuide.Instance?.TriggerFromWaypoint(waypoint)
+//              llamado en NavigateToWaypoint() para que el VoiceGuide
+//              arranque correctamente. Sin este llamado el VoiceGuide
+//              nunca recibía el nombre del waypoint destino.
 
 using System;
 using System.Threading.Tasks;
@@ -23,6 +25,7 @@ using IndoorNavAR.Core.Managers;
 using IndoorNavAR.Core.Controllers;
 using IndoorNavAR.AR;
 using IndoorNavAR.Navigation;
+using IndoorNavAR.Navigation.Voice; // ✅ FIX #7: namespace del VoiceGuide
 
 namespace IndoorNavAR.Core
 {
@@ -74,7 +77,6 @@ namespace IndoorNavAR.Core
         private void Start()
         {
             if (_autoInitialize)
-                // FIX #4: Esperar un frame completo antes de Initialize()
                 StartCoroutine(InitializeAfterFirstFrame());
         }
 
@@ -265,9 +267,6 @@ namespace IndoorNavAR.Core
             try
             {
                 Debug.Log("[NavManager] 📂 [1/3] Llamando LoadSession...");
-                // LoadSession() internamente llama RestoreModelTransform,
-                // luego LoadNavMeshFromFile → RecreateStairGeometryAsync →
-                // ConfirmModelPositioned → NotifyNavMeshReady (en ese orden correcto).
                 bool sessionLoaded = await _persistenceManager.LoadSession();
                 Debug.Log($"[NavManager] 📂 LoadSession resultado: {sessionLoaded}");
 
@@ -280,11 +279,6 @@ namespace IndoorNavAR.Core
                 Debug.Log("[NavManager] ✅ [2/3] Marcando coordinador...");
                 _navMeshCoordinator?.MarkSetupDone();
 
-                // ✅ FIX #6: Notificar al AROriginAligner que la sesión fue restaurada.
-                // En este flujo, ModelLoadedEvent nunca se publicó, por lo que
-                // AROriginAligner nunca pudo activar el modo No-AR ni alinear la cámara.
-                // NotifySessionRestored() dispara AlignWhenReady() que verifica
-                // ARCapabilityDetector y activa el modo correcto (No-AR o FullAR).
                 if (_arOriginAligner != null)
                 {
                     Debug.Log("[NavManager] 🎯 [3/3] Notificando AROriginAligner de sesión restaurada...");
@@ -362,15 +356,35 @@ namespace IndoorNavAR.Core
 
         #region Navigation
 
+        /// <summary>
+        /// ✅ FIX #7: Llama NavigationVoiceGuide.TriggerFromWaypoint() después de
+        /// iniciar la navegación para que el guía de voz arranque con el nombre
+        /// correcto del waypoint destino y espere la ruta antes de hablar.
+        /// </summary>
         public bool NavigateToWaypoint(WaypointData waypoint)
         {
             if (_navigationAgent == null || waypoint == null) return false;
+
             bool success = _navigationAgent.NavigateToWaypoint(waypoint);
-            if (success) Debug.Log($"[NavManager] 🧭 Navegando a: {waypoint.WaypointName}");
+
+            if (success)
+            {
+                Debug.Log($"[NavManager] 🧭 Navegando a: {waypoint.WaypointName}");
+
+                // ✅ FIX #7: Activar el guía de voz con el waypoint real.
+                // NavigationVoiceGuide.TriggerFromWaypoint() espera la ruta antes
+                // de generar instrucciones — no habla hasta tener el path listo.
+                NavigationVoiceGuide.Instance?.TriggerFromWaypoint(waypoint);
+            }
+
             return success;
         }
 
-        public void StopNavigation() => _navigationAgent?.StopNavigation("Usuario canceló");
+        public void StopNavigation()
+        {
+            _navigationAgent?.StopNavigation("Usuario canceló");
+            NavigationVoiceGuide.Instance?.StopVoiceGuide();
+        }
 
         #endregion
 

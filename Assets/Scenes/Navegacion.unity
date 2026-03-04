@@ -1440,6 +1440,45 @@ MonoBehaviour:
   _minColor: {r: 0, g: 0.8, b: 1, a: 0.2}
   _destinationColor: {r: 1, g: 1, b: 0, a: 0.8}
   _stairColor: {r: 1, g: 0, b: 1, a: 0.35}
+--- !u!114 &1603812460
+MonoBehaviour:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_GameObject: {fileID: 1603812454}
+  m_Enabled: 1
+  m_EditorHideFlags: 0
+  m_Script: {fileID: 11500000, guid: 00b2293dbfe0dfe4997cd050d91d98ab, type: 3}
+  m_Name: 
+  m_EditorClassIdentifier: Assembly-CSharp::IndoorNavAR.Navigation.Voice.NavigationVoiceGuide
+  _userBridge: {fileID: 0}
+  _pathController: {fileID: 0}
+  _turnTriggerDist: 5
+  _stairTriggerDist: 6
+  _arrivalTriggerDist: 1.5
+  _straightReminderDist: 12
+  _pathWaitTimeout: 3
+  _pathPollInterval: 0.1
+  _destinationChangeThreshold: 0.5
+  _stairHeightThreshold: 0.3
+  _slightTurnAngle: 20
+  _definiteTurnAngle: 50
+  _uTurnAngle: 140
+  _walkSpeedFlat: 0.8
+  _walkSpeedStairs: 0.4
+  _stepLength: 0.7
+  _straightReminderInterval: 20
+  _progressInterval: 45
+  _stopTimeout: 4
+  _stopMinMovement: 0.25
+  _stopReminderInterval: 15
+  _deviationDist: 2
+  _deviationDelay: 2.5
+  _obstacleCheckTime: 6
+  _longSeparationTime: 12
+  _logInstructions: 1
+  _logPreprocessing: 1
 --- !u!1 &1651261851
 GameObject:
   m_ObjectHideFlags: 0
@@ -1809,14 +1848,16 @@ PrefabInstance:
       propertyPath: m_LocalEulerAnglesHint.z
       value: 0
       objectReference: {fileID: 0}
-    m_RemovedComponents:
-    - {fileID: 4397978064763092886, guid: d0f916b92dcfab540a9ea711aba44a9b, type: 3}
+    m_RemovedComponents: []
     m_RemovedGameObjects: []
     m_AddedGameObjects: []
     m_AddedComponents:
     - targetCorrespondingSourceObject: {fileID: 2184020662871595315, guid: d0f916b92dcfab540a9ea711aba44a9b, type: 3}
       insertIndex: -1
       addedObject: {fileID: 1603812455}
+    - targetCorrespondingSourceObject: {fileID: 2184020662871595315, guid: d0f916b92dcfab540a9ea711aba44a9b, type: 3}
+      insertIndex: -1
+      addedObject: {fileID: 1603812460}
   m_SourcePrefab: {fileID: 100100000, guid: d0f916b92dcfab540a9ea711aba44a9b, type: 3}
 --- !u!1660057539 &9223372036854775807
 SceneRoots:

@@ -13,7 +13,6 @@ GameObject:
   - component: {fileID: 190788527659418708}
   - component: {fileID: 7784056001429803027}
   - component: {fileID: 3591176874749200417}
-  - component: {fileID: 4397978064763092886}
   m_Layer: 0
   m_Name: VirtualAssistant
   m_TagString: Untagged
@@ -222,32 +221,6 @@ MonoBehaviour:
   _destinationColor: {r: 0, g: 1, b: 0.3, a: 0.8}
   _stairColor: {r: 1, g: 0.5, b: 0, a: 1}
   _logVerbose: 0
---- !u!114 &4397978064763092886
-MonoBehaviour:
-  m_ObjectHideFlags: 0
-  m_CorrespondingSourceObject: {fileID: 0}
-  m_PrefabInstance: {fileID: 0}
-  m_PrefabAsset: {fileID: 0}
-  m_GameObject: {fileID: 2184020662871595315}
-  m_Enabled: 1
-  m_EditorHideFlags: 0
-  m_Script: {fileID: 11500000, guid: 54f08d9679501474dafc18af564f6904, type: 3}
-  m_Name: 
-  m_EditorClassIdentifier: Assembly-CSharp::IndoorNavAR.Agent.ARGuideController
-  _xrOrigin: {fileID: 0}
-  _safeDistance: 3
-  _minDistance: 1.5
-  _maxReturnDistance: 5
-  _maxAngle: 120
-  _rotationSpeed: 90
-  _evaluationInterval: 0.1
-  _logStateChanges: 1
-  _logEvaluations: 1
-  _drawGizmos: 1
-  _safeColor: {r: 0, g: 1, b: 0, a: 0.25}
-  _returnColor: {r: 1, g: 0.4, b: 0, a: 0.2}
-  _minColor: {r: 0, g: 0.8, b: 1, a: 0.2}
-  _destinationColor: {r: 1, g: 1, b: 0, a: 0.8}
 --- !u!1001 &974987646280666911
 PrefabInstance:
   m_ObjectHideFlags: 0

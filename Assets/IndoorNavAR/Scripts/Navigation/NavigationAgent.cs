@@ -208,13 +208,12 @@ namespace IndoorNavAR.Navigation
             if (_publishEvents)
                 EventBus.Instance?.Publish(new NavigationStartedEvent
                 {
-                    DestinationWaypointId = string.Empty,
+                    DestinationWaypointId = _lastDestinationName,   // ← DESPUÉS (1 línea)
                     StartPosition         = transform.position,
                     DestinationPosition   = destination,
                     EstimatedDistance     = Vector3.Distance(transform.position, destination)
                 });
         }
-
         private void HandlePathCompleted()
         {
             OnArrived?.Invoke();
