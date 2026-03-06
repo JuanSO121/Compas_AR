@@ -22624,7 +22624,7 @@ MonoBehaviour:
   _waitForNavMesh: 1
   _initialDelay: 0.5
   _navMeshTimeout: 30
-  _autoTeleportOnStart: 1
+  _autoTeleportOnStart: 0
   _maxVerticalDeviation: 1
   _maxHorizontalRadius: 5
   _showGizmo: 1

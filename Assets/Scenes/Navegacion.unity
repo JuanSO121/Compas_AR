@@ -217,6 +217,7 @@ Transform:
   m_ConstrainProportionsScale: 0
   m_Children:
   - {fileID: 1651261852}
+  - {fileID: 867515509}
   m_Father: {fileID: 0}
   m_LocalEulerAnglesHint: {x: 0, y: 0, z: 0}
 --- !u!114 &2694464
@@ -500,12 +501,12 @@ Transform:
   m_PrefabAsset: {fileID: 0}
   m_GameObject: {fileID: 867515506}
   serializedVersion: 2
-  m_LocalRotation: {x: 0, y: 0, z: 0, w: 1}
+  m_LocalRotation: {x: -0, y: -0, z: -0, w: 1}
   m_LocalPosition: {x: 0, y: 0, z: 0}
   m_LocalScale: {x: 1, y: 1, z: 1}
   m_ConstrainProportionsScale: 0
   m_Children: []
-  m_Father: {fileID: 0}
+  m_Father: {fileID: 2694463}
   m_LocalEulerAnglesHint: {x: 0, y: 0, z: 0}
 --- !u!1 &976973324
 GameObject:
@@ -950,14 +951,14 @@ MonoBehaviour:
   _navigationAgent: {fileID: 446943536}
   _targetLevel: 0
   _eyeHeightOffset: 1.6
-  _autoAlignOnLoad: 1
-  _teleportAgent: 1
   _delayFrames: 2
   _noArCameraHeight: 1.65
   _noArCameraBack: 0
   _noArPitchAngle: 0
   _noArFollowSmooth: 8
   _noArFollowRotation: 1
+  _fullArSnapRadius: 3
+  _fullArSyncThreshold: 0.05
   _logAlignment: 1
 --- !u!4 &1112862960
 Transform:
@@ -1273,7 +1274,7 @@ MonoBehaviour:
   m_Script: {fileID: 11500000, guid: a79441f348de89743a2939f4d699eac1, type: 3}
   m_Name: 
   m_EditorClassIdentifier: Unity.RenderPipelines.Universal.Runtime::UnityEngine.Rendering.Universal.UniversalAdditionalCameraData
-  m_RenderShadows: 1
+  m_RenderShadows: 0
   m_RequiresDepthTextureOption: 2
   m_RequiresOpaqueTextureOption: 2
   m_CameraType: 0
@@ -1420,13 +1421,26 @@ MonoBehaviour:
   m_Script: {fileID: 11500000, guid: 54f08d9679501474dafc18af564f6904, type: 3}
   m_Name: 
   m_EditorClassIdentifier: Assembly-CSharp::IndoorNavAR.Agent.ARGuideController
-  _xrOrigin: {fileID: 0}
+  _xrOrigin: {fileID: 2694462}
   _safeDistance: 3
   _minDistance: 1.5
   _maxReturnDistance: 5
+  _arrivalConfirmDist: 2
+  _arrivalTimeout: 30
+  _arrivalMinDelay: 3
+  _maxAgentSpeed: 1.4
+  _minLeadingSpeed: 0.8
+  _closedistSpeedFactor: 0.5
+  _stairSpeedFactor: 0.5
+  _initialNavigationPause: 3.5
+  _postTurnPauseSeconds: 4
+  _postTurnMaxWait: 10
+  _postTurnResumeSpeed: 0.15
+  _pauseForHighPriorityTTS: 1
+  _ttsPauseMinPriority: 1
+  _maxTTSWaitTime: 8
   _stairWarningDistance: 2.5
   _stairConfirmDistance: 2
-  _stairSpeedFactor: 0.5
   _stairHeightThreshold: 0.4
   _maxAngle: 120
   _rotationSpeed: 90
@@ -1434,6 +1448,9 @@ MonoBehaviour:
   _logStateChanges: 1
   _logEvaluations: 0
   _logStairs: 1
+  _logTTSSync: 1
+  _logAccessibility: 1
+  _logFullAR: 1
   _drawGizmos: 1
   _safeColor: {r: 0, g: 1, b: 0, a: 0.25}
   _returnColor: {r: 1, g: 0.4, b: 0, a: 0.2}
@@ -1452,15 +1469,17 @@ MonoBehaviour:
   m_Script: {fileID: 11500000, guid: 00b2293dbfe0dfe4997cd050d91d98ab, type: 3}
   m_Name: 
   m_EditorClassIdentifier: Assembly-CSharp::IndoorNavAR.Navigation.Voice.NavigationVoiceGuide
-  _userBridge: {fileID: 0}
-  _pathController: {fileID: 0}
+  _userBridge: {fileID: 1603812465}
+  _pathController: {fileID: 1603812461}
   _turnTriggerDist: 5
   _stairTriggerDist: 6
   _arrivalTriggerDist: 1.5
   _straightReminderDist: 12
+  _evalInterval: 0.1
   _pathWaitTimeout: 3
   _pathPollInterval: 0.1
   _destinationChangeThreshold: 0.5
+  _startDelay: 2.5
   _stairHeightThreshold: 0.3
   _slightTurnAngle: 20
   _definiteTurnAngle: 50
@@ -1479,6 +1498,37 @@ MonoBehaviour:
   _longSeparationTime: 12
   _logInstructions: 1
   _logPreprocessing: 1
+--- !u!114 &1603812461 stripped
+MonoBehaviour:
+  m_CorrespondingSourceObject: {fileID: 3591176874749200417, guid: d0f916b92dcfab540a9ea711aba44a9b, type: 3}
+  m_PrefabInstance: {fileID: 6053017865874710982}
+  m_PrefabAsset: {fileID: 0}
+  m_GameObject: {fileID: 1603812454}
+  m_Enabled: 1
+  m_EditorHideFlags: 0
+  m_Script: {fileID: 11500000, guid: ad6068ba031593945a482c0da7d72d2d, type: 3}
+  m_Name: 
+  m_EditorClassIdentifier: Assembly-CSharp::IndoorNavAR.Navigation.NavigationPathController
+--- !u!114 &1603812465
+MonoBehaviour:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_GameObject: {fileID: 1603812454}
+  m_Enabled: 1
+  m_EditorHideFlags: 0
+  m_Script: {fileID: 11500000, guid: 75f9b6c73a997f9429797cae930e341a, type: 3}
+  m_Name: 
+  m_EditorClassIdentifier: Assembly-CSharp::IndoorNavAR.Navigation.Voice.UserPositionBridge
+  _xrOrigin: {fileID: 2694462}
+  _arOriginAligner: {fileID: 1112862959}
+  _virtualAgentTransform: {fileID: 1603812468}
+--- !u!4 &1603812468 stripped
+Transform:
+  m_CorrespondingSourceObject: {fileID: 7016565646962738363, guid: d0f916b92dcfab540a9ea711aba44a9b, type: 3}
+  m_PrefabInstance: {fileID: 6053017865874710982}
+  m_PrefabAsset: {fileID: 0}
 --- !u!1 &1651261851
 GameObject:
   m_ObjectHideFlags: 0
@@ -1682,7 +1732,7 @@ Transform:
   m_PrefabAsset: {fileID: 0}
   m_GameObject: {fileID: 1873175135}
   serializedVersion: 2
-  m_LocalRotation: {x: 0, y: 0, z: 0, w: 1}
+  m_LocalRotation: {x: -0, y: -0, z: -0, w: 1}
   m_LocalPosition: {x: 0, y: 0, z: 0}
   m_LocalScale: {x: 1, y: 1, z: 1}
   m_ConstrainProportionsScale: 0
@@ -1751,6 +1801,7 @@ MonoBehaviour:
   _persistenceManager: {fileID: 515710065}
   _flutterGameObject: FlutterBridge
   _responseMethod: OnUnityResponse
+  _logTTSSync: 1
 --- !u!1 &2008524774
 GameObject:
   m_ObjectHideFlags: 0
@@ -1804,6 +1855,10 @@ PrefabInstance:
       propertyPath: m_Name
       value: VirtualAssistant
       objectReference: {fileID: 0}
+    - target: {fileID: 3591176874749200417, guid: d0f916b92dcfab540a9ea711aba44a9b, type: 3}
+      propertyPath: _logVerbose
+      value: 1
+      objectReference: {fileID: 0}
     - target: {fileID: 4397978064763092886, guid: d0f916b92dcfab540a9ea711aba44a9b, type: 3}
       propertyPath: _xrOrigin
       value: 
@@ -1826,15 +1881,15 @@ PrefabInstance:
       objectReference: {fileID: 0}
     - target: {fileID: 7016565646962738363, guid: d0f916b92dcfab540a9ea711aba44a9b, type: 3}
       propertyPath: m_LocalRotation.x
-      value: 0
+      value: -0
       objectReference: {fileID: 0}
     - target: {fileID: 7016565646962738363, guid: d0f916b92dcfab540a9ea711aba44a9b, type: 3}
       propertyPath: m_LocalRotation.y
-      value: 0
+      value: -0
       objectReference: {fileID: 0}
     - target: {fileID: 7016565646962738363, guid: d0f916b92dcfab540a9ea711aba44a9b, type: 3}
       propertyPath: m_LocalRotation.z
-      value: 0
+      value: -0
       objectReference: {fileID: 0}
     - target: {fileID: 7016565646962738363, guid: d0f916b92dcfab540a9ea711aba44a9b, type: 3}
       propertyPath: m_LocalEulerAnglesHint.x
@@ -1858,6 +1913,9 @@ PrefabInstance:
     - targetCorrespondingSourceObject: {fileID: 2184020662871595315, guid: d0f916b92dcfab540a9ea711aba44a9b, type: 3}
       insertIndex: -1
       addedObject: {fileID: 1603812460}
+    - targetCorrespondingSourceObject: {fileID: 2184020662871595315, guid: d0f916b92dcfab540a9ea711aba44a9b, type: 3}
+      insertIndex: -1
+      addedObject: {fileID: 1603812465}
   m_SourcePrefab: {fileID: 100100000, guid: d0f916b92dcfab540a9ea711aba44a9b, type: 3}
 --- !u!1660057539 &9223372036854775807
 SceneRoots:
@@ -1866,10 +1924,9 @@ SceneRoots:
   - {fileID: 832575519}
   - {fileID: 1583794870}
   - {fileID: 2694463}
-  - {fileID: 867515509}
+  - {fileID: 6053017865874710982}
   - {fileID: 1873175137}
   - {fileID: 2008524775}
-  - {fileID: 6053017865874710982}
   - {fileID: 1091847578}
   - {fileID: 999373695}
   - {fileID: 1112862960}

@@ -151,6 +151,23 @@ namespace IndoorNavAR.Core.Events
         public int Count;
     }
 
+    /// <summary>
+    /// Publicado por VoiceCommandAPI cuando Flutter reporta que el TTS
+    /// empezó o terminó de hablar. ARGuideController lo escucha para
+    /// pausar/reanudar el NPC durante instrucciones de alta prioridad.
+    /// </summary>
+    public struct TTSSpeakingEvent
+    {
+        /// <summary>True cuando el TTS empieza a hablar, false cuando termina.</summary>
+        public bool IsSpeaking;
+    
+        /// <summary>
+        /// Prioridad de la instrucción que se está leyendo (0-4).
+        /// ARGuideController solo pausa el NPC para prioridad ≥ 3.
+        /// </summary>
+        public int Priority;
+    }
+
     // ── Modelo 3D ─────────────────────────────────────────────────────────────
 
     public struct ModelLoadedEvent

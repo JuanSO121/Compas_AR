@@ -1,33 +1,26 @@
 // File: NavigationStartPoint.cs
-// ✅ FIX v5 — Solo el nivel 0 teleporta automáticamente al iniciar.
+// ✅ FIX v6 — FindFirstObjectByType incluye objetos inactivos
 //
-//  PROBLEMA CORREGIDO (v4 → v5):
-//    Todos los NavigationStartPoint (piso 0, piso 1, etc.) llamaban
-//    StartCoroutine(TeleportAgentWhenReady()) en Start(). Cuando
-//    NotifyNavMeshReady() llegaba, TODAS las corrutinas avanzaban en
-//    paralelo y ejecutaban TeleportToCorrectFloor(). La del piso 1
-//    terminaba última y dejaba al agente en el piso incorrecto.
+//  PROBLEMA CORREGIDO (v5 → v6):
+//    Al mover el VirtualAssistant dentro del XR Origin, el GameObject
+//    puede estar inactivo al inicio (AR Foundation activa el XR Origin
+//    después de que la sesión AR se inicializa). FindFirstObjectByType
+//    por defecto SOLO busca en objetos activos, por lo que devolvía null
+//    y el agente nunca se teleportaba al StartPoint.
 //
-//  FIX v5:
-//    - Nueva propiedad serializable _autoTeleportOnStart (default true).
-//    - En Start(), solo se lanza la corrutina si _autoTeleportOnStart == true.
-//    - Los StartPoints de niveles superiores (piso 1, piso 2, …) deben
-//      tener _autoTeleportOnStart = false en el Inspector; solo sirven
-//      para definir la altura de piso y recibir teleports manuales vía
-//      ReteleportAgent().
-//    - Se añade propiedad pública AutoTeleportOnStart por si se necesita
-//      configurar en runtime (p.ej. desde DefaultWaypointSeeder).
+//    Error original:
+//      [StartPoint Level0] ❌ NavigationAgent no encontrado.
 //
-//  NOTA SOBRE EL FLUJO NORMAL (sesión guardada):
-//    PersistenceManager.RecreateStairGeometryAsync() llama:
-//      ConfirmModelPositioned() → NotifyNavMeshReady()
-//    Solo el StartPoint nivel 0 (con _autoTeleportOnStart=true) avanza
-//    su corrutina hasta TeleportToCorrectFloor(). Los demás están dormidos.
+//  FIX v6:
+//    Todas las llamadas a FindFirstObjectByType<NavigationAgent>() ahora
+//    usan el overload FindObjectsInactive.Include, que busca en toda la
+//    jerarquía independientemente del estado activo/inactivo del GameObject.
 //
-//  ReteleportAgent() sigue siendo útil para:
-//    - Reposicionamiento manual (botón de reset)
-//    - Flujo de nuevo modelo (OnModelLoaded)
-//    - Debug desde ContextMenu en el editor
+//  AFECTA:
+//    - TeleportAgentWhenReady() — búsqueda inicial del agente
+//    - ReteleportAgent()        — búsqueda de fallback si _agent es null
+//
+//  TODOS LOS FIXES ANTERIORES (v1–v5) SE CONSERVAN ÍNTEGRAMENTE.
 
 using System.Collections;
 using UnityEngine;
@@ -46,8 +39,6 @@ namespace IndoorNavAR.Navigation
         [SerializeField] private float _initialDelay        = 0.5f;
         [SerializeField] private float _navMeshTimeout      = 30f;
 
-        // ✅ FIX v5: Solo el StartPoint del nivel de entrada debe teleportar
-        // automáticamente. Los niveles superiores ponen este flag en false.
         [Tooltip("Si true, el agente se teleporta aquí automáticamente al iniciar la escena.\n" +
                  "Debe estar activo SOLO en el nivel de entrada (normalmente nivel 0).\n" +
                  "Desactívalo en los niveles superiores para evitar teleports no deseados.")]
@@ -66,11 +57,9 @@ namespace IndoorNavAR.Navigation
         [SerializeField] private float _gizmoRadius = 0.3f;
 
         private NavigationAgent _agent;
-        private bool _hasTeleported           = false;
-        private bool _navMeshSignaled         = false;
-        private bool _modelPositionConfirmed  = false;
-
-        // FIX v4: Referencia a la corrutina activa para poder cancelarla
+        private bool _hasTeleported          = false;
+        private bool _navMeshSignaled        = false;
+        private bool _modelPositionConfirmed = false;
         private Coroutine _teleportCoroutine = null;
 
         // ─── Properties ──────────────────────────────────────────────────
@@ -80,7 +69,6 @@ namespace IndoorNavAR.Navigation
         public Vector3 Position          => transform.position;
         public bool    DefinesFloorHeight => _useThisAsFloorHeight;
 
-        // ✅ FIX v5: Exponer para configuración en runtime si fuera necesario
         public bool AutoTeleportOnStart
         {
             get => _autoTeleportOnStart;
@@ -102,9 +90,6 @@ namespace IndoorNavAR.Navigation
         {
             NavigationStartPointManager.RegisterStartPoint(this);
 
-            // ✅ FIX v5: Solo lanzar corrutina de teleport automático si este
-            // StartPoint es el punto de entrada. Los niveles superiores NO deben
-            // teleportar al agente automáticamente — solo definen alturas de piso.
             if (_autoTeleportOnStart)
             {
                 _teleportCoroutine = StartCoroutine(TeleportAgentWhenReady());
@@ -137,16 +122,9 @@ namespace IndoorNavAR.Navigation
             Debug.Log($"[StartPoint Level{_level}] 📡 NavMesh listo (notificación directa).");
         }
 
-        /// <summary>
-        /// Re-teleporta el agente. Cancela la corrutina anterior antes de lanzar una nueva.
-        /// Usar solo cuando el NavMesh ya esté disponible (flujo manual / reset / nuevo modelo).
-        /// En el flujo de sesión guardada, NavigationManager ya no llama este método —
-        /// la corrutina de Start() se resuelve sola vía NotifyNavMeshReady().
-        /// </summary>
         [ContextMenu("🔄 Re-teleportar Agente")]
         public void ReteleportAgent()
         {
-            // FIX v4: Cancelar corrutina anterior para evitar doble teleport
             if (_teleportCoroutine != null)
             {
                 StopCoroutine(_teleportCoroutine);
@@ -159,12 +137,17 @@ namespace IndoorNavAR.Navigation
             _modelPositionConfirmed = true;
 
             if (_agent == null)
-                _agent = FindFirstObjectByType<NavigationAgent>();
+            {
+                // ✅ FIX v6: Incluir objetos inactivos — el VirtualAssistant puede
+                // estar dentro del XR Origin que aún no se activó.
+                _agent = FindFirstObjectByType<NavigationAgent>(FindObjectsInactive.Include);
+            }
 
             if (_agent != null)
                 _teleportCoroutine = StartCoroutine(TeleportAgentWhenReady());
             else
-                Debug.LogWarning($"[StartPoint Level{_level}] ⚠️ ReteleportAgent: NavigationAgent no encontrado.");
+                Debug.LogWarning($"[StartPoint Level{_level}] ⚠️ ReteleportAgent: NavigationAgent no encontrado " +
+                                 $"(ni activo ni inactivo). Verifica que VirtualAssistant existe en la escena.");
         }
 
         public NavigationStartPointInfo GetInfo() => new NavigationStartPointInfo
@@ -184,12 +167,23 @@ namespace IndoorNavAR.Navigation
             if (_initialDelay > 0)
                 yield return new WaitForSeconds(_initialDelay);
 
-            _agent = FindFirstObjectByType<NavigationAgent>();
+            // ✅ FIX v6: FindObjectsInactive.Include — busca también en GameObjects
+            // inactivos. Necesario porque el VirtualAssistant vive dentro del
+            // XR Origin (Mobile AR), que puede estar inactivo hasta que AR Foundation
+            // inicialice la sesión AR. Sin este flag, FindFirstObjectByType devuelve
+            // null y el agente nunca llega al StartPoint.
+            _agent = FindFirstObjectByType<NavigationAgent>(FindObjectsInactive.Include);
+
             if (_agent == null)
             {
-                Debug.LogError($"[StartPoint Level{_level}] ❌ NavigationAgent no encontrado.");
+                Debug.LogError($"[StartPoint Level{_level}] ❌ NavigationAgent no encontrado " +
+                               $"(buscado en activos e inactivos). " +
+                               $"Verifica que el VirtualAssistant está en la escena y tiene NavigationAgent.");
                 yield break;
             }
+
+            Debug.Log($"[StartPoint Level{_level}] ✅ NavigationAgent encontrado: " +
+                      $"'{_agent.gameObject.name}' (activo={_agent.gameObject.activeInHierarchy})");
 
             // Esperar confirmación de posición del modelo
             if (!_modelPositionConfirmed)
@@ -227,6 +221,19 @@ namespace IndoorNavAR.Navigation
             // Frame extra para propagación
             yield return new WaitForSeconds(0.3f);
 
+            // Esperar a que el agente esté activo antes de teleportar
+            // (el XR Origin puede activarse después de que el NavMesh esté listo)
+            float activationWait = 0f;
+            while (!_agent.gameObject.activeInHierarchy && activationWait < 5f)
+            {
+                yield return new WaitForSeconds(0.1f);
+                activationWait += 0.1f;
+            }
+
+            if (!_agent.gameObject.activeInHierarchy)
+                Debug.LogWarning($"[StartPoint Level{_level}] ⚠️ NavigationAgent sigue inactivo tras 5s. " +
+                                 $"Intentando teleport de todas formas...");
+
             LogDiagnostics();
 
             bool success = TeleportToCorrectFloor();
@@ -242,13 +249,13 @@ namespace IndoorNavAR.Navigation
                                $"maxVerticalDeviation={_maxVerticalDeviation}m");
             }
 
-            _teleportCoroutine = null; // limpiar referencia al terminar
+            _teleportCoroutine = null;
         }
 
         private bool TeleportToCorrectFloor()
         {
             Vector3 myPos = transform.position;
-            float myY     = myPos.y;
+            float   myY   = myPos.y;
 
             float[] radii = { 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, _maxHorizontalRadius };
 
@@ -380,7 +387,6 @@ namespace IndoorNavAR.Navigation
         {
             if (!_showGizmo) return;
 
-            // ✅ FIX v5: Color diferente si autoTeleport está desactivado
             Gizmos.color = _hasTeleported ? Color.green
                          : _autoTeleportOnStart ? _gizmoColor
                          : new Color(_gizmoColor.r, _gizmoColor.g, _gizmoColor.b, 0.4f);
@@ -399,8 +405,8 @@ namespace IndoorNavAR.Navigation
             }
 
             Gizmos.color = new Color(_gizmoColor.r, _gizmoColor.g, _gizmoColor.b, 0.15f);
-            Gizmos.DrawWireSphere(pos + Vector3.up    * _maxVerticalDeviation, _maxHorizontalRadius * 0.5f);
-            Gizmos.DrawWireSphere(pos + Vector3.down  * _maxVerticalDeviation, _maxHorizontalRadius * 0.5f);
+            Gizmos.DrawWireSphere(pos + Vector3.up   * _maxVerticalDeviation, _maxHorizontalRadius * 0.5f);
+            Gizmos.DrawWireSphere(pos + Vector3.down * _maxVerticalDeviation, _maxHorizontalRadius * 0.5f);
 
 #if UNITY_EDITOR
             UnityEditor.Handles.Label(transform.position + Vector3.up * 0.5f,
@@ -422,7 +428,6 @@ namespace IndoorNavAR.Navigation
 
             Vector3 myPos = transform.position;
 
-            bool foundCorrectFloor = false;
             float[] radii = { 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, _maxHorizontalRadius };
             foreach (float r in radii)
             {
@@ -439,24 +444,9 @@ namespace IndoorNavAR.Navigation
                             $"NavMesh Y={hit.position.y:F2}m\n(ΔY={yDelta:F3}m, r={r}m)",
                             new GUIStyle { normal = new GUIStyleState { textColor = Color.cyan }, fontSize = 10 });
 #endif
-                        foundCorrectFloor = true;
                         break;
                     }
                 }
-            }
-
-            if (!foundCorrectFloor)
-            {
-#if UNITY_EDITOR
-                UnityEditor.Handles.Label(myPos + Vector3.up * 0.7f,
-                    $"⚠️ Sin NavMesh en Y={myPos.y:F2}m\n±{_maxVerticalDeviation:F1}m",
-                    new GUIStyle
-                    {
-                        normal    = new GUIStyleState { textColor = Color.red },
-                        fontSize  = 11,
-                        fontStyle = FontStyle.Bold
-                    });
-#endif
             }
         }
     }

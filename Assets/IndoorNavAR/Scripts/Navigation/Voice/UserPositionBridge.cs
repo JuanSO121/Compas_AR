@@ -1,42 +1,55 @@
 // File: UserPositionBridge.cs
 // Carpeta: Assets/IndoorNavAR/Scripts/Navigation/Voice/
+// v5 — Fix modo FullAR: expone AgentPosition para triggers de navegación
 //
-// ============================================================================
-//  USER POSITION BRIDGE — IndoorNavAR
-// ============================================================================
+// ══════════════════════════════════════════════════════════════════════════════
+// BUG CORREGIDO v4 → v5
+// ══════════════════════════════════════════════════════════════════════════════
 //
-//  PROPÓSITO:
-//    Expone la posición correcta del usuario en el espacio del modelo 3D
-//    según el modo activo (FullAR / No-AR), para que NavigationVoiceGuide
-//    y cualquier otro sistema consuman la posición sin saber en qué modo están.
+// SÍNTOMA:
+//   En modo FullAR los triggers de instrucciones (giros, escaleras) nunca se
+//   disparaban aunque el agente NPC avanzara correctamente por la ruta.
 //
-//  LÓGICA POR MODO (derivada de AROriginAligner):
+// CAUSA:
+//   NavigationVoiceGuide.EvaluateInstructions() usaba UserPos (posición de la
+//   cámara XR = usuario real) para evaluar distancias a los waypoints de la ruta.
+//   En FullAR el NPC es quien recorre el NavMesh. Si el usuario real no está en
+//   el mismo punto que el NPC, los triggers basados en distancia a waypoints
+//   nunca se cumplían. Resultado: instrucciones mudas durante toda la navegación.
 //
-//  FullAR (AROriginAligner.IsNoArMode == false):
-//    ARCore trackea la posición física del usuario. XROrigin.Camera.transform
-//    se mueve con el usuario real en el espacio del modelo 3D alineado.
-//    → UserPosition = XROrigin.Camera.transform.position
-//    → UserForward  = XROrigin.Camera.transform.forward (XZ aplanado)
+// FIX:
+//   • Nueva propiedad pública AgentPosition que devuelve la posición del
+//     _virtualAgentTransform independientemente del modo (FullAR o NoAR).
+//   • NavigationVoiceGuide.EvalPos usa esta propiedad en modo FullAR para
+//     evaluar los triggers de instrucciones de ruta.
+//   • UserPosition sigue siendo la posición de la cámara XR en FullAR
+//     (comportamiento correcto v4), usada para:
+//       - Detección de llegada al destino (el usuario real debe llegar)
+//       - Detección de parada (el usuario real se detiene)
+//       - Velocidad del usuario (UserSpeed)
+//   • En NoAR AgentPosition == UserPosition (sin cambio de comportamiento).
 //
-//  No-AR (AROriginAligner.IsNoArMode == true):
-//    AROriginAligner.FollowAgent() mueve el XROrigin para que siga al NPC.
-//    La cámara tiene la posición del NPC — no hay usuario físico real.
-//    → UserPosition = XROrigin.Camera.transform.position (= posición del NPC)
-//    → Resultado: el VoiceGuide se comporta igual que con el NPC, correcto.
+// RESUMEN DE FUENTES POR PROPIEDAD:
+//   ┌──────────────────┬─────────────────────┬──────────────────────┐
+//   │ Propiedad        │ FullAR              │ NoAR                 │
+//   ├──────────────────┼─────────────────────┼──────────────────────┤
+//   │ UserPosition     │ Cámara XR (usuario) │ Agente NPC           │
+//   │ UserForward      │ Cámara XR (usuario) │ Agente NPC           │
+//   │ UserSpeed        │ Cámara XR (usuario) │ Agente NPC           │
+//   │ AgentPosition    │ Agente NPC          │ Agente NPC           │
+//   └──────────────────┴─────────────────────┴──────────────────────┘
 //
-//  DETECCIÓN DEL MODO:
-//    Lee AROriginAligner.IsNoArMode (propiedad pública). No necesita ARSessionManager.
-//    Requiere añadir en AROriginAligner: public bool IsNoArMode => _noArMode;
+// ══════════════════════════════════════════════════════════════════════════════
+// BUG CORREGIDO v3 → v4 (conservado íntegramente)
+// ══════════════════════════════════════════════════════════════════════════════
 //
-//  MÉTRICAS EXPUESTAS:
-//    UserPosition  → posición en el espacio del modelo 3D
-//    UserForward   → dirección de la cámara aplanada en XZ
-//    UserSpeed     → velocidad de movimiento suavizada (m/s)
-//    IsNoArMode    → true si el dispositivo no tiene ARCore
+// SÍNTOMA: En NoAR, UserPosition era la cámara estática → triggers rotos.
+// FIX: En NoAR, GetActivePosition() devuelve _virtualAgentTransform.position.
 
 using UnityEngine;
 using Unity.XR.CoreUtils;
 using IndoorNavAR.AR;
+using IndoorNavAR.Agent;
 
 namespace IndoorNavAR.Navigation.Voice
 {
@@ -44,37 +57,63 @@ namespace IndoorNavAR.Navigation.Voice
     {
         public static UserPositionBridge Instance { get; private set; }
 
-        [Header("─── Referencias ─────────────────────────────────────────────")]
-        [Tooltip("XROrigin de la escena (XR Origin Mobile AR). Auto-detectado.")]
-        [SerializeField] private XROrigin         _xrOrigin;
+        // ── Inspector ─────────────────────────────────────────────────────────
 
-        [Tooltip("AROriginAligner para saber si estamos en modo No-AR. Auto-detectado.")]
-        [SerializeField] private AROriginAligner  _arOriginAligner;
+        [Header("Referencias AR")]
+        [SerializeField] private XROrigin        _xrOrigin;
+        [SerializeField] private AROriginAligner _arOriginAligner;
 
-        // ── Posición y orientación del usuario ────────────────────────────────
+        [Header("Agente Virtual (NoAR y FullAR)")]
+        [Tooltip("Transform del VirtualAssistant (agente NPC). " +
+                 "En NoAR: UserPosition sigue este objeto. " +
+                 "En FullAR: AgentPosition sigue este objeto (para triggers de ruta). " +
+                 "Si se deja vacío, se busca automáticamente el componente ARGuideController.")]
+        [SerializeField] private Transform _virtualAgentTransform;
+
+        // ── Métricas públicas ─────────────────────────────────────────────────
 
         /// <summary>
-        /// Posición del usuario en el espacio del modelo 3D.
-        /// FullAR: posición física real (ARCore tracking).
-        /// No-AR:  posición del NPC (XROrigin sigue al agente).
+        /// Posición del usuario real.
+        /// FullAR: posición de la cámara XR (usuario físico con el dispositivo).
+        /// NoAR:   posición del agente NPC (el agente representa al usuario).
         /// </summary>
         public Vector3 UserPosition { get; private set; }
 
-        /// <summary>Dirección de la cámara en XZ, normalizada.</summary>
+        /// <summary>
+        /// Orientación del usuario real (plana, sin componente Y).
+        /// FullAR: forward de la cámara XR.
+        /// NoAR:   forward del agente NPC.
+        /// </summary>
         public Vector3 UserForward  { get; private set; } = Vector3.forward;
 
         /// <summary>
-        /// Velocidad de movimiento suavizada (m/s).
-        /// Útil para distinguir quieto vs caminando en los escenarios de accesibilidad.
+        /// Velocidad de movimiento del usuario real (m/s, suavizada).
         /// </summary>
-        public float UserSpeed { get; private set; }
+        public float   UserSpeed    { get; private set; }
 
-        /// <summary>True si el dispositivo no tiene ARCore (modo No-AR activo).</summary>
+        /// <summary>
+        /// ✅ v5 — Posición del agente NPC, independientemente del modo.
+        ///
+        /// Usada por NavigationVoiceGuide.EvalPos en FullAR para evaluar
+        /// los triggers de instrucciones de ruta (giros, escaleras).
+        ///
+        /// En FullAR: posición del _virtualAgentTransform (NPC que recorre el NavMesh).
+        /// En NoAR:   igual que UserPosition (el NPC ES el usuario en NoAR).
+        ///
+        /// Si _virtualAgentTransform no está disponible, devuelve UserPosition
+        /// como fallback seguro.
+        /// </summary>
+        public Vector3 AgentPosition => _virtualAgentTransform != null
+            ? _virtualAgentTransform.position
+            : UserPosition;
+
         public bool IsNoArMode => _arOriginAligner != null && _arOriginAligner.IsNoArMode;
 
         // ── Privado ────────────────────────────────────────────────────────────
-        private Vector3 _prevPosition;
-        private float   _speedSmoothVelocity;
+
+        private Vector3   _prevPosition;
+        private Transform _cameraTransform;
+        private const float SpeedLerpFactor = 0.18f;
 
         // ─────────────────────────────────────────────────────────────────────
         //  LIFECYCLE
@@ -94,28 +133,59 @@ namespace IndoorNavAR.Navigation.Voice
             if (_arOriginAligner == null)
                 _arOriginAligner = FindFirstObjectByType<AROriginAligner>();
 
-            if (_xrOrigin == null)
-                Debug.LogWarning("[UserPositionBridge] ⚠️ XROrigin no encontrado.");
+            // Cache del transform de cámara XR (usado en FullAR para UserPosition)
+            _cameraTransform = _xrOrigin?.Camera?.transform ?? Camera.main?.transform;
+
+            if (_cameraTransform == null)
+                Debug.LogWarning("[UserPositionBridge] ⚠️ Camera transform no encontrado.");
 
             if (_arOriginAligner == null)
-                Debug.LogWarning("[UserPositionBridge] ⚠️ AROriginAligner no encontrado. " +
-                                 "IsNoArMode siempre será false (FullAR asumido).");
+                Debug.LogWarning("[UserPositionBridge] ⚠️ AROriginAligner no encontrado.");
 
-            _prevPosition = GetCameraPosition();
+            // Buscar el agente virtual automáticamente si no fue asignado en Inspector.
+            // ✅ FindObjectsInactive.Include: el VirtualAssistant puede estar inactivo
+            // al inicio si el NavMesh aún no está listo o si vive dentro del XR Origin.
+            if (_virtualAgentTransform == null)
+            {
+                var guide = FindFirstObjectByType<ARGuideController>(FindObjectsInactive.Include);
+                if (guide != null)
+                {
+                    _virtualAgentTransform = guide.transform;
+                    Debug.Log($"[UserPositionBridge] ✅ Agente virtual encontrado: '{guide.gameObject.name}'");
+                }
+                else
+                {
+                    Debug.LogWarning("[UserPositionBridge] ⚠️ ARGuideController no encontrado " +
+                                     "(ni activo ni inactivo). AgentPosition usará UserPosition como fallback.");
+                }
+            }
+
+            _prevPosition = GetActivePosition();
             UserPosition  = _prevPosition;
+
+            string mode   = IsNoArMode ? "NoAR" : "FullAR";
+            string srcUser = IsNoArMode && _virtualAgentTransform != null
+                ? $"agente '{_virtualAgentTransform.gameObject.name}'"
+                : $"camara '{_cameraTransform?.gameObject.name ?? "NULL"}'";
+            string srcAgent = _virtualAgentTransform != null
+                ? $"agente '{_virtualAgentTransform.gameObject.name}'"
+                : "fallback (UserPosition)";
+
+            Debug.Log($"[UserPositionBridge] ✅ Iniciado." +
+                      $"\n  Modo:           {mode}" +
+                      $"\n  UserPosition ←  {srcUser}" +
+                      $"\n  AgentPosition ← {srcAgent}");
         }
 
         private void Update()
         {
-            Vector3 pos = GetCameraPosition();
-            Vector3 fwd = GetCameraForward();
+            Vector3 pos = GetActivePosition();
 
-            // Velocidad suavizada para detectar si el usuario está quieto o caminando
-            float rawSpeed = Vector3.Distance(pos, _prevPosition) / Mathf.Max(Time.deltaTime, 0.0001f);
-            UserSpeed     = Mathf.SmoothDamp(UserSpeed, rawSpeed, ref _speedSmoothVelocity, 0.12f);
+            float rawSpeed = Vector3.Distance(pos, _prevPosition) / (Time.deltaTime + 0.0001f);
+            UserSpeed      = Mathf.Lerp(UserSpeed, rawSpeed, SpeedLerpFactor);
 
             UserPosition  = pos;
-            UserForward   = fwd;
+            UserForward   = GetActiveForward();
             _prevPosition = pos;
         }
 
@@ -128,52 +198,94 @@ namespace IndoorNavAR.Navigation.Voice
         //  HELPERS PRIVADOS
         // ─────────────────────────────────────────────────────────────────────
 
-        private Vector3 GetCameraPosition()
+        /// <summary>
+        /// Posición del "usuario" para métricas de movimiento (parada, velocidad, llegada).
+        ///
+        /// FullAR: cámara XR (usuario real con el dispositivo en mano).
+        ///         En FullAR el usuario se mueve físicamente → la cámara se mueve.
+        ///
+        /// NoAR:   agente NPC (sin cámara XR real, el agente representa al usuario).
+        ///
+        /// NOTA: Esta función NO se usa para los triggers de instrucciones de ruta.
+        ///       Para eso, NavigationVoiceGuide usa AgentPosition (propiedad pública).
+        /// </summary>
+        private Vector3 GetActivePosition()
         {
-            if (_xrOrigin != null && _xrOrigin.Camera != null)
-                return _xrOrigin.Camera.transform.position;
+            if (IsNoArMode && _virtualAgentTransform != null)
+                return _virtualAgentTransform.position;
 
-            // Fallback: Camera.main (no debería llegar aquí si la escena está bien)
-            return Camera.main != null ? Camera.main.transform.position : Vector3.zero;
+            return _cameraTransform != null ? _cameraTransform.position : Vector3.zero;
         }
 
-        private Vector3 GetCameraForward()
+        /// <summary>
+        /// Orientación del "usuario" para instrucciones de giro recalculadas.
+        ///
+        /// FullAR: forward de la cámara XR (dirección a la que mira el usuario real).
+        /// NoAR:   forward del agente NPC.
+        /// </summary>
+        private Vector3 GetActiveForward()
         {
-            Transform camT = _xrOrigin?.Camera?.transform ?? Camera.main?.transform;
-            if (camT == null) return Vector3.forward;
+            Transform src = (IsNoArMode && _virtualAgentTransform != null)
+                ? _virtualAgentTransform
+                : _cameraTransform;
 
-            Vector3 f = camT.forward;
+            if (src == null) return Vector3.forward;
+            Vector3 f = src.forward;
             f.y = 0f;
             return f.sqrMagnitude > 0.001f ? f.normalized : Vector3.forward;
         }
 
         // ─────────────────────────────────────────────────────────────────────
-        //  GIZMOS
+        //  GIZMOS — solo en Editor
         // ─────────────────────────────────────────────────────────────────────
 
-        #if UNITY_EDITOR
+#if UNITY_EDITOR
         private void OnDrawGizmos()
         {
             if (!Application.isPlaying) return;
+
+            // UserPosition: azul/amarillo según modo
             Gizmos.color = IsNoArMode ? Color.yellow : Color.cyan;
             Gizmos.DrawWireSphere(UserPosition, 0.25f);
-            Gizmos.color = Color.blue;
+            Gizmos.color = IsNoArMode ? new Color(1f, 0.8f, 0f) : Color.blue;
             Gizmos.DrawLine(UserPosition, UserPosition + UserForward * 0.7f);
+
+            // AgentPosition: verde si difiere de UserPosition (FullAR con NPC separado)
+            Vector3 agentPos = AgentPosition;
+            if (Vector3.Distance(agentPos, UserPosition) > 0.1f)
+            {
+                Gizmos.color = Color.green;
+                Gizmos.DrawWireSphere(agentPos, 0.2f);
+                Gizmos.DrawLine(UserPosition, agentPos);
+            }
         }
-        #endif
+#endif
 
         // ─────────────────────────────────────────────────────────────────────
         //  DEBUG
         // ─────────────────────────────────────────────────────────────────────
 
-        [ContextMenu("ℹ️ Estado")]
+        [ContextMenu("Info Estado")]
         private void DebugInfo()
         {
-            Debug.Log($"[UserPositionBridge] Mode={( IsNoArMode ? "NoAR" : "FullAR")}\n" +
-                      $"UserPosition={UserPosition:F2} | UserForward={UserForward:F2}\n" +
-                      $"UserSpeed={UserSpeed:F2}m/s\n" +
-                      $"XROrigin='{_xrOrigin?.gameObject.name ?? "NULL"}'\n" +
-                      $"AROriginAligner='{_arOriginAligner?.gameObject.name ?? "NULL"}'");
+            string srcUser = IsNoArMode && _virtualAgentTransform != null
+                ? $"Agente '{_virtualAgentTransform.gameObject.name}'"
+                : $"Camara '{_cameraTransform?.gameObject.name ?? "NULL"}'";
+
+            string srcAgent = _virtualAgentTransform != null
+                ? $"Agente '{_virtualAgentTransform.gameObject.name}'"
+                : "Fallback (UserPosition)";
+
+            Debug.Log($"[UserPositionBridge] ==================\n" +
+                      $"  Modo:            {(IsNoArMode ? "NoAR" : "FullAR")}\n" +
+                      $"  UserPosition ←   {srcUser}\n" +
+                      $"  AgentPosition ←  {srcAgent}\n" +
+                      $"  UserPosition:    {UserPosition:F2}\n" +
+                      $"  AgentPosition:   {AgentPosition:F2}\n" +
+                      $"  UserForward:     {UserForward:F2}\n" +
+                      $"  UserSpeed:       {UserSpeed:F2} m/s\n" +
+                      $"  Separación NPC:  {Vector3.Distance(UserPosition, AgentPosition):F2}m\n" +
+                      $"==========================================");
         }
     }
 }

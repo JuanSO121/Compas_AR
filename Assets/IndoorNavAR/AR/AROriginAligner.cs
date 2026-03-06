@@ -1,36 +1,63 @@
 // File: AROriginAligner.cs
-// ✅ FIX v3 — Modo No-AR se activa automáticamente sin necesitar ModelLoadedEvent.
+// ✅ v6 — FullAR: agente ACTIVO e INVISIBLE, sincronizado con cámara XR.
+//         El agente NO se mueve por su cuenta en FullAR.
 //
-//  PROBLEMA CORREGIDO (v2 → v3):
-//    En el flujo de sesión guardada, NavigationManager.InitializeFromSavedSession()
-//    llama directamente a PersistenceManager.LoadSession() sin publicar
-//    ModelLoadedEvent. Por tanto, OnModelLoaded() nunca se disparaba,
-//    AlignWhenReady() nunca corría y el modo No-AR nunca se activaba
-//    a menos que el usuario lo forzara manualmente desde el Inspector.
+// ============================================================================
+//  PROBLEMA CORREGIDO (v5 → v6)
+// ============================================================================
 //
-//  FIX v3:
-//    - En Start(), se lanza InitializeCapabilityAsync() que espera a que
-//      ARCapabilityDetector termine su detección y activa el modo No-AR
-//      si corresponde, INDEPENDIENTEMENTE de si llega un ModelLoadedEvent.
-//    - ModelLoadedEvent sigue siendo atendido para el flujo de carga de
-//      modelo nuevo (sin sesión guardada), pero ahora también se suscribe
-//      a NavMeshReadyForAlignmentEvent para poder alinear al StartPoint
-//      cuando el NavMesh ya está inyectado en el flujo de sesión guardada.
-//    - Se añade método público NotifySessionRestored() para que
-//      NavigationManager lo llame al final de InitializeFromSavedSession(),
-//      disparando la alineación post-restauración.
+//  En v5 el agente se DESACTIVABA en FullAR con DisableAgentForFullAR().
+//  Esto causaba una cadena de fallos:
 //
-//  COMPORTAMIENTO POR MODO:
-//    FullAR / ARWithoutPlanes → comportamiento original: AR tracking + alineación StartPoint
-//    NoAR                     → XR Origin sigue al agente cada frame (modo espectador)
+//    1. NavigationStartPoint.TeleportAgentWhenReady() es una corrutina en
+//       NavigationStartPoint (MonoBehaviour). Al desactivar el agente, la
+//       corrutina NUNCA se ejecuta → el agente nunca llega al StartPoint.
 //
-//  INTEGRACIÓN:
-//    NavigationManager debe llamar _arOriginAligner.NotifySessionRestored()
-//    al final de InitializeFromSavedSession() para disparar la alineación.
+//    2. NavigationPathController necesita el NavMeshAgent activo para
+//       calcular la ruta. Con el agente desactivado, NavigateTo() falla
+//       silenciosamente → CurrentPath queda null.
+//
+//    3. NavigationVoiceGuide.WaitForPath() hace timeout porque CurrentPath
+//       es null → _isGuiding queda false → sin instrucciones de voz.
+//
+//  SOLUCIÓN v6:
+//    • El agente permanece ACTIVO en FullAR para que todos los MonoBehaviour
+//      (NavigationAgent, NavMeshAgent, corrutinas) sigan ejecutándose.
+//    • Se hace INVISIBLE desactivando sus Renderers (el usuario no lo ve).
+//    • Cada frame, AROriginAligner mueve el agente al NavMesh más cercano
+//      a la cámara XR mediante SyncAgentToCameraFullAR().
+//    • El NavMeshAgent propio del agente se mantiene DETENIDO en FullAR
+//      (isStopped = true) para que el agente NO camine solo hacia el destino.
+//      La lógica de movimiento autónomo es solo para NoAR.
+//    • NavigationPathController puede calcular rutas desde la posición real
+//      del usuario porque el agente está en esa posición.
+//    • NavigationVoiceGuide.EvalPos usa AgentPosition (= posición real del
+//      usuario en FullAR) para los triggers de instrucciones de ruta.
+//
+// ============================================================================
+//  ARQUITECTURA POR MODO (actualizada)
+// ============================================================================
+//
+//  ── MODO FullAR ──────────────────────────────────────────────────────────
+//    ARCore trackea la posición física del usuario (cámara XR).
+//    El NavigationAgent está ACTIVO pero INVISIBLE.
+//    Su NavMeshAgent está DETENIDO (isStopped=true) → no camina solo.
+//    AROriginAligner.SyncAgentToCameraFullAR() mueve el agente al NavMesh
+//    más cercano a la cámara cada frame.
+//    NavigationPathController calcula la ruta desde esa posición.
+//    NavigationVoiceGuide genera instrucciones de voz basadas en la posición
+//    real del usuario (agente = usuario en FullAR).
+//    ARGuideController detecta FullAR y desactiva su lógica de movimiento.
+//
+//  ── MODO NoAR ────────────────────────────────────────────────────────────
+//    Sin ARCore. El agente ES el usuario virtual, está ACTIVO y VISIBLE.
+//    La cámara sigue al agente (FollowAgent).
+//    ARGuideController gestiona el movimiento del agente hacia el destino.
+//    Las instrucciones de voz se basan en la posición del agente.
 
 using System.Collections;
-using System.Threading.Tasks;
 using UnityEngine;
+using UnityEngine.AI;
 using UnityEngine.XR.ARFoundation;
 using IndoorNavAR.Core.Events;
 using IndoorNavAR.Navigation;
@@ -40,74 +67,75 @@ namespace IndoorNavAR.AR
 {
     public class AROriginAligner : MonoBehaviour
     {
-        [Header("─── Referencias ────────────────────────────────────────")]
-        [SerializeField] private XROrigin         _xrOrigin;
-        [SerializeField] private NavigationAgent  _navigationAgent;
+        [Header("─── Referencias ────────────────────────────────────────────")]
+        [SerializeField] private XROrigin        _xrOrigin;
+        [SerializeField] private NavigationAgent _navigationAgent;
 
-        [Header("─── Configuración AR ──────────────────────────────────")]
+        [Header("─── Configuración ─────────────────────────────────────────")]
         [Tooltip("Nivel del modelo al que buscar el StartPoint (normalmente 0).")]
-        [SerializeField] private int   _targetLevel       = 0;
+        [SerializeField] private int _targetLevel = 0;
 
-        [Tooltip("Altura adicional sobre el StartPoint para colocar la cámara AR.")]
-        [SerializeField] private float _eyeHeightOffset   = 1.6f;
+        [Tooltip("Altura adicional sobre el StartPoint para la alineación inicial del XR Origin (FullAR).")]
+        [SerializeField] private float _eyeHeightOffset = 1.6f;
 
-        [Tooltip("Si true, se realinea cada vez que se carga un modelo nuevo vía EventBus.")]
-        [SerializeField] private bool  _autoAlignOnLoad   = true;
+        [Tooltip("Frames de espera después de que el modelo se carga antes de inicializar.")]
+        [SerializeField] private int _delayFrames = 2;
 
-        [Tooltip("Si true, también teleporta el NavigationAgent al StartPoint.")]
-        [SerializeField] private bool  _teleportAgent     = true;
+        [Header("─── Modo NoAR — Seguimiento del agente ─────────────────────")]
+        [Tooltip("Offset vertical de la cámara sobre el agente.")]
+        [SerializeField] private float _noArCameraHeight = 1.65f;
 
-        [Tooltip("Frames de espera después de que el modelo se carga antes de alinear.")]
-        [SerializeField] private int   _delayFrames       = 2;
+        [Tooltip("Offset en profundidad hacia atrás del agente (0 = primera persona).")]
+        [SerializeField] private float _noArCameraBack = 0.0f;
 
-        [Header("─── Modo No-AR (fallback) ─────────────────────────────")]
-        [Tooltip("Offset vertical de la cámara sobre el agente en modo No-AR.")]
-        [SerializeField] private float _noArCameraHeight  = 1.65f;
+        [Tooltip("Ángulo de inclinación hacia abajo de la cámara (grados).")]
+        [SerializeField] private float _noArPitchAngle = 0.0f;
 
-        [Tooltip("Offset en profundidad (hacia atrás del agente) para vista en 3ª persona.")]
-        [SerializeField] private float _noArCameraBack    = 0.0f;
-
-        [Tooltip("Ángulo de inclinación hacia abajo de la cámara en modo No-AR (grados).")]
-        [SerializeField] private float _noArPitchAngle    = 0.0f;
-
-        [Tooltip("Suavizado del seguimiento (0 = instantáneo, valores altos = más suave).")]
-        [SerializeField] private float _noArFollowSmooth  = 8f;
+        [Tooltip("Suavizado del seguimiento (0 = instantáneo).")]
+        [SerializeField] private float _noArFollowSmooth = 8f;
 
         [Tooltip("Si true, la cámara rota para seguir la dirección del agente.")]
-        [SerializeField] private bool  _noArFollowRotation = true;
+        [SerializeField] private bool _noArFollowRotation = true;
 
-        [Header("─── Debug ──────────────────────────────────────────────")]
+        [Header("─── Modo FullAR — Sincronización agente con cámara ─────────")]
+        [Tooltip("Radio de búsqueda en el NavMesh al sincronizar el agente con la cámara (m). " +
+                 "Aumentar si el modelo tiene suelos gruesos o está muy escalado.")]
+        [SerializeField] private float _fullArSnapRadius = 3.0f;
+
+        [Tooltip("Distancia mínima de movimiento de la cámara para re-sincronizar el agente (m). " +
+                 "Evita Warp innecesarios cuando la cámara apenas se mueve.")]
+        [SerializeField] private float _fullArSyncThreshold = 0.05f;
+
+        [Header("─── Debug ──────────────────────────────────────────────────")]
         [SerializeField] private bool _logAlignment = true;
 
         // ─── Estado interno ────────────────────────────────────────────────
-        private bool               _aligned      = false;
-        private bool               _noArMode     = false;
-        private bool               _followActive = false;
-        private bool               _capabilityResolved = false; // ✅ FIX v3
+
+        private bool _noArMode           = false;
+        private bool _followActive       = false;
+        private bool _capabilityResolved = false;
+        private bool _initialAlignDone   = false;
         private ARCapabilityDetector _capDetector;
+
+        // FullAR: posición de cámara en el último frame de sincronización
+        private Vector3 _lastSyncedCameraPos = new Vector3(float.PositiveInfinity, 0, 0);
+
+        // Referencia cacheada al NavMeshAgent del agente
+        private NavMeshAgent _agentNavMeshAgent;
+
+        // ─── Propiedades públicas ──────────────────────────────────────────
+
+        /// <summary>True si el dispositivo no tiene ARCore (modo sin AR).</summary>
+        public bool IsNoArMode   => _noArMode;
+        public bool IsFullARMode => !_noArMode;
 
         #region Unity Lifecycle
 
-        private void Awake()
-        {
-            FindComponents();
-        }
+        private void Awake() => FindComponents();
 
-        private void Start()
-        {
-            // ✅ FIX v3: Resolver capacidad AR automáticamente en Start(),
-            // sin esperar ningún evento externo. Esto garantiza que el modo
-            // No-AR se activa aunque no llegue ModelLoadedEvent (flujo de
-            // sesión guardada) y aunque el usuario no pulse nada en el Inspector.
-            StartCoroutine(InitializeCapabilityRoutine());
-        }
+        private void Start() => StartCoroutine(InitializeCapabilityRoutine());
 
-        private void OnEnable()
-        {
-            if (_autoAlignOnLoad)
-                EventBus.Instance?.Subscribe<ModelLoadedEvent>(OnModelLoaded);
-        }
-
+        private void OnEnable()  => EventBus.Instance?.Subscribe<ModelLoadedEvent>(OnModelLoaded);
         private void OnDisable()
         {
             EventBus.Instance?.Unsubscribe<ModelLoadedEvent>(OnModelLoaded);
@@ -116,8 +144,16 @@ namespace IndoorNavAR.AR
 
         private void Update()
         {
+            // NoAR: la cámara sigue al agente
             if (_followActive && _noArMode)
+            {
                 FollowAgent();
+                return;
+            }
+
+            // FullAR: el agente sigue a la cámara (posición del usuario real)
+            if (!_noArMode && _initialAlignDone)
+                SyncAgentToCameraFullAR();
         }
 
         #endregion
@@ -128,37 +164,29 @@ namespace IndoorNavAR.AR
         {
             if (_xrOrigin == null)
                 _xrOrigin = FindFirstObjectByType<XROrigin>();
-
             if (_navigationAgent == null)
                 _navigationAgent = FindFirstObjectByType<NavigationAgent>();
+
+            if (_navigationAgent != null)
+                _agentNavMeshAgent = _navigationAgent.GetComponent<NavMeshAgent>();
 
             _capDetector = ARCapabilityDetector.Instance
                         ?? FindFirstObjectByType<ARCapabilityDetector>();
 
             if (_xrOrigin == null)
                 Debug.LogWarning("[AROriginAligner] ⚠️ XROrigin no encontrado.");
-
             if (_capDetector == null)
                 Debug.LogWarning("[AROriginAligner] ⚠️ ARCapabilityDetector no encontrado — asumiendo FullAR.");
         }
 
         #endregion
 
-        #region Capability Initialization (FIX v3)
+        #region Capability Initialization
 
-        /// <summary>
-        /// Corre en Start(). Espera a que ARCapabilityDetector termine,
-        /// luego configura el modo (FullAR o No-AR) sin depender de eventos externos.
-        /// Si el modo es No-AR, activa el seguimiento inmediatamente.
-        /// Si el modo es FullAR/ARWithoutPlanes, espera a que llegue ModelLoadedEvent
-        /// o a que NotifySessionRestored() sea llamado externamente.
-        /// </summary>
         private IEnumerator InitializeCapabilityRoutine()
         {
-            // Esperar al menos un frame para que Awake() de otros componentes termine
             yield return null;
 
-            // Esperar a que ARCapabilityDetector resuelva la detección
             if (_capDetector != null)
                 yield return _capDetector.WaitUntilReady();
 
@@ -166,35 +194,117 @@ namespace IndoorNavAR.AR
                 ? _capDetector.Current
                 : ARCapabilityLevel.FullAR;
 
-            Log($"📡 [Start] Capacidad AR resuelta: {level}");
             _capabilityResolved = true;
+            Log($"📡 [Start] Capacidad AR: {level}");
 
             if (level == ARCapabilityLevel.NoAR)
             {
-                Log("📵 [Start] Dispositivo sin ARCore → activando modo No-AR automáticamente.");
                 _noArMode = true;
+                Log("📵 Modo NoAR — agente ES el usuario virtual (activo y visible).");
 
-                // Si ya hay un modelo cargado (sesión restaurada), activar seguimiento.
-                // Si no, ActivateNoArMode() se llamará cuando llegue ModelLoadedEvent
-                // o NotifySessionRestored().
+                // NoAR: PathController en modo movimiento activo
+                if (_navigationAgent != null)
+                {
+                    var pc = _navigationAgent.GetComponent<NavigationPathController>();
+                    pc?.SetFullARMode(false);
+                }
+
+                var arSession = FindFirstObjectByType<ARSession>();
+                if (arSession != null) { arSession.enabled = false; Log("📵 ARSession desactivada."); }
+
+                var planeManager = FindFirstObjectByType<ARPlaneManager>();
+                if (planeManager != null) { planeManager.enabled = false; Log("📵 ARPlaneManager desactivado."); }
+
+                // NoAR: agente activo y VISIBLE
+                SetAgentActiveAndVisible(makeVisible: true);
+
                 var modelMgr = FindFirstObjectByType<IndoorNavAR.Core.Managers.ModelLoadManager>();
                 if (modelMgr != null && modelMgr.IsModelLoaded)
-                {
-                    Log("📵 [Start] Modelo ya cargado → activando seguimiento No-AR ahora.");
                     ActivateNoArMode();
-                }
-                else
-                {
-                    Log("📵 [Start] Modo No-AR configurado. Esperando modelo para activar seguimiento...");
-                    // El seguimiento se activará cuando llegue ModelLoadedEvent o NotifySessionRestored()
-                }
             }
             else
             {
-                _noArMode = false;
+                _noArMode     = false;
                 _followActive = false;
-                Log($"📡 [Start] Modo AR normal ({level}) — listo para alinear cuando llegue el modelo.");
+
+                Log("📡 Modo FullAR — agente ACTIVO e INVISIBLE, sincronizado con cámara XR.");
+                Log("📡 El agente NO caminará solo: isStopped=true hasta que se inicie navegación.");
+
+                // ✅ CRÍTICO: Activar modo FullAR en PathController AHORA.
+                // Esto garantiza que FollowPath() nunca mueva el transform,
+                // incluso antes de la primera llamada a NavigateToWaypoint().
+                if (_navigationAgent != null)
+                {
+                    var pc = _navigationAgent.GetComponent<NavigationPathController>();
+                    if (pc != null)
+                    {
+                        pc.SetFullARMode(true);
+                        Log("✅ PathController.SetFullARMode(true) — movimiento del agente bloqueado.");
+                    }
+                    else
+                    {
+                        Debug.LogWarning("[AROriginAligner] ⚠️ NavigationPathController no encontrado " +
+                                         "en VirtualAssistant. El agente podría moverse en FullAR.");
+                    }
+                }
+
+                // FullAR: agente activo pero INVISIBLE y DETENIDO
+                // - Activo: para que NavigationStartPoint, NavMeshAgent y
+                //   NavigationPathController funcionen correctamente.
+                // - Invisible: el usuario no debe ver al NPC.
+                // - Detenido: el agente no debe moverse por su cuenta.
+                SetAgentActiveAndVisible(makeVisible: false);
+                StopAgentMovement();
+
+                if (level == ARCapabilityLevel.ARWithoutPlanes)
+                {
+                    var pm = FindFirstObjectByType<ARPlaneManager>();
+                    if (pm != null) { pm.enabled = false; Log("📡 ARPlaneManager desactivado."); }
+                }
             }
+        }
+
+        /// <summary>
+        /// Activa el GameObject del agente (siempre) y controla la visibilidad
+        /// de sus Renderers sin desactivar el GameObject. Así todos los
+        /// MonoBehaviour siguen ejecutándose independientemente del modo.
+        /// </summary>
+        private void SetAgentActiveAndVisible(bool makeVisible)
+        {
+            if (_navigationAgent == null) return;
+
+            // Garantizar que el GameObject esté activo
+            if (!_navigationAgent.gameObject.activeSelf)
+            {
+                _navigationAgent.gameObject.SetActive(true);
+                Log($"✅ Agente activado (estaba desactivado).");
+            }
+
+            // Controlar visibilidad mediante Renderers
+            foreach (var r in _navigationAgent.GetComponentsInChildren<Renderer>(true))
+                r.enabled = makeVisible;
+
+            Log(makeVisible
+                ? "👁️ Agente VISIBLE (NoAR)."
+                : "🙈 Agente INVISIBLE (FullAR) — Renderers desactivados, MonoBehaviour activos.");
+        }
+
+        /// <summary>
+        /// En FullAR, detiene el movimiento autónomo del NavMeshAgent.
+        /// El agente nunca debe caminar hacia el destino en FullAR;
+        /// solo existe para que NavigationPathController calcule rutas.
+        /// </summary>
+        private void StopAgentMovement()
+        {
+            if (_agentNavMeshAgent == null) return;
+
+            if (_agentNavMeshAgent.enabled && _agentNavMeshAgent.isOnNavMesh)
+            {
+                _agentNavMeshAgent.isStopped = true;
+                _agentNavMeshAgent.ResetPath();
+            }
+
+            Log("🛑 [FullAR] NavMeshAgent detenido — el agente no caminará autónomamente.");
         }
 
         #endregion
@@ -203,92 +313,65 @@ namespace IndoorNavAR.AR
 
         private void OnModelLoaded(ModelLoadedEvent evt)
         {
-            Log($"📦 Modelo cargado: {evt.ModelName} → alineando en {_delayFrames} frames...");
-            StartCoroutine(AlignWhenReady());
+            Log($"📦 Modelo cargado: {evt.ModelName}");
+            StartCoroutine(HandleModelReady());
         }
 
         #endregion
 
         #region Public API
 
-        [ContextMenu("🎯 Alinear al StartPoint ahora")]
-        public void AlignToStartPoint()
-        {
-            StartCoroutine(AlignAfterFrames(1));
-        }
+        /// <summary>Llamar desde NavigationManager al final de InitializeFromSavedSession().</summary>
+        public void NotifySessionRestored() => StartCoroutine(HandleModelReady());
 
+        /// <summary>
+        /// FullAR: alinea XR Origin al StartPoint una sola vez (si no se hizo ya).
+        /// NoAR: activa seguimiento del agente.
+        /// </summary>
+        public void AlignToStartPoint() => StartCoroutine(HandleModelReady());
+
+        /// <summary>Fuerza nueva alineación inicial. Útil si el modelo fue recargado.</summary>
         public void ForceRealign()
         {
-            _aligned = false;
-            AlignToStartPoint();
-        }
-
-        /// <summary>
-        /// True si el dispositivo no tiene ARCore y la cámara sigue al agente NPC.
-        /// Leído por UserPositionBridge para diagnóstico y logging.
-        /// </summary>
-        public bool IsNoArMode => _noArMode;
-
-        /// <summary>
-        /// True si ARCore está activo (inverso de IsNoArMode).
-        /// </summary>
-        public bool IsFullARMode => !_noArMode;
-
-        /// <summary>
-        /// ✅ FIX v3: Llamar desde NavigationManager al final de InitializeFromSavedSession().
-        /// </summary>
-        public void NotifySessionRestored()
-        {
-            Log("📂 NotifySessionRestored() recibido.");
-            StartCoroutine(AlignWhenReady());
+            if (!_noArMode) _initialAlignDone = false;
+            StartCoroutine(HandleModelReady());
         }
 
         #endregion
 
-        #region Core Alignment
+        #region Core Logic
 
-        /// <summary>
-        /// Espera a que ARCapabilityDetector esté listo, luego decide qué modo usar.
-        /// </summary>
-        private IEnumerator AlignWhenReady()
+        private IEnumerator HandleModelReady()
         {
-            // Esperar frames configurados
             for (int i = 0; i < _delayFrames; i++)
                 yield return null;
 
-            // Si el detector aún no terminó, esperar
             if (_capDetector != null && !_capabilityResolved)
                 yield return _capDetector.WaitUntilReady();
 
-            // Decidir modo (puede haber sido resuelto ya por InitializeCapabilityRoutine)
             ARCapabilityLevel level = _capDetector != null
                 ? _capDetector.Current
                 : ARCapabilityLevel.FullAR;
 
-            Log($"📡 [AlignWhenReady] Modo AR: {level}");
-
             if (level == ARCapabilityLevel.NoAR)
             {
-                Log("📵 Dispositivo sin ARCore → activando modo seguimiento de agente.");
                 _noArMode = true;
                 ActivateNoArMode();
             }
             else
             {
-                _noArMode = false;
+                _noArMode     = false;
                 _followActive = false;
-                PerformAlignment();
+                AlignXROriginOnce();
             }
         }
 
-        private IEnumerator AlignAfterFrames(int frames)
-        {
-            for (int i = 0; i < frames; i++)
-                yield return null;
-            PerformAlignment();
-        }
-
-        private void PerformAlignment()
+        /// <summary>
+        /// FullAR: posiciona XR Origin en StartPoint UNA SOLA VEZ al inicio.
+        /// El agente permanece activo e invisible, detenido, esperando la primera
+        /// sincronización con la cámara XR en el siguiente Update().
+        /// </summary>
+        private void AlignXROriginOnce()
         {
             if (_xrOrigin == null)
             {
@@ -299,31 +382,34 @@ namespace IndoorNavAR.AR
             var startPoint = NavigationStartPointManager.GetStartPointForLevel(_targetLevel);
             if (startPoint == null)
             {
-                Debug.LogWarning($"[AROriginAligner] ⚠️ No hay NavigationStartPoint para nivel {_targetLevel}.");
+                Debug.LogWarning($"[AROriginAligner] ⚠️ No hay StartPoint para nivel {_targetLevel}.");
                 return;
             }
 
             startPoint.ConfirmModelPositioned();
 
-            Vector3 startWorldPos    = startPoint.transform.position;
-            Vector3 targetCameraPos  = startWorldPos + Vector3.up * _eyeHeightOffset;
-            _xrOrigin.MoveCameraToWorldLocation(targetCameraPos);
-
-            Log($"✅ XR Origin alineado → cámara en {targetCameraPos}");
-
-            if (_teleportAgent && _navigationAgent != null)
+            if (!_initialAlignDone)
             {
-                bool ok = _navigationAgent.TeleportTo(startWorldPos);
-                if (ok)  Log($"✅ NavigationAgent teleportado a {startWorldPos}");
-                else     Debug.LogWarning("[AROriginAligner] ⚠️ TeleportTo falló — ¿NavMesh activo?");
+                Vector3 targetPos = startPoint.transform.position + Vector3.up * _eyeHeightOffset;
+                _xrOrigin.MoveCameraToWorldLocation(targetPos);
+                _initialAlignDone    = true;
+                _lastSyncedCameraPos = new Vector3(float.PositiveInfinity, 0, 0); // forzar primera sync
+
+                Log($"✅ [FullAR] XR Origin → {targetPos}. ARCore toma control.");
+                Log("✅ [FullAR] La sincronización agente↔cámara comenzará en el próximo Update().");
+            }
+            else
+            {
+                Log("📡 [FullAR] Alineación ya realizada — XR Origin intocado.");
             }
 
-            startPoint.ReteleportAgent();
-            _aligned = true;
+            // Garantizar estado correcto del agente
+            SetAgentActiveAndVisible(makeVisible: false);
+            StopAgentMovement();
 
             EventBus.Instance?.Publish(new ShowMessageEvent
             {
-                Message  = "Posicionado en el inicio del edificio",
+                Message  = "Navegación lista",
                 Type     = MessageType.Success,
                 Duration = 3f
             });
@@ -331,53 +417,86 @@ namespace IndoorNavAR.AR
 
         #endregion
 
-        #region No-AR Follower Mode
+        #region FullAR — Sincronización agente con cámara XR
 
         /// <summary>
-        /// Activa el modo fallback: desactiva el AR tracking,
-        /// teleporta al StartPoint y empieza a seguir al agente.
+        /// En FullAR, mueve el agente al punto del NavMesh más cercano
+        /// a la cámara XR. Se llama cada frame desde Update().
+        ///
+        /// IMPORTANTE: Solo reposiciona el agente (transform + Warp).
+        /// NO inicia navegación ni modifica la ruta activa.
+        /// El NavMeshAgent mantiene isStopped=true cuando no hay navegación,
+        /// y ARGuideController garantiza que el agente no se mueva en FullAR.
+        ///
+        /// El throttle (_fullArSyncThreshold) evita Warp innecesarios cuando
+        /// la cámara apenas se mueve (usuario quieto).
         /// </summary>
+        private void SyncAgentToCameraFullAR()
+        {
+            if (_navigationAgent == null || _xrOrigin?.Camera == null) return;
+            if (!_navigationAgent.gameObject.activeSelf)               return;
+
+            Vector3 cameraPos = _xrOrigin.Camera.transform.position;
+
+            // Throttle: solo actualizar si la cámara se movió lo suficiente
+            if (Vector3.Distance(cameraPos, _lastSyncedCameraPos) < _fullArSyncThreshold)
+                return;
+
+            // Buscar el punto del NavMesh más cercano a la cámara XR
+            if (!NavMesh.SamplePosition(cameraPos, out NavMeshHit hit,
+                    _fullArSnapRadius, NavMesh.AllAreas))
+                return; // No hay NavMesh cerca — esperar a que se cargue
+
+            // Solo mover si la diferencia es significativa
+            if (Vector3.Distance(_navigationAgent.transform.position, hit.position) < _fullArSyncThreshold)
+                return;
+
+            // Mover el agente a la posición del usuario sobre el NavMesh
+            _navigationAgent.transform.position = hit.position;
+
+            // Warp del NavMeshAgent solo si no está navegando activamente.
+            // Si está navegando, NavigationPathController gestiona su posición.
+            if (_agentNavMeshAgent != null && _agentNavMeshAgent.enabled && _agentNavMeshAgent.isOnNavMesh)
+            {
+                if (!_navigationAgent.IsNavigating)
+                {
+                    _agentNavMeshAgent.Warp(hit.position);
+                    // Mantener detenido
+                    _agentNavMeshAgent.isStopped = true;
+                }
+                // Si está navegando, la ruta ya fue calculada desde la posición
+                // correcta — no interferir con el pathfinding activo.
+            }
+
+            _lastSyncedCameraPos = cameraPos;
+        }
+
+        #endregion
+
+        #region NoAR Follower Mode
+
         private void ActivateNoArMode()
         {
             if (_xrOrigin == null)
             {
-                Debug.LogError("[AROriginAligner] ❌ XROrigin es null — no se puede activar modo No-AR.");
+                Debug.LogError("[AROriginAligner] ❌ XROrigin es null.");
                 return;
             }
 
-            // Desactivar ARSession para que no intente hacer tracking
-            var arSession = FindFirstObjectByType<ARSession>();
-            if (arSession != null)
-            {
-                arSession.enabled = false;
-                Log("📵 ARSession desactivada (modo No-AR).");
-            }
+            // NoAR: agente activo y visible
+            SetAgentActiveAndVisible(makeVisible: true);
 
-            // Desactivar ARPlaneManager para que no intente detectar planos
-            var planeManager = FindFirstObjectByType<ARPlaneManager>();
-            if (planeManager != null)
-            {
-                planeManager.enabled = false;
-                Log("📵 ARPlaneManager desactivada.");
-            }
-
-            // Posicionar XR Origin sobre el StartPoint para el primer frame
             var startPoint = NavigationStartPointManager.GetStartPointForLevel(_targetLevel);
             if (startPoint != null)
             {
                 startPoint.ConfirmModelPositioned();
                 startPoint.ReteleportAgent();
-
-                if (_navigationAgent != null)
-                {
-                    Vector3 agentPos = _navigationAgent.transform.position;
-                    SnapCameraToAgent(agentPos, _navigationAgent.transform.forward);
-                }
             }
 
-            // Activar el loop de seguimiento en Update()
+            if (_navigationAgent != null)
+                SnapCameraToAgent(_navigationAgent.transform.position, _navigationAgent.transform.forward);
+
             _followActive = true;
-            _aligned      = true;
 
             EventBus.Instance?.Publish(new ShowMessageEvent
             {
@@ -386,121 +505,105 @@ namespace IndoorNavAR.AR
                 Duration = 4f
             });
 
-            Log("✅ Modo No-AR activo — cámara siguiendo al agente.");
+            Log("✅ [NoAR] Cámara siguiendo al agente (usuario virtual).");
         }
 
-        /// <summary>
-        /// Llamado cada Update() en modo No-AR.
-        /// </summary>
         private void FollowAgent()
         {
             if (_navigationAgent == null || _xrOrigin == null) return;
 
-            Transform agentTf = _navigationAgent.transform;
+            Transform agentTf  = _navigationAgent.transform;
+            Vector3   agentPos = agentTf.position;
+            Vector3   agentFwd = agentTf.forward;
 
-            Vector3 agentPos     = agentTf.position;
-            Vector3 agentForward = agentTf.forward;
             Vector3 desiredCamPos = agentPos
-                + Vector3.up    * _noArCameraHeight
-                - agentForward  * _noArCameraBack;
+                + Vector3.up * _noArCameraHeight
+                - agentFwd   * _noArCameraBack;
 
             Quaternion desiredCamRot;
-            if (_noArFollowRotation && agentForward != Vector3.zero)
+            if (_noArFollowRotation && agentFwd != Vector3.zero)
             {
-                Vector3 lookDir = agentForward;
-                if (_noArCameraBack > 0)
-                    lookDir = (agentPos - desiredCamPos).normalized;
-                desiredCamRot = Quaternion.LookRotation(lookDir) *
-                                Quaternion.Euler(_noArPitchAngle, 0, 0);
+                Vector3 lookDir = _noArCameraBack > 0f
+                    ? (agentPos - desiredCamPos).normalized
+                    : agentFwd;
+                desiredCamRot = Quaternion.LookRotation(lookDir) * Quaternion.Euler(_noArPitchAngle, 0f, 0f);
             }
             else
             {
                 desiredCamRot = _xrOrigin.Camera.transform.rotation;
             }
 
-            float t = _noArFollowSmooth > 0
-                ? Time.deltaTime * _noArFollowSmooth
-                : 1f;
+            float t = _noArFollowSmooth > 0f ? Time.deltaTime * _noArFollowSmooth : 1f;
 
-            Vector3    currentCamPos = _xrOrigin.Camera.transform.position;
-            Quaternion currentCamRot = _xrOrigin.Camera.transform.rotation;
-
-            Vector3    smoothPos = Vector3.Lerp(currentCamPos, desiredCamPos, t);
-            Quaternion smoothRot = Quaternion.Slerp(currentCamRot, desiredCamRot, t);
+            Vector3    smoothPos = Vector3.Lerp(_xrOrigin.Camera.transform.position, desiredCamPos, t);
+            Quaternion smoothRot = Quaternion.Slerp(_xrOrigin.Camera.transform.rotation, desiredCamRot, t);
 
             _xrOrigin.MoveCameraToWorldLocation(smoothPos);
-
             if (_noArFollowRotation)
                 _xrOrigin.MatchOriginUpCameraForward(Vector3.up, smoothRot * Vector3.forward);
         }
 
-        /// <summary>
-        /// Posicionamiento instantáneo (sin lerp) — para el primer frame.
-        /// </summary>
-        private void SnapCameraToAgent(Vector3 agentPos, Vector3 agentForward)
+        private void SnapCameraToAgent(Vector3 agentPos, Vector3 agentFwd)
         {
             Vector3 desiredCamPos = agentPos
-                + Vector3.up   * _noArCameraHeight
-                - agentForward * _noArCameraBack;
+                + Vector3.up * _noArCameraHeight
+                - agentFwd   * _noArCameraBack;
 
             _xrOrigin.MoveCameraToWorldLocation(desiredCamPos);
-
-            if (_noArFollowRotation && agentForward != Vector3.zero)
-            {
-                _xrOrigin.MatchOriginUpCameraForward(Vector3.up, agentForward);
-            }
+            if (_noArFollowRotation && agentFwd != Vector3.zero)
+                _xrOrigin.MatchOriginUpCameraForward(Vector3.up, agentFwd);
         }
 
         #endregion
 
-        #region Utilities
+        #region Utilities & Debug
 
         private void Log(string msg)
         {
-            if (_logAlignment)
-                Debug.Log($"[AROriginAligner] {msg}");
+            if (_logAlignment) Debug.Log($"[AROriginAligner] {msg}");
         }
 
-        #endregion
-
-        #region Debug Info
-
-        [ContextMenu("ℹ️ Info de alineación")]
+        [ContextMenu("ℹ️ Info de estado")]
         private void DebugInfo()
         {
-            var startPoint = NavigationStartPointManager.GetStartPointForLevel(_targetLevel);
-            ARCapabilityLevel level = _capDetector?.Current ?? ARCapabilityLevel.FullAR;
+            var sp    = NavigationStartPointManager.GetStartPointForLevel(_targetLevel);
+            var level = _capDetector?.Current ?? ARCapabilityLevel.FullAR;
 
-            Debug.Log("══════════════════════════════════════");
-            Debug.Log("  AROriginAligner — Estado");
-            Debug.Log("══════════════════════════════════════");
-            Debug.Log($"  Modo AR:              {level}");
-            Debug.Log($"  Modo No-AR:           {_noArMode}");
-            Debug.Log($"  Seguimiento activo:   {_followActive}");
-            Debug.Log($"  Capacidad resuelta:   {_capabilityResolved}");
-            Debug.Log($"  XR Origin:            {(_xrOrigin != null ? _xrOrigin.gameObject.name : "NULL")}");
-            Debug.Log($"  AR Camera pos:        {(_xrOrigin?.Camera?.transform.position.ToString() ?? "N/A")}");
-            Debug.Log($"  StartPoint:           {(startPoint != null ? startPoint.gameObject.name : "No encontrado")}");
-            Debug.Log($"  SP posición:          {(startPoint != null ? startPoint.transform.position.ToString() : "N/A")}");
-            Debug.Log($"  Agente pos:           {(_navigationAgent != null ? _navigationAgent.transform.position.ToString() : "N/A")}");
-            Debug.Log($"  Nivel target:         {_targetLevel}");
-            Debug.Log($"  Alineado:             {_aligned}");
-            Debug.Log("══════════════════════════════════════");
+            Debug.Log("══════════════════════════════════════════════");
+            Debug.Log("  AROriginAligner v6 — Estado");
+            Debug.Log("══════════════════════════════════════════════");
+            Debug.Log($"  Modo:               {(IsNoArMode ? "NoAR (agente visible)" : "FullAR (agente invisible, activo)")}");
+            Debug.Log($"  Capacidad AR:       {level}");
+            Debug.Log($"  Seguimiento NoAR:   {_followActive}");
+            Debug.Log($"  Alineación inicial: {_initialAlignDone}");
+            Debug.Log($"  XR Origin:          {(_xrOrigin != null ? _xrOrigin.gameObject.name : "NULL")}");
+            Debug.Log($"  Camera pos:         {(_xrOrigin?.Camera?.transform.position.ToString() ?? "N/A")}");
+            Debug.Log($"  StartPoint:         {(sp != null ? $"{sp.gameObject.name} @ {sp.transform.position}" : "No encontrado")}");
+            Debug.Log($"  Agente:             {(_navigationAgent != null ? $"{_navigationAgent.gameObject.name} activo={_navigationAgent.gameObject.activeSelf}" : "NULL")}");
+            Debug.Log($"  Agente pos:         {(_navigationAgent?.transform.position.ToString() ?? "N/A")}");
+            Debug.Log($"  NavMeshAgent stop:  {(_agentNavMeshAgent != null ? _agentNavMeshAgent.isStopped.ToString() : "N/A")}");
+            Debug.Log($"  Última sync cámara: {_lastSyncedCameraPos}");
+            Debug.Log("══════════════════════════════════════════════");
         }
 
-        [ContextMenu("📵 Forzar modo No-AR (test)")]
+        [ContextMenu("📵 Forzar modo NoAR (test)")]
         private void DebugForceNoAr()
         {
             _noArMode = true;
+            SetAgentActiveAndVisible(makeVisible: true);
             ActivateNoArMode();
         }
 
         [ContextMenu("📡 Forzar modo FullAR (test)")]
         private void DebugForceFullAr()
         {
-            _noArMode     = false;
-            _followActive = false;
-            AlignToStartPoint();
+            _noArMode            = false;
+            _followActive        = false;
+            _initialAlignDone    = false;
+            _lastSyncedCameraPos = new Vector3(float.PositiveInfinity, 0, 0);
+            SetAgentActiveAndVisible(makeVisible: false);
+            StopAgentMovement();
+            AlignXROriginOnce();
         }
 
         #endregion

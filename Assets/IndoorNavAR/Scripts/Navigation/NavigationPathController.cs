@@ -1,27 +1,42 @@
 // File: NavigationPathController.cs
 // ============================================================================
-//  CONTROLADOR DE RUTA — IndoorNavAR  v2
+//  CONTROLADOR DE RUTA — IndoorNavAR  v3
 // ============================================================================
 //
-//  PROBLEMAS DE v1 RESUELTOS:
+//  CAMBIOS v2 → v3  (soporte FullAR)
+// ============================================================================
 //
-//  1. AGENTE PEGADO A PAREDES:
-//     v1 hacía SamplePosition en cada frame desde la posición actual, lo que
-//     snappeaba a la posición más cercana aunque estuviera junto a un borde.
-//     Ahora el movimiento sigue el path (ya centrado por el optimizer), y
-//     SamplePosition solo valida que no salgamos del NavMesh — no redirige.
-//     Eliminada la repulsión reactiva de SphereCast que entraba en conflicto.
+//  PROBLEMA CRÍTICO:
+//    En FullAR, NavigationPathController.Update() llamaba FollowPath() cada
+//    frame, que ejecutaba MoveTowardsTarget() → transform.position = hit.position.
 //
-//  2. FALSA LLEGADA AL DESTINO:
-//     v1 declaraba arribo cuando el stall avanzaba artificialmente waypoints
-//     hasta el final. Ahora:
-//       - Arribo SOLO si distancia física al destino final < destinationArrivalRadius.
-//       - Anti-stall recalcula la ruta, nunca avanza waypoints artificialmente.
-//       - Si el recálculo falla N veces → OnPathFailed, nunca OnPathCompleted.
+//    Esto movía el agente hacia el destino DIRECTAMENTE en el transform,
+//    sin pasar por NavMeshAgent.isStopped (que solo controla el componente
+//    de navegación de Unity, no el movimiento manual del transform).
 //
-//  3. RECÁLCULO AGRESIVO ELIMINADO:
-//     Eliminado el DeviationWatchRoutine. El recálculo ocurre solo cuando
-//     el anti-stall lo determina necesario.
+//    Resultado: el agente caminaba solo hacia el destino en FullAR aunque
+//    AROriginAligner, NavigationAgent y ARGuideController tuvieran
+//    isStopped = true. El movimiento del transform bypaseaba todo.
+//
+//  SOLUCIÓN v3:
+//    1. Nueva propiedad pública IsFullARMode (bool, default false).
+//       Debe setearse a true ANTES de llamar NavigateTo() en FullAR.
+//
+//    2. FollowPath() retorna inmediatamente si IsFullARMode = true.
+//       El path se calcula y CurrentPath queda válido (NavigationVoiceGuide
+//       lo necesita para generar instrucciones), pero el agente NO se mueve.
+//
+//    3. AROriginAligner llama SetFullARMode(true) en InitializeCapabilityRoutine().
+//       NavigationAgent llama SetFullARMode(true) en Start() si detecta FullAR.
+//
+//    4. En FullAR, IsNavigating sigue siendo true mientras haya ruta activa.
+//       Esto permite que NavigationVoiceGuide evalúe la posición del usuario
+//       (que AROriginAligner sincroniza con la cámara cada frame) contra la
+//       ruta y genere instrucciones de giro, distancia, etc.
+//
+//    5. StopNavigation() no cambia IsFullARMode — solo limpia la ruta.
+//
+//  TODOS LOS FIXES DE v2 SE CONSERVAN ÍNTEGRAMENTE.
 
 using System;
 using System.Collections.Generic;
@@ -132,6 +147,16 @@ namespace IndoorNavAR.Navigation
         public bool          IsNavigating   => _isNavigating;
         public OptimizedPath CurrentPath    => _currentPath;
 
+        /// <summary>
+        /// ✅ v3 — En FullAR, FollowPath() no mueve el transform.
+        /// El path se calcula y CurrentPath queda válido para VoiceGuide,
+        /// pero MoveTowardsTarget() nunca se ejecuta.
+        ///
+        /// Setear a true ANTES de llamar NavigateTo() en FullAR.
+        /// AROriginAligner y NavigationAgent son responsables de esto.
+        /// </summary>
+        public bool IsFullARMode { get; private set; } = false;
+
         public Vector3 CurrentTarget => (_isNavigating && _currentPath != null
                                          && _currentWaypointIndex < _currentPath.Waypoints.Count)
             ? _currentPath.Waypoints[_currentWaypointIndex]
@@ -158,8 +183,8 @@ namespace IndoorNavAR.Navigation
         private bool                    _isNavigating;
         private bool                    _agentReady;
         private Vector3                 _currentDestination;
-        private float                   _currentSpeed;   // velocidad escalar actual
-        private Vector3                 _smoothDampVel;  // solo para SmoothDamp de dirección
+        private float                   _currentSpeed;
+        private Vector3                 _smoothDampVel;
         private bool                    _isOnStairs;
 
         // Anti-stall
@@ -210,6 +235,35 @@ namespace IndoorNavAR.Navigation
         //  API PÚBLICA
         // ─────────────────────────────────────────────────────────────────────
 
+        /// <summary>
+        /// ✅ v3 — Activa/desactiva el modo FullAR.
+        /// En FullAR FollowPath() calcula posición de waypoints pero
+        /// NO mueve el transform. El agente permanece donde AROriginAligner
+        /// lo dejó (posición del usuario sobre el NavMesh).
+        /// </summary>
+        public void SetFullARMode(bool isFullAR)
+        {
+            if (IsFullARMode == isFullAR) return;
+            IsFullARMode = isFullAR;
+
+            if (isFullAR)
+            {
+                // En FullAR el agente no debe moverse: detener cualquier movimiento activo
+                _currentSpeed  = 0f;
+                _smoothDampVel = Vector3.zero;
+                TrySetAgentStopped(true);
+                if (_logVerbose)
+                    Debug.Log("[PathController] ✅ Modo FullAR activado — " +
+                              "FollowPath() no moverá el transform.");
+            }
+            else
+            {
+                if (_logVerbose)
+                    Debug.Log("[PathController] ✅ Modo NoAR activado — " +
+                              "movimiento del agente habilitado.");
+            }
+        }
+
         public void NavigateTo(Vector3 destination, bool forceRecalculate = false)
         {
             if (forceRecalculate)
@@ -221,7 +275,8 @@ namespace IndoorNavAR.Navigation
 
             if (!path.IsValid)
             {
-                Debug.LogWarning($"[PathController] Sin ruta válida hacia {destination:F2}. Status={path.Status}");
+                Debug.LogWarning($"[PathController] Sin ruta válida hacia {destination:F2}. " +
+                                 $"Status={path.Status} | agentPos={transform.position:F2}");
                 OnPathFailed?.Invoke(path.Status);
                 return;
             }
@@ -237,12 +292,15 @@ namespace IndoorNavAR.Navigation
             _stallTimer           = 0f;
             _stallRetryCount      = 0;
 
-            TrySetAgentStopped(false);
+            // En FullAR no activamos el movimiento del agente
+            if (!IsFullARMode)
+                TrySetAgentStopped(false);
 
             if (_logVerbose)
                 Debug.Log($"[PathController] Ruta: {path.RawWaypointCount} raw → " +
                           $"{path.Waypoints.Count} optimizados, {path.TotalLength:F1}m, " +
-                          $"clearance mín={path.MinClearance:F3}m");
+                          $"clearance mín={path.MinClearance:F3}m" +
+                          (IsFullARMode ? " [FullAR — sin movimiento]" : ""));
 
             OnPathStarted?.Invoke(destination);
         }
@@ -267,6 +325,19 @@ namespace IndoorNavAR.Navigation
 
         private void FollowPath()
         {
+            // ✅ v3 — En FullAR, el transform no se mueve.
+            // El path existe y CurrentPath.IsValid = true para que
+            // NavigationVoiceGuide pueda evaluar la ruta.
+            // AROriginAligner es el único que mueve el transform en FullAR.
+            if (IsFullARMode)
+            {
+                // En FullAR: verificar llegada basada en la posición actual del agente
+                // (que AROriginAligner sincroniza con la cámara).
+                // No se avanza waypoints, no se mueve el transform.
+                // NavigationVoiceGuide usa EvalPos para evaluar la ruta, no este sistema.
+                return;
+            }
+
             IReadOnlyList<Vector3> waypoints = _currentPath.Waypoints;
             Vector3 finalDest = waypoints[waypoints.Count - 1];
 
@@ -304,9 +375,9 @@ namespace IndoorNavAR.Navigation
             }
 
             if (_currentWaypointIndex >= waypoints.Count)
-                return; // Siguiente frame comprobará distancia final
+                return;
 
-            Vector3 target       = waypoints[_currentWaypointIndex];
+            Vector3 target        = waypoints[_currentWaypointIndex];
             float   arrivalRadius = nextIsStair ? _stairWaypointRadius : _waypointArrivalRadius;
 
             if (Vector3.Distance(transform.position, target) <= arrivalRadius)
@@ -322,19 +393,14 @@ namespace IndoorNavAR.Navigation
         }
 
         // ─────────────────────────────────────────────────────────────────────
-        //  MOVIMIENTO LIMPIO
+        //  MOVIMIENTO (solo NoAR)
         // ─────────────────────────────────────────────────────────────────────
 
-        /// <summary>
-        /// Sigue el path optimizado sin re-snappear a bordes.
-        /// Velocidad escalar constante con aceleración/deceleración lineal.
-        /// SmoothDamp solo se usa para suavizar la dirección, no la velocidad.
-        /// </summary>
         private void MoveTowardsTarget(Vector3 target, bool isStair, Vector3 finalDest)
         {
+            // Nunca llamado en FullAR (FollowPath retorna antes)
             Vector3 toTarget = target - transform.position;
 
-            // Dirección deseada
             Vector3 desiredDir;
             if (isStair)
             {
@@ -346,23 +412,19 @@ namespace IndoorNavAR.Navigation
                 desiredDir = flat.sqrMagnitude > 0.001f ? flat.normalized : transform.forward;
             }
 
-            // Velocidad objetivo: constante con frenado cerca del destino final
-            float distFinal  = Vector3.Distance(transform.position, finalDest);
-            float brakeT     = Mathf.InverseLerp(0f, _brakingDistance, distFinal);
+            float distFinal   = Vector3.Distance(transform.position, finalDest);
+            float brakeT      = Mathf.InverseLerp(0f, _brakingDistance, distFinal);
             float targetSpeed = Mathf.Lerp(_moveSpeed * _minBrakingFactor, _moveSpeed, brakeT);
             if (isStair) targetSpeed *= 0.7f;
 
-            // Acelerar/frenar linealmente — sin feedback loop
             _currentSpeed = Mathf.MoveTowards(_currentSpeed, targetSpeed,
                                                _acceleration * Time.deltaTime);
 
-            // Suavizado de DIRECCIÓN solamente (no velocidad)
-            // SmoothDamp en dirección normalizada previene giros bruscos
             Vector3 smoothDir = Vector3.SmoothDamp(
                 transform.forward, desiredDir,
                 ref _smoothDampVel,
-                0.08f,           // tiempo de suavizado de dirección (s)
-                float.MaxValue,  // sin límite de velocidad de giro de la dirección
+                0.08f,
+                float.MaxValue,
                 Time.deltaTime);
 
             smoothDir.y = isStair ? desiredDir.y : 0f;
@@ -370,13 +432,11 @@ namespace IndoorNavAR.Navigation
             if (smoothDir.sqrMagnitude < 0.001f) return;
             smoothDir = smoothDir.normalized;
 
-            // Desplazamiento final: dirección × velocidad escalar
-            Vector3 delta  = smoothDir * (_currentSpeed * Time.deltaTime);
+            Vector3 delta = smoothDir * (_currentSpeed * Time.deltaTime);
             if (isStair) delta.y = desiredDir.y * _stairYSpeed * Time.deltaTime;
 
             Vector3 newPos = transform.position + delta;
 
-            // Validación conservadora: radio pequeño para no snappear a bordes
             if (!NavMesh.SamplePosition(newPos, out NavMeshHit hit, 0.15f, NavMesh.AllAreas))
             {
                 if (!NavMesh.SamplePosition(newPos, out hit, 0.40f, NavMesh.AllAreas))
@@ -386,7 +446,6 @@ namespace IndoorNavAR.Navigation
             transform.position  = hit.position;
             _agent.nextPosition = hit.position;
 
-            // Rotación
             Vector3 rotDir = new Vector3(smoothDir.x, 0f, smoothDir.z);
             if (rotDir.sqrMagnitude > 0.01f)
             {
@@ -398,14 +457,9 @@ namespace IndoorNavAR.Navigation
         }
 
         // ─────────────────────────────────────────────────────────────────────
-        //  ANTI-STALL — SIN AVANCE ARTIFICIAL
+        //  ANTI-STALL (solo NoAR)
         // ─────────────────────────────────────────────────────────────────────
 
-        /// <summary>
-        /// Recalcula la ruta desde la posición actual.
-        /// Si supera _maxStallRetries → OnPathFailed.
-        /// NUNCA declara arribo por timeout.
-        /// </summary>
         private void HandleStall(Vector3 finalDest)
         {
             _stallRetryCount++;
@@ -504,7 +558,7 @@ namespace IndoorNavAR.Navigation
         {
             if (!evt.Success) return;
             _optimizer.InvalidateCache();
-            if (_isNavigating && !_isOnStairs)
+            if (_isNavigating && !_isOnStairs && !IsFullARMode)
                 NavigateTo(_currentDestination, forceRecalculate: true);
         }
 
@@ -547,9 +601,16 @@ namespace IndoorNavAR.Navigation
 
             if (_isNavigating && _currentWaypointIndex < wp.Count)
             {
-                Gizmos.color = _isOnStairs ? _stairColor : _lookAheadColor;
+                Gizmos.color = IsFullARMode ? Color.magenta : (_isOnStairs ? _stairColor : _lookAheadColor);
                 Gizmos.DrawLine(transform.position, wp[_currentWaypointIndex]);
                 Gizmos.DrawWireSphere(wp[_currentWaypointIndex], 0.10f);
+            }
+
+            // En FullAR: indicador visual del modo
+            if (IsFullARMode && Application.isPlaying)
+            {
+                Gizmos.color = new Color(1f, 0f, 1f, 0.5f);
+                Gizmos.DrawWireSphere(transform.position, 0.2f);
             }
         }
     }

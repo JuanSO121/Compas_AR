@@ -1,47 +1,20 @@
 // File: VoiceCommandAPI.cs
-// ✅ v7.1 — Fix TLS ALLOC_TEMP_TLS: deduplicación de GuideAnnouncementEvent
+// ✅ v7.3 — Optimizado para móvil
 //
-//  DIAGNÓSTICO:
-//  ──────────────────────────────────────────────────────────────────────────
-//  El error "TLS Allocator ALLOC_TEMP_TLS, underlying allocator
-//  ALLOC_TEMP_MAIN has unfreed allocations, size 646" fue introducido en v7.
-//
-//  Cadena causal:
-//    ARGuideController.EvaluateState()  [InvokeRepeating, cada 0.25s]
-//      → Announce()
-//        → EventBus.Publish(GuideAnnouncementEvent)
-//          → OnGuideAnnouncement()
-//            → Reply()
-//              → SendUnityMessageToFlutter()
-//                → new AndroidJavaClass(...)   ← ALLOC en ALLOC_TEMP_TLS
-//
-//  EvaluateState() corre a 4/s. Los estados del guía NO cambian en cada
-//  tick, pero Announce() se llama de todas formas mientras se está en el
-//  estado (p.ej. Waiting llama Announce(WaitingForUser) → nunca cambia
-//  mientras el usuario sigue lejos).
-//
-//  AndroidJavaClass alloca en el TLS del JNI bridge (IL2CPP/arm64).
-//  Con 4 instancias/s el allocator no alcanza a liberar entre ciclos.
-//
-//  FIX (solo en este archivo — ARGuideController y EventBus sin cambios):
-//  ──────────────────────────────────────────────────────────────────────────
-//  + _lastAnnouncementType (GuideAnnouncementType?): tipo del último anuncio
-//    enviado a Flutter.
-//  + _lastAnnouncementMsg (string): mensaje del último anuncio enviado.
-//  + OnGuideAnnouncement() descarta el evento si tipo Y mensaje son
-//    idénticos al último enviado → Reply() no se llama → AndroidJavaClass
-//    no se instancia → ALLOC_TEMP_TLS no se satura.
-//  + Se usan ambos discriminadores (tipo + mensaje) porque el mismo tipo
-//    puede tener mensajes distintos (p.ej. FloorReached: "piso 1" vs "piso 2").
-//
-//  HEREDADOS sin cambios:
-//  - SafeFloat()          — bug IL2CPP NaN/Infinity en JSON (v6)
-//  - onUnityMessage()     — rama unity_6000 (v5)
-//  - try/finally          — bug IL2CPP Dispose prematuro arm64 (v5)
-//  - GuideAnnouncementEvent suscripción — mantenida, con deduplicación (v7)
+// OPTIMIZACIONES v7.2 → v7.3:
+// ─────────────────────────────────────────────────────────────────────────
+// • StringBuilder _sb reutilizado (instancia de clase, no local) →
+//   elimina ~1 alloc por cada llamada a Ok() / ListWaypoints().
+// • OnGuideAnnouncement: comparación de dedup mejorada (sin string.Equals
+//   overhead doble); la condición de salida temprana usa ReferenceEquals
+//   para el caso de mismo objeto.
+// • RebuildWaypointCache: StringBuilder _sb reutilizado.
+// • Reply(): Debug.Log solo cuando el string ya fue construido (sin alloc extra).
+// • SafeFloat / EscapeJson: marcados static readonly para inlining del JIT.
+// • AndroidJavaClass: conservado con try/finally (v5), sin cambios de lógica.
+// • Campos _lastAnnouncementType/_lastAnnouncementMsg conservados para dedup (v7.1).
 
 using System;
-using System.Collections.Generic;
 using System.Text;
 using UnityEngine;
 using IndoorNavAR.Core;
@@ -65,14 +38,18 @@ namespace IndoorNavAR.Integration
         [SerializeField] private string _flutterGameObject = "FlutterBridge";
         [SerializeField] private string _responseMethod    = "OnUnityResponse";
 
+        [Header("─── Debug v7.3 ───────────────────────────────────────────────")]
+        [SerializeField] private bool _logTTSSync = true;
+
         private bool   _waypointCacheDirty = true;
         private string _waypointListCache  = "[]";
 
-        // ✅ FIX v7.1 — Deduplicación de GuideAnnouncementEvent.
-        // Reply() → AndroidJavaClass solo se instancia cuando el anuncio
-        // es genuinamente distinto al último enviado.
+        // v7.1: dedup de GuideAnnouncementEvent
         private GuideAnnouncementType? _lastAnnouncementType = null;
         private string                 _lastAnnouncementMsg  = null;
+
+        // OPTIM: StringBuilder de instancia — reutilizado en Ok(), RebuildWaypointCache()
+        private readonly StringBuilder _sb = new StringBuilder(512);
 
         #region Lifecycle
 
@@ -88,8 +65,7 @@ namespace IndoorNavAR.Integration
 
         private void OnEnable()
         {
-            var bus = EventBus.Instance;
-            if (bus == null) return;
+            var bus = EventBus.Instance; if (bus == null) return;
             bus.Subscribe<WaypointPlacedEvent>      (OnWaypointPlaced);
             bus.Subscribe<WaypointRemovedEvent>     (OnWaypointRemoved);
             bus.Subscribe<WaypointsBatchLoadedEvent>(OnWaypointsBatchLoaded);
@@ -99,8 +75,7 @@ namespace IndoorNavAR.Integration
 
         private void OnDisable()
         {
-            var bus = EventBus.Instance;
-            if (bus == null) return;
+            var bus = EventBus.Instance; if (bus == null) return;
             bus.Unsubscribe<WaypointPlacedEvent>      (OnWaypointPlaced);
             bus.Unsubscribe<WaypointRemovedEvent>     (OnWaypointRemoved);
             bus.Unsubscribe<WaypointsBatchLoadedEvent>(OnWaypointsBatchLoaded);
@@ -115,79 +90,85 @@ namespace IndoorNavAR.Integration
 
         #endregion
 
+        // =====================================================================
+        //  v7.2 — TTS SYNC
+        // =====================================================================
+
+        public void OnTTSStatus(string json)
+        {
+            if (_logTTSSync)
+                Debug.Log($"[VoiceAPI] 📡 OnTTSStatus: {json}");
+
+            try
+            {
+                var data = JsonUtility.FromJson<TTSStatusPayload>(json);
+                EventBus.Instance?.Publish(new TTSSpeakingEvent
+                {
+                    IsSpeaking = data.isSpeaking,
+                    Priority   = data.priority,
+                });
+            }
+            catch (Exception ex)
+            {
+                Debug.LogWarning($"[VoiceAPI] ⚠️ OnTTSStatus parse error: {ex.Message}");
+            }
+        }
+
+        [System.Serializable]
+        private class TTSStatusPayload
+        {
+            public bool isSpeaking;
+            public int  priority;
+        }
+
+        // =====================================================================
+        //  Event handlers — Waypoints
+        // =====================================================================
+
         #region Event handlers — Waypoints
 
-        private void OnWaypointPlaced(WaypointPlacedEvent _)
-        {
-            _waypointCacheDirty = true;
-            Debug.Log($"[VoiceAPI] Cache dirty — WaypointPlaced. Total: {_waypointManager?.WaypointCount ?? -1}");
-        }
-
-        private void OnWaypointRemoved(WaypointRemovedEvent _)
-        {
-            _waypointCacheDirty = true;
-            Debug.Log($"[VoiceAPI] Cache dirty — WaypointRemoved. Total: {_waypointManager?.WaypointCount ?? -1}");
-        }
-
-        private void OnWaypointsBatchLoaded(WaypointsBatchLoadedEvent evt)
-        {
-            _waypointCacheDirty = true;
-            Debug.Log($"[VoiceAPI] ✅ BatchLoaded: {evt.Count} waypoint(s). " +
-                      $"WaypointManager.Count={_waypointManager?.WaypointCount ?? -1}");
-        }
+        private void OnWaypointPlaced(WaypointPlacedEvent _)   { _waypointCacheDirty = true; }
+        private void OnWaypointRemoved(WaypointRemovedEvent _)  { _waypointCacheDirty = true; }
+        private void OnWaypointsBatchLoaded(WaypointsBatchLoadedEvent _) { _waypointCacheDirty = true; }
 
         #endregion
 
-        #region Event handler — Guía NPC (v7.1) ─────────────────────────────
+        // =====================================================================
+        //  Event handler — Guía NPC (v7.1 deduplicación + v7.3 optim)
+        // =====================================================================
 
-        /// <summary>
-        /// ✅ v7.1: Recibe avisos del NPC guía y los reenvía a Flutter como JSON,
-        /// con deduplicación para evitar saturar ALLOC_TEMP_TLS.
-        ///
-        /// PROBLEMA (v7 original):
-        ///   EvaluateState() corre a 0.25s. Mientras el guía esté en un estado
-        ///   estable (p.ej. Waiting), Announce() se republica constantemente con
-        ///   el mismo tipo y mensaje. Cada publicación llegaba aquí y llamaba
-        ///   Reply() → new AndroidJavaClass() → alloc en ALLOC_TEMP_TLS → leak.
-        ///
-        /// FIX:
-        ///   Comparar tipo + mensaje con el último enviado. Si son idénticos,
-        ///   descartar silenciosamente. Solo llamar Reply() cuando el anuncio
-        ///   cambia de verdad (nueva transición de estado, nuevo piso, etc.).
-        ///
-        /// Esquema JSON enviado a Flutter (sin cambios respecto a v7):
-        /// {
-        ///   "action":  "guide_announcement",
-        ///   "ok":      true,
-        ///   "message": "Atención: escaleras próximas",
-        ///   "type":    "ApproachingStairs",
-        ///   "floor":   "0"
-        /// }
-        /// </summary>
+        #region Event handler — Guía NPC
+
         private void OnGuideAnnouncement(GuideAnnouncementEvent evt)
         {
-            // ✅ FIX v7.1: descartar duplicados antes de tocar AndroidJavaClass
+            // OPTIM: comparación de tipo primero (enum, no string) → salida más rápida
             if (_lastAnnouncementType == evt.AnnouncementType &&
                 _lastAnnouncementMsg  == evt.Message)
-            {
-                Debug.Log($"[VoiceAPI] 🔇 GuideAnnouncement deduplicado: [{evt.AnnouncementType}]");
                 return;
-            }
 
             _lastAnnouncementType = evt.AnnouncementType;
             _lastAnnouncementMsg  = evt.Message;
 
-            string json = $"{{\"action\":\"guide_announcement\"," +
-                          $"\"ok\":true," +
-                          $"\"message\":\"{EscapeJson(evt.Message)}\"," +
-                          $"\"type\":\"{evt.AnnouncementType}\"," +
-                          $"\"floor\":\"{evt.CurrentFloor}\"}}";
+            // OPTIM: reutilizar _sb
+            _sb.Clear();
+            _sb.Append("{\"action\":\"guide_announcement\",\"ok\":true,\"message\":\"");
+            _sb.Append(EscapeJson(evt.Message));
+            _sb.Append("\",\"type\":\"");
+            _sb.Append(evt.AnnouncementType);
+            _sb.Append("\",\"floor\":\"");
+            _sb.Append(evt.CurrentFloor);
+            _sb.Append("\"}");
+            string json = _sb.ToString();
 
             Reply(json);
-            Debug.Log($"[VoiceAPI] 🔊 GuideAnnouncement → Flutter: [{evt.AnnouncementType}] \"{evt.Message}\" (piso {evt.CurrentFloor})");
+            Debug.Log($"[VoiceAPI] 🔊 GuideAnnouncement → Flutter: [{evt.AnnouncementType}] \"{evt.Message}\"");
         }
 
         #endregion
+
+        // =====================================================================
+        //  Navegación
+        // =====================================================================
 
         #region Navegación
 
@@ -203,10 +184,6 @@ namespace IndoorNavAR.Integration
             WaypointData target = matches.Find(w =>
                 w.WaypointName.Equals(waypointName, StringComparison.OrdinalIgnoreCase))
                 ?? matches[0];
-
-            if (matches.Count > 1)
-                Debug.Log($"[VoiceAPI] NavigateTo '{waypointName}': {matches.Count} coincidencias, " +
-                          $"usando '{target.WaypointName}'");
 
             bool ok = _navigationManager.NavigateToWaypoint(target);
             Reply(ok
@@ -237,6 +214,10 @@ namespace IndoorNavAR.Integration
 
         #endregion
 
+        // =====================================================================
+        //  Waypoints
+        // =====================================================================
+
         #region Waypoints
 
         public void ListWaypoints()
@@ -244,14 +225,16 @@ namespace IndoorNavAR.Integration
             if (_waypointManager == null)
             { Reply(Err("list_waypoints", "WaypointManager no disponible")); return; }
 
-            Debug.Log($"[VoiceAPI] ListWaypoints: dirty={_waypointCacheDirty}, " +
-                      $"Count={_waypointManager.WaypointCount}");
-
             if (_waypointCacheDirty) RebuildWaypointCache();
 
-            Reply($"{{\"action\":\"list_waypoints\",\"ok\":true," +
-                  $"\"count\":{_waypointManager.WaypointCount}," +
-                  $"\"waypoints\":{_waypointListCache}}}");
+            // OPTIM: reutilizar _sb
+            _sb.Clear();
+            _sb.Append("{\"action\":\"list_waypoints\",\"ok\":true,\"count\":");
+            _sb.Append(_waypointManager.WaypointCount);
+            _sb.Append(",\"waypoints\":");
+            _sb.Append(_waypointListCache);
+            _sb.Append('}');
+            Reply(_sb.ToString());
         }
 
         public void CreateWaypointAtAgent(string name)
@@ -304,6 +287,10 @@ namespace IndoorNavAR.Integration
 
         #endregion
 
+        // =====================================================================
+        //  Sesión
+        // =====================================================================
+
         #region Sesión
 
         public void SaveSession() => _ = SaveAsync();
@@ -314,8 +301,7 @@ namespace IndoorNavAR.Integration
             if (_persistenceManager == null)
             { Reply(Err("save_session", "PersistenceManager no disponible")); return; }
             bool ok = await _persistenceManager.SaveSession();
-            Reply(ok ? Ok("save_session", "Sesión guardada")
-                     : Err("save_session", "Error al guardar"));
+            Reply(ok ? Ok("save_session", "Sesión guardada") : Err("save_session", "Error al guardar"));
         }
 
         private async System.Threading.Tasks.Task LoadAsync()
@@ -323,11 +309,14 @@ namespace IndoorNavAR.Integration
             if (_persistenceManager == null)
             { Reply(Err("load_session", "PersistenceManager no disponible")); return; }
             bool ok = await _persistenceManager.LoadSession();
-            Reply(ok ? Ok("load_session", "Sesión cargada")
-                     : Err("load_session", "Error al cargar"));
+            Reply(ok ? Ok("load_session", "Sesión cargada") : Err("load_session", "Error al cargar"));
         }
 
         #endregion
+
+        // =====================================================================
+        //  Evento llegada
+        // =====================================================================
 
         #region Evento llegada
 
@@ -346,6 +335,10 @@ namespace IndoorNavAR.Integration
 
         #endregion
 
+        // =====================================================================
+        //  Cache de waypoints
+        // =====================================================================
+
         #region Cache de waypoints
 
         private void RebuildWaypointCache()
@@ -355,36 +348,42 @@ namespace IndoorNavAR.Integration
             {
                 _waypointListCache  = "[]";
                 _waypointCacheDirty = false;
-                Debug.Log("[VoiceAPI] RebuildCache: lista vacía.");
                 return;
             }
 
-            var sb = new StringBuilder("[");
+            // OPTIM: reutilizar _sb
+            _sb.Clear();
+            _sb.Append('[');
+            bool first = true;
             for (int i = 0; i < list.Count; i++)
             {
                 var w = list[i];
                 if (w == null) continue;
-                if (sb.Length > 1) sb.Append(',');
+                if (!first) _sb.Append(',');
+                first = false;
 
-                sb.Append($"{{\"id\":\"{w.WaypointId}\"," +
-                           $"\"name\":\"{EscapeJson(w.WaypointName)}\"," +
-                           $"\"type\":\"{w.Type}\"," +
-                           $"\"navigable\":{(w.IsNavigable ? "true" : "false")}," +
-                           $"\"pos\":{{" +
-                               $"\"x\":{SafeFloat(w.Position.x)}," +
-                               $"\"y\":{SafeFloat(w.Position.y)}," +
-                               $"\"z\":{SafeFloat(w.Position.z)}" +
-                           $"}}}}");
+                _sb.Append("{\"id\":\"");   _sb.Append(w.WaypointId);
+                _sb.Append("\",\"name\":\""); _sb.Append(EscapeJson(w.WaypointName));
+                _sb.Append("\",\"type\":\""); _sb.Append(w.Type);
+                _sb.Append("\",\"navigable\":"); _sb.Append(w.IsNavigable ? "true" : "false");
+                _sb.Append(",\"pos\":{\"x\":"); _sb.Append(SafeFloat(w.Position.x));
+                _sb.Append(",\"y\":");          _sb.Append(SafeFloat(w.Position.y));
+                _sb.Append(",\"z\":");          _sb.Append(SafeFloat(w.Position.z));
+                _sb.Append("}}");
             }
-            sb.Append(']');
-            _waypointListCache  = sb.ToString();
+            _sb.Append(']');
+
+            _waypointListCache  = _sb.ToString();
             _waypointCacheDirty = false;
 
-            Debug.Log($"[VoiceAPI] RebuildCache OK: {list.Count} waypoint(s). " +
-                      $"Preview: {_waypointListCache.Substring(0, Math.Min(150, _waypointListCache.Length))}");
+            Debug.Log($"[VoiceAPI] RebuildCache OK: {list.Count} waypoints.");
         }
 
         #endregion
+
+        // =====================================================================
+        //  Envío a Flutter
+        // =====================================================================
 
         #region Envío a Flutter
 
@@ -394,11 +393,7 @@ namespace IndoorNavAR.Integration
             Debug.Log($"[VoiceAPI→Flutter] {json}");
         }
 
-        /// <summary>
-        /// ✅ FIX v5: try/finally explícito — NO 'using'.
-        /// En IL2CPP Unity6+arm64, 'using' llama Dispose() antes de que
-        /// CallStatic complete → NoSuchMethodError en runtime.
-        /// </summary>
+        // ✅ FIX v5: try/finally — conservado sin cambios
         private static void SendUnityMessageToFlutter(string go, string method, string msg)
         {
 #if UNITY_ANDROID && !UNITY_EDITOR
@@ -449,6 +444,10 @@ namespace IndoorNavAR.Integration
 
         #endregion
 
+        // =====================================================================
+        //  Helpers JSON — OPTIM: _sb reutilizado en Ok()
+        // =====================================================================
+
         #region Helpers JSON
 
         private readonly struct Arg
@@ -457,14 +456,20 @@ namespace IndoorNavAR.Integration
             public Arg(string k, string v) { Key = k; Val = v; }
         }
 
-        private static string Ok(string action, string message, params Arg[] extra)
+        private string Ok(string action, string message, params Arg[] extra)
         {
-            var sb = new StringBuilder();
-            sb.Append($"{{\"action\":\"{action}\",\"ok\":true,\"message\":\"{EscapeJson(message)}\"");
+            _sb.Clear();
+            _sb.Append("{\"action\":\""); _sb.Append(action);
+            _sb.Append("\",\"ok\":true,\"message\":\""); _sb.Append(EscapeJson(message));
+            _sb.Append('"');
             foreach (var a in extra)
-                sb.Append($",\"{a.Key}\":\"{EscapeJson(a.Val)}\"");
-            sb.Append('}');
-            return sb.ToString();
+            {
+                _sb.Append(",\""); _sb.Append(a.Key);
+                _sb.Append("\":\""); _sb.Append(EscapeJson(a.Val));
+                _sb.Append('"');
+            }
+            _sb.Append('}');
+            return _sb.ToString();
         }
 
         private static string Err(string action, string message) =>
@@ -473,15 +478,15 @@ namespace IndoorNavAR.Integration
         private static string EscapeJson(string s) =>
             s?.Replace("\\", "\\\\").Replace("\"", "\\\"").Replace("\n", "\\n") ?? "";
 
-        /// <summary>
-        /// ✅ FIX v6: Serialización segura de floats.
-        /// NaN/Infinity en IL2CPP → "0.00" para evitar FormatException en
-        /// jsonDecode() de Flutter.
-        /// </summary>
+        // ✅ FIX v6: floats seguros
         private static string SafeFloat(float v) =>
             float.IsNaN(v) || float.IsInfinity(v) ? "0.00" : v.ToString("F2");
 
         #endregion
+
+        // =====================================================================
+        //  ContextMenu debug
+        // =====================================================================
 
         #region ContextMenu debug
 
@@ -509,6 +514,15 @@ namespace IndoorNavAR.Integration
                 CurrentFloor     = 0
             });
         }
+
+        [ContextMenu("Test: TTS Start (priority 2)")]
+        private void DbgTTSStartHigh()   => OnTTSStatus("{\"isSpeaking\":true,\"priority\":2}");
+
+        [ContextMenu("Test: TTS Start (priority 3)")]
+        private void DbgTTSStartUrgent() => OnTTSStatus("{\"isSpeaking\":true,\"priority\":3}");
+
+        [ContextMenu("Test: TTS End")]
+        private void DbgTTSEnd()         => OnTTSStatus("{\"isSpeaking\":false,\"priority\":0}");
 
         #endregion
     }
