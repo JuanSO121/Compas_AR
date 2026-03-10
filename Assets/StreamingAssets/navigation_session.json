@@ -1,10 +1,10 @@
 {
     "version": "2.0",
-    "timestamp": "2026-03-01 21:32:01",
-    "waypointCount": 2,
+    "timestamp": "2026-03-09 21:04:19",
+    "waypointCount": 3,
     "waypoints": [
         {
-            "id": "4190fccc-42c3-42f1-acc6-5a2509fd638b",
+            "id": "7d467feb-5708-4ee7-83c7-49b643ef253b",
             "name": "Entrada / Salida",
             "type": 1,
             "position": {
@@ -30,7 +30,7 @@
             "isNavigable": true
         },
         {
-            "id": "79c000b9-01a5-416e-b0c9-be95c51bad6e",
+            "id": "7a9b0c52-8e78-4dd3-8db9-bc628ae3885e",
             "name": "Habitación 2° Piso",
             "type": 5,
             "position": {
@@ -49,6 +49,32 @@
                 "g": 0.4000000059604645,
                 "b": 0.800000011920929,
                 "a": 0.800000011920929
+            },
+            "height": 0.5,
+            "radius": 0.15000000596046449,
+            "description": "",
+            "isNavigable": true
+        },
+        {
+            "id": "0b8a6f9a-899e-42c6-adc7-907d0e839b8d",
+            "name": "Waypoint_3",
+            "type": 0,
+            "position": {
+                "x": -2.740000009536743,
+                "y": 0.5,
+                "z": -2.1242809295654299
+            },
+            "rotation": {
+                "x": 0.0,
+                "y": 0.0,
+                "z": 0.0,
+                "w": 1.0
+            },
+            "color": {
+                "r": 0.0,
+                "g": 1.0,
+                "b": 1.0,
+                "a": 1.0
             },
             "height": 0.5,
             "radius": 0.15000000596046449,

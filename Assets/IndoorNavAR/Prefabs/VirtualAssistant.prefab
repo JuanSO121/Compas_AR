@@ -13,6 +13,9 @@ GameObject:
   - component: {fileID: 190788527659418708}
   - component: {fileID: 7784056001429803027}
   - component: {fileID: 3591176874749200417}
+  - component: {fileID: 6913761919810237098}
+  - component: {fileID: 6088798759352734889}
+  - component: {fileID: 8311457197044558507}
   m_Layer: 0
   m_Name: VirtualAssistant
   m_TagString: Untagged
@@ -72,6 +75,8 @@ MonoBehaviour:
   m_EditorClassIdentifier: Assembly-CSharp::IndoorNavAR.Navigation.NavigationAgent
   _detectFloorTransitions: 1
   _publishEvents: 1
+  _verifyNavMeshOnFullAR: 1
+  _fullARVerifyRadius: 3
   _debugDestination: {fileID: 0}
   _logVerbose: 0
 --- !u!120 &7784056001429803027
@@ -220,7 +225,111 @@ MonoBehaviour:
   _lookAheadColor: {r: 1, g: 0.92156863, b: 0.015686275, a: 1}
   _destinationColor: {r: 0, g: 1, b: 0.3, a: 0.8}
   _stairColor: {r: 1, g: 0.5, b: 0, a: 1}
-  _logVerbose: 0
+  _logVerbose: 1
+--- !u!114 &6913761919810237098
+MonoBehaviour:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_GameObject: {fileID: 2184020662871595315}
+  m_Enabled: 1
+  m_EditorHideFlags: 0
+  m_Script: {fileID: 11500000, guid: 54f08d9679501474dafc18af564f6904, type: 3}
+  m_Name: 
+  m_EditorClassIdentifier: Assembly-CSharp::IndoorNavAR.Agent.ARGuideController
+  _xrOrigin: {fileID: 0}
+  _safeDistance: 3
+  _minDistance: 1.5
+  _maxReturnDistance: 5
+  _arrivalConfirmDist: 2
+  _arrivalTimeout: 30
+  _arrivalMinDelay: 3
+  _maxAgentSpeed: 1.4
+  _minLeadingSpeed: 0.8
+  _closedistSpeedFactor: 0.5
+  _stairSpeedFactor: 0.5
+  _initialNavigationPause: 3.5
+  _postTurnPauseSeconds: 4
+  _postTurnMaxWait: 10
+  _postTurnResumeSpeed: 0.15
+  _pauseForHighPriorityTTS: 1
+  _ttsPauseMinPriority: 1
+  _maxTTSWaitTime: 8
+  _stairWarningDistance: 2.5
+  _stairConfirmDistance: 2
+  _stairHeightThreshold: 0.4
+  _maxAngle: 120
+  _rotationSpeed: 90
+  _evaluationInterval: 0.25
+  _logStateChanges: 1
+  _logEvaluations: 0
+  _logStairs: 1
+  _logTTSSync: 1
+  _logAccessibility: 1
+  _logFullAR: 1
+  _drawGizmos: 1
+  _safeColor: {r: 0, g: 1, b: 0, a: 0.25}
+  _returnColor: {r: 1, g: 0.4, b: 0, a: 0.2}
+  _minColor: {r: 0, g: 0.8, b: 1, a: 0.2}
+  _destinationColor: {r: 1, g: 1, b: 0, a: 0.8}
+  _stairColor: {r: 1, g: 0, b: 1, a: 0.35}
+--- !u!114 &6088798759352734889
+MonoBehaviour:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_GameObject: {fileID: 2184020662871595315}
+  m_Enabled: 1
+  m_EditorHideFlags: 0
+  m_Script: {fileID: 11500000, guid: 00b2293dbfe0dfe4997cd050d91d98ab, type: 3}
+  m_Name: 
+  m_EditorClassIdentifier: Assembly-CSharp::IndoorNavAR.Navigation.Voice.NavigationVoiceGuide
+  _userBridge: {fileID: 8311457197044558507}
+  _pathController: {fileID: 3591176874749200417}
+  _turnTriggerDist: 5
+  _stairTriggerDist: 6
+  _arrivalTriggerDist: 1.5
+  _straightReminderDist: 12
+  _evalInterval: 0.1
+  _pathWaitTimeout: 3
+  _pathPollInterval: 0.1
+  _destinationChangeThreshold: 0.5
+  _startDelay: 2.5
+  _stairHeightThreshold: 0.3
+  _slightTurnAngle: 20
+  _definiteTurnAngle: 50
+  _uTurnAngle: 140
+  _walkSpeedFlat: 0.8
+  _walkSpeedStairs: 0.4
+  _stepLength: 0.7
+  _straightReminderInterval: 20
+  _progressInterval: 45
+  _stopTimeout: 4
+  _stopMinMovement: 0.25
+  _stopReminderInterval: 15
+  _deviationDist: 2
+  _deviationDelay: 2.5
+  _obstacleCheckTime: 6
+  _longSeparationTime: 12
+  _logInstructions: 1
+  _logPreprocessing: 1
+--- !u!114 &8311457197044558507
+MonoBehaviour:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_GameObject: {fileID: 2184020662871595315}
+  m_Enabled: 1
+  m_EditorHideFlags: 0
+  m_Script: {fileID: 11500000, guid: 75f9b6c73a997f9429797cae930e341a, type: 3}
+  m_Name: 
+  m_EditorClassIdentifier: Assembly-CSharp::IndoorNavAR.Navigation.Voice.UserPositionBridge
+  _xrOrigin: {fileID: 0}
+  _arOriginAligner: {fileID: 0}
+  _virtualAgentTransform: {fileID: 7016565646962738363}
 --- !u!1001 &974987646280666911
 PrefabInstance:
   m_ObjectHideFlags: 0

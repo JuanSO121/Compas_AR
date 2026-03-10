@@ -362,7 +362,7 @@ namespace IndoorNavAR.Core
             }
         }
 
-        private async Task LoadSessionData(SessionData data)
+private async Task LoadSessionData(SessionData data)
         {
             // Esperar frames para que ARCore y el RenderPipeline terminen de inicializarse
             await Task.Yield();
@@ -375,9 +375,35 @@ namespace IndoorNavAR.Core
 
                 var restoreTask = _modelLoadManager.RestoreModelTransform(
                     data.modelPosition, data.modelRotation, data.modelScale);
-                var timeoutTask = Task.Delay(8000);
 
-                var winner = await Task.WhenAny(restoreTask, timeoutTask);
+                // ✅ FIX — Timeout separado para Editor y dispositivo:
+                //
+                // PROBLEMA ORIGINAL:
+                //   En Editor no hay ARCore real. ResolveARPosition() dentro de
+                //   ModelLoadManager esperaba 8s buscando planos que nunca llegan,
+                //   pero este método tenía un Task.WhenAny con timeout de 8000ms —
+                //   el mismo valor — así que este timeout disparaba primero (o al mismo
+                //   tiempo), logueaba el error TIMEOUT, y continuaba sin modelo.
+                //
+                // EN EDITOR:
+                //   ResolveARPosition() retorna inmediatamente con la posición guardada
+                //   gracias al #if UNITY_EDITOR en ModelLoadManager. Sin espera de planos,
+                //   el restoreTask completa en <1 frame. No necesitamos timeout aquí.
+                //
+                // EN DISPOSITIVO:
+                //   ResolveARPosition() puede tardar hasta _planeWaitTimeout (8s).
+                //   El timeout aquí debe ser > 8s para no cancelar antes. Usamos 11s
+                //   (8s + 3s de margen para instanciación del modelo y Start() de hijos).
+
+#if UNITY_EDITOR
+                bool modelOk = await restoreTask;
+                if (!modelOk)
+                    Debug.LogWarning("[PersistenceManager] ⚠️ RestoreModelTransform retornó false");
+                else
+                    Log("✅ Modelo restaurado correctamente.");
+#else
+                var timeoutTask = Task.Delay(11000); // > _planeWaitTimeout (8s) + margen
+                var winner      = await Task.WhenAny(restoreTask, timeoutTask);
 
                 if (winner == timeoutTask)
                 {
@@ -392,6 +418,7 @@ namespace IndoorNavAR.Core
                     else
                         Log("✅ Modelo restaurado correctamente.");
                 }
+#endif
 
                 // ✅ FIX v10 BUG #1 y #3: Esperar tiempo suficiente para que los
                 // StairWithLandingHelper instanciados durante RestoreModelTransform
@@ -414,18 +441,14 @@ namespace IndoorNavAR.Core
 
             // ✅ FIX v10: Esperar a que RecreateStairGeometryAsync (llamado dentro de
             // LoadNavMeshFromFile) y NotifyNavMeshReady() hayan terminado completamente
-            // antes de cargar los waypoints. Sin esto, los eventos de Unity disparados
-            // por NotifyNavMeshReady pueden interleavearse con CreateWaypoint().
+            // antes de cargar los waypoints.
             await Task.Delay(200);
 
             Log("🔧 LoadNavMeshFromFile completado.");
 
             // ✅ FIX v10 BUG #2: Validación defensiva completa antes de pasarlos al manager.
-            // Filtra entradas nulas, con id/name vacío, o con posición NaN que JsonUtility
-            // puede generar en IL2CPP cuando los campos Color tienen valores no estándar.
             if (_waypointManager != null && data.waypoints != null && data.waypoints.Count > 0)
             {
-                // Log diagnóstico: mostrar TODOS los elementos recibidos
                 Log($"📍 Validando {data.waypoints.Count} waypoint(s) antes de cargar...");
                 for (int i = 0; i < data.waypoints.Count; i++)
                 {
@@ -439,7 +462,6 @@ namespace IndoorNavAR.Core
                         $"name='{w.name ?? "NULL"}' pos={w.position} navigable={w.isNavigable}");
                 }
 
-                // Filtrar entradas inválidas
                 var validWaypoints = data.waypoints
                     .Where(w => w != null
                                 && !string.IsNullOrEmpty(w.id)
@@ -465,7 +487,6 @@ namespace IndoorNavAR.Core
                 Log($"ℹ️ Sin waypoints que cargar (count={data.waypoints?.Count ?? 0})");
             }
         }
-
         // ─── NavMesh ──────────────────────────────────────────────────────
 
         public async Task<bool> LoadNavMeshFromFile()
@@ -514,7 +535,7 @@ namespace IndoorNavAR.Core
                 Log("ℹ️ No hay StairWithLandingHelper en escena.");
                 NavigationStartPointManager.ConfirmModelPositioned();
                 Log("📍 Posición del modelo confirmada a todos los StartPoints.");
-                NavigationStartPointManager.NotifyNavMeshReady();
+                NavigationStartPointManager.NotifyNavMeshReadyAfterSessionRestore();
                 return;
             }
 
@@ -560,7 +581,7 @@ namespace IndoorNavAR.Core
             Log("📍 Posición del modelo confirmada a todos los StartPoints.");
 
             Log("✅ NavMesh completo — notificando StartPoints...");
-            NavigationStartPointManager.NotifyNavMeshReady();
+            NavigationStartPointManager.NotifyNavMeshReadyAfterSessionRestore();
         }
 
         public void RemoveLoadedNavMesh()

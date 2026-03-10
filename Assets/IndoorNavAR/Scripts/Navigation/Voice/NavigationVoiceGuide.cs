@@ -1,78 +1,57 @@
 // File: NavigationVoiceGuide.cs
 // Carpeta: Assets/IndoorNavAR/Scripts/Navigation/Voice/
-// ✅ v4.4 — Fix EvalPos en FullAR + WaitForPath robusto + StairsWarning no se repite
+// ✅ v5.4 — FIX: Instrucciones relativas a la orientación real del usuario (cámara XR)
+//           FIX: Segmentación automática de waypoints en rutas diagonales
 //
-// ══════════════════════════════════════════════════════════════════════════════
-// BUGS CORREGIDOS v4.3 → v4.4
-// ══════════════════════════════════════════════════════════════════════════════
+// ============================================================================
+//  CAMBIOS v5.3 → v5.4
+// ============================================================================
 //
-// ── BUG 1 CRÍTICO: StairsWarning se repetía en loop ─────────────────────────
+//  PROBLEMA 1 — Instrucciones no relativas a la orientación del usuario:
 //
-//   SÍNTOMA (logs):
-//     "[VoiceGuide] ⏳ Evento [StairsWarning] aún dentro de trigger (4.2m <= 6.0m).
-//      Esperando..." → se repetía decenas de veces → timeout → guía activaba
-//      con todos los eventos todavía dentro del radio de trigger.
+//    En v5.3, ClassifyTurn() calcula el ángulo entre dirIn (segmento anterior)
+//    y dirOut (segmento siguiente). Esto da la curvatura de la ruta en el
+//    NavMesh, NO la dirección relativa al usuario físico.
 //
-//   CAUSA:
-//     EvalPos en FullAR devolvía UserPositionBridge.AgentPosition.
-//     El comentario de v4.3 decía "el NPC recorre el NavMesh, los triggers
-//     deben dispararse cuando el NPC llega al punto". Esto era CORRECTO para
-//     NoAR (donde el NPC se mueve) pero INCORRECTO para FullAR.
+//    EJEMPLO DEL BUG:
+//      Ruta: A → B → C donde A→B va al Norte y B→C va al Este.
+//      El NavMesh dice "gira 90° a la derecha en B".
+//      Pero si el usuario está mirando al Sur, "la derecha" del NavMesh
+//      es en realidad "su izquierda". → Instrucción incorrecta.
 //
-//     En FullAR el agente NPC es ESTÁTICO: AROriginAligner lo mueve solo
-//     para reflejar la posición del usuario, NO para avanzar por la ruta.
-//     Entonces AgentPosition ≈ UserPosition ≈ inicio de la ruta.
+//    FIX 1 — ClassifyTurnRelativeToUser():
+//      En lugar de comparar dirIn vs dirOut, compara UserForward vs dirOut.
+//      El ángulo resultante es el giro real que el usuario necesita hacer
+//      desde su orientación actual para seguir la ruta.
+//      Se usa SignedAngleXZ(UserFwd, dirOut) con signo para determinar
+//      si el giro es izquierda (negativo) o derecha (positivo).
 //
-//     Resultado: el agente siempre estaba a 4.2m de la escalera (dentro
-//     del trigger de 6.0m), el loop de "esperando" nunca terminaba, y al
-//     hacer timeout el evento StairsWarning se disparaba inmediatamente.
+//  PROBLEMA 2 — Rutas diagonales generan instrucciones ambiguas:
 //
-//   FIX v4.4:
-//     En FullAR, EvalPos = UserPos (posición real del usuario = cámara XR).
-//     Son lo mismo en FullAR: el agente está sincronizado con el usuario.
-//     En NoAR, EvalPos = AgentPosition (el NPC se mueve por el NavMesh,
-//     puede estar adelante del usuario).
+//    Si hay un waypoint B que está, por ejemplo, a 45° de la posición del
+//    usuario, el sistema dice "gira levemente a la izquierda" pero en
+//    realidad el camino óptimo es: recto 5 pasos, luego curva suave.
+//    El problema es que el NavMesh crea segmentos diagonales para optimizar
+//    la longitud de la ruta pero estos segmentos no corresponden con
+//    "caminar recto" desde la perspectiva del usuario.
 //
-//     ADICIONALMENTE: el loop de "esperando" en WaitForPath ahora tiene
-//     un límite distinto para cada tipo de evento:
-//       - StartNavigation: siempre se activa (está en wp[0], siempre cerca)
-//       - StairsWarning/Turn: se omiten del check de "dentro de trigger"
-//         si la distancia actual es irreducible (usuario en el inicio)
+//    FIX 2 — SubdivideWaypointSegments():
+//      Antes de BuildInstructions(), los segmentos más largos que
+//      _maxSegmentLength se subdividen en sub-waypoints intermedios.
+//      En cada sub-waypoint se comprueba si hay un giro significativo
+//      respecto a la trayectoria previa. Los sub-waypoints "rectos"
+//      se insertan silenciosamente para mejorar la precisión de las
+//      instrucciones de giro en los vértices reales de la ruta.
 //
-// ── BUG 2: WaitForPath — loop de "dentro de trigger" nunca terminaba ─────────
+//    FIX 3 — InstructionBuilder con lookahead de segmento recto previo:
+//      Al generar una instrucción de giro en el waypoint i, se calcula
+//      cuántos pasos lleva el usuario caminando recto antes de ese giro.
+//      Si el segmento previo era recto (< _slightTurnAngle de deflexión),
+//      el mensaje incluye primero el segmento recto: 
+//      "Continúa {n} pasos recto, luego gira a la derecha."
+//      Esto da instrucciones mucho más naturales y precisas.
 //
-//   CAUSA:
-//     El loop revisaba si algún evento estaba dentro de su TriggerDistance.
-//     En FullAR con escaleras cercanas al inicio, StairsWarning.TriggerDist
-//     (6.0m) era mayor que la distancia actual (4.2m) desde el inicio.
-//     El usuario no puede alejarse más del StartPoint hacia atrás, así que
-//     la condición NUNCA se cumplía y hacía timeout siempre.
-//
-//   FIX v4.4:
-//     El loop de verificación pre-guía ahora EXCLUYE eventos cuyo
-//     WorldPosition está DETRÁS del usuario (dot product negativo con la
-//     dirección de avance), y también excluye eventos de tipo StartNavigation
-//     ya que ese siempre se dispara en el primer frame.
-//     Si todos los eventos pendientes están "detrás" o son StartNavigation,
-//     el loop termina inmediatamente.
-//
-// ── BUG 3: Llegada prematura vía ARGuideController ───────────────────────────
-//
-//   CAUSA:
-//     ARGuideController.EvaluateArrivalInFullAR() disparaba llegada antes
-//     de que el usuario llegara al destino real. Esto publicaba
-//     NavigationCompletedEvent → OnNavCompleted() → ResetSession() →
-//     toda la sesión de VoiceGuide terminaba prematuramente.
-//
-//   FIX v4.4 (en NavigationVoiceGuide):
-//     OnNavCompleted() ahora verifica si el evento Arrived ya fue disparado
-//     por EvaluateInstructions(). Si no fue disparado, no hace ResetSession()
-//     inmediatamente — espera a que el usuario realmente llegue al destino
-//     evaluando la distancia directamente.
-//     (El fix principal está en ARGuideController._arrivalMinDelay, pero
-//     esta es una capa de defensa adicional.)
-//
-// ── TODOS LOS FIXES DE v4.3 SE CONSERVAN ÍNTEGRAMENTE ───────────────────────
+//  TODOS LOS FIXES DE v5.0 - v5.3 SE CONSERVAN ÍNTEGRAMENTE.
 
 using System.Collections;
 using System.Collections.Generic;
@@ -81,10 +60,6 @@ using IndoorNavAR.Core.Events;
 
 namespace IndoorNavAR.Navigation.Voice
 {
-    // =========================================================================
-    //  TIPOS
-    // =========================================================================
-
     public enum VoiceInstructionType
     {
         StartNavigation, GoStraight, TurnLeft, TurnRight,
@@ -115,107 +90,97 @@ namespace IndoorNavAR.Navigation.Voice
         }
     }
 
-    // =========================================================================
-    //  COMPONENTE PRINCIPAL
-    // =========================================================================
-
     public sealed class NavigationVoiceGuide : MonoBehaviour
     {
         public static NavigationVoiceGuide Instance { get; private set; }
-
-        // ── Inspector — Referencias ───────────────────────────────────────────
 
         [Header("─── Referencias ─────────────────────────────────────────────")]
         [SerializeField] private UserPositionBridge       _userBridge;
         [SerializeField] private NavigationPathController _pathController;
 
-        // ── Inspector — Triggers ──────────────────────────────────────────────
-
         [Header("─── Triggers de distancia ──────────────────────────────────")]
-        [Tooltip("Distancia usuario→waypoint de giro para anunciar (m).")]
         [SerializeField] private float _turnTriggerDist      = 5.0f;
-        [Tooltip("Distancia usuario→inicio de escalera para advertir (m).")]
         [SerializeField] private float _stairTriggerDist     = 6.0f;
-        [Tooltip("Distancia usuario real→destino final para anunciar llegada (m).")]
         [SerializeField] private float _arrivalTriggerDist   = 1.5f;
-        [Tooltip("Distancia mínima al próximo waypoint para lanzar recordatorio (m).")]
         [SerializeField] private float _straightReminderDist = 12.0f;
-
-        // ── Inspector — Rendimiento ───────────────────────────────────────────
 
         [Header("─── Rendimiento ─────────────────────────────────────────────")]
         [SerializeField, Range(0.05f, 0.5f)]
         private float _evalInterval = 0.10f;
-
-        // ── Inspector — Espera de ruta ────────────────────────────────────────
 
         [Header("─── Espera de Ruta ──────────────────────────────────────────")]
         [SerializeField] private float _pathWaitTimeout            = 3.0f;
         [SerializeField] private float _pathPollInterval           = 0.1f;
         [SerializeField] private float _destinationChangeThreshold = 0.5f;
 
-        // ── Inspector — Inicio ────────────────────────────────────────────────
-
         [Header("─── Timing de inicio ───────────────────────────────────────")]
-        [Tooltip("Segundos de espera entre StartNavigation y activar evaluaciones.")]
         [SerializeField] private float _startDelay = 2.5f;
-
-        // ── Inspector — Escaleras ─────────────────────────────────────────────
 
         [Header("─── Escaleras ──────────────────────────────────────────────")]
         [SerializeField] private float _stairHeightThreshold = 0.3f;
 
-        // ── Inspector — Ángulos ───────────────────────────────────────────────
+        [Header("─── Escaleras — Tolerancia Y (FIX D) ──────────────────────")]
+        [Tooltip("Diferencia máxima en Y (metros) entre UserPos y el WorldPosition del evento " +
+                 "StairsComplete o Arrived para que se disparen.")]
+        [SerializeField] private float _stairYTolerance = 1.2f;
 
         [Header("─── Ángulos de Giro ─────────────────────────────────────────")]
         [SerializeField] private float _slightTurnAngle   = 20f;
         [SerializeField] private float _definiteTurnAngle = 50f;
         [SerializeField] private float _uTurnAngle        = 140f;
 
-        // ── Inspector — Física humana ─────────────────────────────────────────
+        [Header("─── v5.4: Subdivisión de segmentos diagonales ───────────────")]
+        [Tooltip("Longitud máxima (m) de un segmento antes de subdividirlo para " +
+                 "mejorar la precisión de las instrucciones. 0 = desactivado.")]
+        [SerializeField] private float _maxSegmentLength = 3.0f;
+
+        [Tooltip("Ángulo máximo (°) de deflexión para considerar un segmento como " +
+                 "'recto' y añadir el prefijo 'X pasos recto, luego...' en el mensaje.")]
+        [SerializeField] private float _straightSegmentAngle = 15f;
+
+        [Tooltip("Longitud mínima (m) de un segmento recto para que valga la pena " +
+                 "mencionar el trecho recto previo al giro.")]
+        [SerializeField] private float _minMentionableStraightDist = 1.5f;
 
         [Header("─── Física Humana ─────────────────────────────────────────")]
         [SerializeField] private float _walkSpeedFlat   = 0.8f;
         [SerializeField] private float _walkSpeedStairs = 0.4f;
         [SerializeField] private float _stepLength      = 0.7f;
 
-        // ── Inspector — Recordatorios ─────────────────────────────────────────
-
         [Header("─── Recordatorios ───────────────────────────────────────────")]
         [SerializeField] private float _straightReminderInterval = 20f;
         [SerializeField] private float _progressInterval         = 45f;
-
-        // ── Inspector — [E1] Parada ───────────────────────────────────────────
 
         [Header("─── [E1] Parada del usuario ─────────────────────────────────")]
         [SerializeField] private float _stopTimeout          = 4.0f;
         [SerializeField] private float _stopMinMovement      = 0.25f;
         [SerializeField] private float _stopReminderInterval = 15.0f;
 
-        // ── Inspector — [E2] Desviación ───────────────────────────────────────
-
         [Header("─── [E2] Desviación del camino ────────────────────────────")]
         [SerializeField] private float _deviationDist  = 2.0f;
         [SerializeField] private float _deviationDelay = 2.5f;
 
-        // ── Inspector — [E3] Obstáculo ────────────────────────────────────────
-
         [Header("─── [E3] Obstáculo ─────────────────────────────────────────")]
         [SerializeField] private float _obstacleCheckTime = 6.0f;
-
-        // ── Inspector — [E6] Separación larga ────────────────────────────────
 
         [Header("─── [E6] Separación larga ───────────────────────────────────")]
         [SerializeField] private float _longSeparationTime = 12.0f;
 
-        // ── Inspector — Debug ─────────────────────────────────────────────────
+        [Header("─── [E7] Desorientación / Instrucciones direccionales (v5.0) ─")]
+        [SerializeField] private float _misalignAngleThreshold   = 45f;
+        [SerializeField] private float _misalignConfirmTime      = 3.0f;
+        [SerializeField] private float _misalignReminderInterval = 12f;
+        [SerializeField] private float _misalignMinSpeed         = 0.2f;
+
+        [Header("─── Dedup de instrucciones (FIX E) ──────────────────────────")]
+        [Tooltip("Segundos durante los cuales un texto idéntico no se repite.")]
+        [SerializeField] private float _dedupWindow = 3.0f;
 
         [Header("─── Debug ────────────────────────────────────────────────────")]
         [SerializeField] private bool _logInstructions  = true;
         [SerializeField] private bool _logPreprocessing = true;
 
         // ── Estado de sesión ──────────────────────────────────────────────────
-
         private readonly List<NavigationInstructionEvent> _events = new(24);
         private int     _nextIdx         = 0;
         private bool    _isGuiding       = false;
@@ -223,33 +188,38 @@ namespace IndoorNavAR.Navigation.Voice
         private string  _destName        = string.Empty;
         private Vector3 _destPos         = new(float.PositiveInfinity, 0, 0);
 
-        // ── Recordatorios ─────────────────────────────────────────────────────
         private float _lastStraightTime = -999f;
         private int   _lastStraightIdx  = -1;
         private float _lastProgressTime = -999f;
 
-        // ── [E1] Parada ───────────────────────────────────────────────────────
         private Vector3 _stopRefPos;
         private float   _stopAccumTime    = 0f;
         private bool    _isStopped        = false;
         private float   _lastStopReminder = -999f;
 
-        // ── [E2] Desviación ───────────────────────────────────────────────────
         private float _deviationTimer = 0f;
         private bool  _deviationFired = false;
 
-        // ── [E3] Obstáculo ────────────────────────────────────────────────────
         private float _obstacleTimer  = 0f;
         private float _lastDistToNext = float.MaxValue;
         private bool  _obstacleFired  = false;
 
-        // ── [E6] Separación ───────────────────────────────────────────────────
         private float _returningTimer = 0f;
 
         private int       _currentFloor  = 0;
         private Coroutine _waitCoroutine = null;
 
         private float _evalAccum = 0f;
+
+        private Coroutine _ttsResumeCoroutine = null;
+
+        // FIX E: Dedup de Speak()
+        private string _lastSpokenText = string.Empty;
+        private float  _lastSpokenTime = -999f;
+
+        // v5.0: [E7] Desorientación
+        private float _misalignTimer    = 0f;
+        private float _lastMisalignTime = -999f;
 
         // ─────────────────────────────────────────────────────────────────────
         //  POSICIONES
@@ -267,23 +237,6 @@ namespace IndoorNavAR.Navigation.Voice
 
         private float UserSpeed => _userBridge?.UserSpeed ?? 0f;
 
-        /// <summary>
-        /// ✅ v4.4 FIX — Posición para evaluar triggers de instrucciones de ruta.
-        ///
-        /// CORRECCIÓN RESPECTO A v4.3:
-        ///
-        ///   v4.3 usaba AgentPosition en FullAR pensando que "el NPC recorre el
-        ///   NavMesh". PERO en FullAR el NPC es ESTÁTICO — AROriginAligner lo
-        ///   sincroniza con la cámara, por eso AgentPosition ≈ UserPosition.
-        ///   El NPC no avanza hacia el destino: la ruta existe solo para que
-        ///   NavigationVoiceGuide evalúe la posición del USUARIO contra ella.
-        ///
-        ///   En FullAR: EvalPos = UserPos (cámara XR = posición real del usuario).
-        ///   En NoAR:   EvalPos = AgentPosition (el NPC se mueve, puede ir
-        ///              adelante del usuario y pre-avisar antes de los giros).
-        ///
-        ///   El evento Arrived siempre usa UserPos en ambos modos.
-        /// </summary>
         private Vector3 EvalPos => IsFullARMode ? UserPos : (_userBridge?.AgentPosition ?? UserPos);
 
         // ─────────────────────────────────────────────────────────────────────
@@ -315,7 +268,7 @@ namespace IndoorNavAR.Navigation.Voice
                 Debug.LogWarning("[VoiceGuide] ⚠️ NavigationPathController no encontrado.");
 
             SubscribeEvents();
-            Debug.Log($"[VoiceGuide] ✅ Iniciado. EventBus={EventBus.Instance != null}");
+            Debug.Log($"[VoiceGuide] ✅ v5.4 Iniciado. EventBus={EventBus.Instance != null}");
         }
 
         private void OnEnable()  => SubscribeEvents();
@@ -367,6 +320,7 @@ namespace IndoorNavAR.Navigation.Voice
             EvaluateDeviation(dt);
             EvaluateObstacle(dt);
             EvaluateProgress();
+            EvaluateMisalignment(dt);
         }
 
         // ─────────────────────────────────────────────────────────────────────
@@ -380,9 +334,6 @@ namespace IndoorNavAR.Navigation.Voice
             if (_nextIdx >= _events.Count) return;
             if (_ttsBusy) return;
 
-            // ✅ v4.4: EvalPos = UserPos en FullAR, AgentPosition en NoAR.
-            // En FullAR el agente está sincronizado con el usuario, son lo mismo.
-            // En NoAR el agente puede ir adelante para pre-avisar giros.
             Vector3 evalPos = EvalPos;
             Vector3 userPos = UserPos;
 
@@ -391,22 +342,36 @@ namespace IndoorNavAR.Navigation.Voice
                 var evt = _events[i];
                 if (evt.HasFired) { _nextIdx = i + 1; continue; }
 
-                // Arrived siempre contra UserPos real
                 Vector3 checkPos = evt.Type == VoiceInstructionType.Arrived ? userPos : evalPos;
 
-                if (Vector3.Distance(checkPos, evt.WorldPosition) <= evt.TriggerDistance)
-                {
-                    FireEvent(evt);
-                    evt.HasFired = true;
-                    _nextIdx     = i + 1;
+                if (!ShouldFireEvent(evt, checkPos))
+                    break;
 
-                    if (GetPriority(evt.Type) >= 2)
-                        return;
-                }
-                else break;
+                FireEvent(evt);
+                evt.HasFired = true;
+                _nextIdx     = i + 1;
+
+                if (GetPriority(evt.Type) >= 2)
+                    return;
             }
 
             EvaluateStraightReminder();
+        }
+
+        private bool ShouldFireEvent(NavigationInstructionEvent evt, Vector3 checkPos)
+        {
+            float dist = Vector3.Distance(checkPos, evt.WorldPosition);
+            if (dist > evt.TriggerDistance) return false;
+
+            if (evt.Type == VoiceInstructionType.StairsComplete ||
+                evt.Type == VoiceInstructionType.Arrived)
+            {
+                float yDelta = Mathf.Abs(UserPos.y - evt.WorldPosition.y);
+                if (yDelta > _stairYTolerance)
+                    return false;
+            }
+
+            return true;
         }
 
         private void ClearTTSBusy() => _ttsBusy = false;
@@ -473,9 +438,10 @@ namespace IndoorNavAR.Navigation.Voice
                 _lastStopReminder = Time.time;
                 float rem   = RemainingDistFromUser();
                 int   steps = Mathf.Max(1, Mathf.RoundToInt(rem / _stepLength));
-                Speak(VoiceInstructionType.UserStopped,
-                    $"Tómate tu tiempo. El destino está a {steps} pasos. Sigue al guía cuando estés listo.",
-                    priority: 0);
+                string stopReminder = IsFullARMode
+                    ? $"Tómate tu tiempo. El destino está a {steps} pasos. Continúa cuando estés listo."
+                    : $"Tómate tu tiempo. El destino está a {steps} pasos. Sigue al guía cuando estés listo.";
+                Speak(VoiceInstructionType.UserStopped, stopReminder, priority: 0);
             }
         }
 
@@ -495,10 +461,12 @@ namespace IndoorNavAR.Navigation.Voice
                 if (_deviationTimer >= _deviationDelay && !_deviationFired)
                 {
                     _deviationFired = true;
-                    Speak(VoiceInstructionType.UserDeviated,
-                        "Te has desviado del camino. Detente y busca al guía virtual. " +
-                        "Camina hacia él para retomar la ruta.",
-                        priority: 2);
+                    string deviationMsg = IsFullARMode
+                        ? "Te has desviado del camino. Detente y oriéntate. " +
+                          "Gira hasta ver la ruta marcada y retoma el camino."
+                        : "Te has desviado del camino. Detente y busca al guía virtual. " +
+                          "Camina hacia él para retomar la ruta.";
+                    Speak(VoiceInstructionType.UserDeviated, deviationMsg, priority: 2);
                 }
             }
             else
@@ -570,6 +538,69 @@ namespace IndoorNavAR.Navigation.Voice
         }
 
         // ─────────────────────────────────────────────────────────────────────
+        //  v5.0 — [E7] DESORIENTACIÓN DEL USUARIO
+        // ─────────────────────────────────────────────────────────────────────
+
+        private void EvaluateMisalignment(float dt)
+        {
+            if (!IsFullARMode) return;
+            if (UserSpeed < _misalignMinSpeed) return;
+            if (_isStopped) return;
+            if (_nextIdx >= _events.Count) return;
+            if (_ttsBusy) return;
+
+            Vector3 nextWpPos = _events[_nextIdx].WorldPosition;
+            Vector3 toNext    = nextWpPos - UserPos;
+            toNext.y = 0f;
+
+            if (toNext.sqrMagnitude < 0.25f) return;
+
+            toNext.Normalize();
+
+            float signedAngle = SignedAngleXZ(UserFwd, toNext);
+            float absAngle    = Mathf.Abs(signedAngle);
+
+            if (absAngle > _misalignAngleThreshold)
+            {
+                _misalignTimer += dt;
+
+                if (_misalignTimer >= _misalignConfirmTime &&
+                    Time.time - _lastMisalignTime >= _misalignReminderInterval)
+                {
+                    _lastMisalignTime = Time.time;
+                    _misalignTimer    = 0f;
+
+                    string dir   = DirectionLabel(signedAngle);
+                    float  dist  = Vector3.Distance(UserPos, nextWpPos);
+                    int    steps = Mathf.Max(1, Mathf.RoundToInt(dist / _stepLength));
+                    string text;
+
+                    if (absAngle <= 50f)
+                        text = $"El camino está {dir}. Gira levemente y continúa. " +
+                               $"En {steps} pasos llegarás a la siguiente indicación.";
+                    else if (absAngle <= 130f)
+                        text = $"Estás yendo en dirección equivocada. " +
+                               $"El camino está {dir}. Gira y continúa. En {steps} pasos.";
+                    else
+                        text = $"Estás en sentido contrario. Date la vuelta — " +
+                               $"el camino está {dir}. En {steps} pasos.";
+
+                    Speak(VoiceInstructionType.UserDeviated, text, priority: 2);
+
+                    if (_logInstructions)
+                        Debug.Log($"[VoiceGuide] ⚠️ [E7] Desorientación: " +
+                                  $"ángulo={signedAngle:F1}° ({dir}) | dist={dist:F1}m | " +
+                                  $"nextWp={nextWpPos:F2}");
+                }
+            }
+            else
+            {
+                if (_misalignTimer > 0f)
+                    _misalignTimer = Mathf.Max(0f, _misalignTimer - dt * 1.5f);
+            }
+        }
+
+        // ─────────────────────────────────────────────────────────────────────
         //  EVENTOS DEL BUS
         // ─────────────────────────────────────────────────────────────────────
 
@@ -585,23 +616,14 @@ namespace IndoorNavAR.Navigation.Voice
         {
             if (!_isGuiding) return;
 
-            // ✅ v4.4 FIX: No terminar la sesión si el usuario aún no llegó.
-            // ARGuideController puede disparar NavigationCompletedEvent prematuramente
-            // (antes de que el usuario llegue al destino real). En ese caso, verificamos
-            // si el evento Arrived ya fue disparado por EvaluateInstructions().
-            // Si no fue disparado, esperamos a que el usuario llegue.
             bool arrivedFired = _events.Exists(e => e.Type == VoiceInstructionType.Arrived && e.HasFired);
             float distToGoal  = Vector3.Distance(UserPos, _destPos);
 
             if (!arrivedFired && distToGoal > _arrivalTriggerDist * 2f)
             {
-                // El usuario aún está lejos — no terminar la sesión.
-                // La evaluación continúa en Update() y el evento Arrived se
-                // disparará cuando el usuario realmente llegue.
                 if (_logPreprocessing)
                     Debug.Log($"[VoiceGuide] ℹ️ NavigationCompleted ignorado: " +
-                              $"usuario aún a {distToGoal:F1}m del destino. " +
-                              "Sesión activa hasta llegada real.");
+                              $"usuario aún a {distToGoal:F1}m del destino.");
                 return;
             }
 
@@ -622,6 +644,12 @@ namespace IndoorNavAR.Navigation.Voice
             _obstacleFired = false;
             _isStopped     = false;
             _stopAccumTime = 0f;
+
+            _lastSpokenText = string.Empty;
+            _lastSpokenTime = -999f;
+
+            _misalignTimer    = 0f;
+            _lastMisalignTime = -999f;
         }
 
         // ─────────────────────────────────────────────────────────────────────
@@ -658,6 +686,9 @@ namespace IndoorNavAR.Navigation.Voice
             _stopAccumTime  = 0f;
             _deviationTimer = 0f;
 
+            _misalignTimer    = 0f;
+            _lastMisalignTime = -999f;
+
             Resync(newPath.Waypoints, longSep);
         }
 
@@ -668,19 +699,24 @@ namespace IndoorNavAR.Navigation.Voice
             _lastStraightTime = Time.time;
             _lastStraightIdx  = -1;
 
-            BuildInstructions(waypoints, startMessage: false);
+            // ✅ v5.4: Usar waypoints subdivididos para mejor precisión
+            var subdivided = SubdivideWaypointSegments(waypoints);
+            BuildInstructions(subdivided, startMessage: false);
 
-            float rem   = RemainingDistFromUser(waypoints);
+            float rem   = RemainingDistFromUser(subdivided);
             int   steps = Mathf.Max(1, Mathf.RoundToInt(rem / _stepLength));
 
             if (fullSummary)
             {
                 int secs = Mathf.RoundToInt(rem / _walkSpeedFlat);
-                Speak(VoiceInstructionType.ResumeAfterSeparation,
-                    $"El guía te encontró. Retomamos hacia {_destName}. " +
-                    $"Quedan {steps} pasos, aproximadamente {secs} segundos. " +
-                    $"Continúa siguiendo al guía.",
-                    priority: 1);
+                string resumeMsg = IsFullARMode
+                    ? $"Ruta recalculada. Retomamos hacia {_destName}. " +
+                      $"Quedan {steps} pasos, aproximadamente {secs} segundos. " +
+                      $"Continúa siguiendo la ruta indicada."
+                    : $"El guía te encontró. Retomamos hacia {_destName}. " +
+                      $"Quedan {steps} pasos, aproximadamente {secs} segundos. " +
+                      $"Continúa siguiendo al guía.";
+                Speak(VoiceInstructionType.ResumeAfterSeparation, resumeMsg, priority: 1);
             }
             else
             {
@@ -742,8 +778,6 @@ namespace IndoorNavAR.Navigation.Voice
 
             float elapsed = 0f;
             OptimizedPath path = null;
-
-            // Timeout efectivo = pathWaitTimeout * 2 para dispositivos lentos
             float effectiveTimeout = _pathWaitTimeout * 2f;
 
             while (elapsed < effectiveTimeout)
@@ -767,13 +801,14 @@ namespace IndoorNavAR.Navigation.Voice
 
             if (path == null || !path.IsValid || path.Waypoints.Count < 2)
             {
-                // Activar en modo mínimo (sin ruta): solo evento de llegada.
-                // Cuando llegue OnPathRecalculated(), Resync() añade todos los eventos.
-                Debug.LogWarning($"[VoiceGuide] ⚠️ Timeout ({elapsed:F1}s) esperando ruta a '{_destName}'. " +
-                                 "Modo mínimo activo.");
+                Debug.LogWarning($"[VoiceGuide] ⚠️ Timeout ({elapsed:F1}s) esperando ruta a '{_destName}'.");
+
+                string timeoutCta = IsFullARMode
+                    ? "Comienza a caminar hacia el destino indicado."
+                    : "Sigue al guía hacia adelante.";
 
                 Speak(VoiceInstructionType.StartNavigation,
-                    $"Iniciando navegación a {_destName}. Sigue al guía hacia adelante.",
+                    $"Iniciando navegación a {_destName}. {timeoutCta}",
                     priority: 1);
 
                 _events.Clear();
@@ -790,7 +825,8 @@ namespace IndoorNavAR.Navigation.Voice
                 yield break;
             }
 
-            // ── Ruta válida — flujo normal ────────────────────────────────────
+            // ✅ v5.4: Subdividir waypoints antes de construir instrucciones
+            var subdivided = SubdivideWaypointSegments(path.Waypoints);
 
             _events.Clear();
             _nextIdx          = 0;
@@ -798,45 +834,24 @@ namespace IndoorNavAR.Navigation.Voice
             _lastStraightIdx  = -1;
             _lastProgressTime = Time.time;
 
-            BuildInstructions(path.Waypoints, startMessage: true);
+            BuildInstructions(subdivided, startMessage: true);
 
-            // Disparar StartNavigation inmediatamente
             if (_events.Count > 0)
             {
                 var startEvt = _events[0];
                 FireEvent(startEvt);
                 startEvt.HasFired = true;
                 _nextIdx = 1;
+
+                AnnounceInitialOrientation(subdivided);
             }
 
-            // Esperar duración estimada del TTS inicial
             {
-                int   startWords  = _events.Count > 0 ? _events[0].InstructionText.Split(' ').Length : 10;
-                float ttsDuration = (startWords / 13f) + 0.3f;
+                int   startWords  = _events.Count > 0 ? CountWords(_events[0].InstructionText) : 10;
+                float ttsDuration = (startWords / 10f) + 1.5f;
                 yield return new WaitForSeconds(ttsDuration);
             }
 
-            // ✅ v4.4 FIX: Loop de verificación pre-guía corregido.
-            //
-            // PROBLEMA ANTERIOR:
-            //   El loop revisaba si algún evento estaba dentro de su TriggerDistance.
-            //   Si el usuario estaba al inicio de la ruta, la escalera podía estar
-            //   a 4.2m con trigger de 6.0m → condición verdadera para siempre.
-            //   El usuario no puede alejarse hacia atrás, así que el loop
-            //   hacía timeout invariablemente.
-            //
-            // FIX:
-            //   Solo esperar para eventos que el usuario puede SUPERAR moviéndose.
-            //   Un evento no debe bloquear el inicio si:
-            //     a) Es de tipo StartNavigation (ya se disparó arriba).
-            //     b) El usuario no está avanzando hacia él (dot product < 0).
-            //     c) El evento ya fue disparado.
-            //     d) Llevan más de _startDelay segundos esperando (timeout por evento).
-            //
-            //   En la práctica: si el usuario está quieto al inicio y hay una escalera
-            //   a 4.2m (dentro del trigger de 6.0m), ese evento se OMITE del check
-            //   porque el usuario no está avanzando hacia él todavía.
-            //   Cuando el usuario comience a caminar, EvaluateInstructions() lo disparará.
             {
                 float safetyTimeout = _startDelay + 3f;
                 float waited        = 0f;
@@ -852,36 +867,24 @@ namespace IndoorNavAR.Navigation.Voice
                     {
                         var ev = _events[i];
                         if (ev.HasFired) continue;
-
-                        // StartNavigation: siempre se omite (ya disparado)
                         if (ev.Type == VoiceInstructionType.StartNavigation) continue;
 
                         float dist = Vector3.Distance(pos, ev.WorldPosition);
-                        if (dist > ev.TriggerDistance) break; // Siguiente evento más lejos — stop
+                        if (dist > ev.TriggerDistance) break;
 
-                        // ✅ v4.4: Verificar si el usuario está avanzando hacia el evento.
-                        // Si el evento está "detrás" o perpendicular al usuario, no bloquear.
                         Vector3 toEvent = (ev.WorldPosition - pos);
                         toEvent.y = 0f;
                         float dot = toEvent.sqrMagnitude > 0.001f
                             ? Vector3.Dot(userFwd, toEvent.normalized)
                             : 0f;
 
-                        bool userAdvancingToward = dot > 0.1f; // usuario avanza hacia el evento
+                        bool userAdvancingToward = dot > 0.1f;
 
                         if (userAdvancingToward && UserSpeed > 0.1f)
                         {
-                            // El usuario se mueve hacia un evento que está dentro del trigger.
-                            // Esperar a que salga del radio o pare.
                             anyBlockingEvent = true;
-                            if (_logPreprocessing)
-                                Debug.Log($"[VoiceGuide] ⏳ Evento [{ev.Type}] " +
-                                          $"dist={dist:F1}m <= trigger={ev.TriggerDistance:F1}m. " +
-                                          $"Usuario avanzando (dot={dot:F2}). Esperando...");
                             break;
                         }
-                        // Usuario quieto o alejándose: no bloquear — el evento
-                        // se disparará cuando el usuario se acerque al caminar.
                     }
 
                     if (!anyBlockingEvent) break;
@@ -889,10 +892,6 @@ namespace IndoorNavAR.Navigation.Voice
                     yield return new WaitForSeconds(checkInterval);
                     waited += checkInterval;
                 }
-
-                if (waited >= safetyTimeout)
-                    Debug.LogWarning($"[VoiceGuide] ⚠️ Timeout pre-guía ({safetyTimeout:F1}s). " +
-                                     "Activando — los eventos se evaluarán al caminar.");
             }
 
             _isGuiding = true;
@@ -900,7 +899,8 @@ namespace IndoorNavAR.Navigation.Voice
 
             float firstDist = GetDistToFirstActionEvent();
             if (_logPreprocessing)
-                Debug.Log($"[VoiceGuide] ✅ Guía activo. {_events.Count} instrucciones, " +
+                Debug.Log($"[VoiceGuide] ✅ v5.4 Guía activo. {_events.Count} instrucciones " +
+                          $"(desde {path.Waypoints.Count} → {subdivided.Count} wp subdivididos), " +
                           $"nextIdx={_nextIdx}. PrimerAccion={firstDist:F1}m");
         }
 
@@ -924,9 +924,85 @@ namespace IndoorNavAR.Navigation.Voice
         }
 
         // ─────────────────────────────────────────────────────────────────────
+        //  ✅ v5.4 — SUBDIVISIÓN DE SEGMENTOS DIAGONALES
+        // ─────────────────────────────────────────────────────────────────────
+
+        /// <summary>
+        /// ✅ v5.4 FIX 2: Subdivide segmentos largos en sub-waypoints intermedios.
+        ///
+        /// PROBLEMA:
+        ///   El NavMesh puede generar segmentos diagonales largos. Cuando el usuario
+        ///   está en A y el siguiente waypoint B está a 10m en diagonal, el sistema
+        ///   dice "gira 45° a la izquierda" en vez de "camina recto 6m, luego gira".
+        ///   Esto ocurre porque el punto de giro real se mezcla con el segmento diagonal.
+        ///
+        /// SOLUCIÓN:
+        ///   Subdividir cualquier segmento mayor que _maxSegmentLength en sub-puntos.
+        ///   Esto permite que BuildInstructions() detecte giros más precisamente,
+        ///   ya que los segmentos cortos reflejan mejor la dirección real de avance.
+        ///
+        ///   La subdivisión solo ocurre en segmentos planos (sin cambio de altura de
+        ///   escaleras) — los segmentos de escaleras no se subdividen para no interferir
+        ///   con la lógica de detección de escaleras.
+        /// </summary>
+        private List<Vector3> SubdivideWaypointSegments(IReadOnlyList<Vector3> waypoints)
+        {
+            var result = new List<Vector3>(waypoints.Count * 2);
+            if (waypoints.Count == 0) return result;
+
+            result.Add(waypoints[0]);
+
+            for (int i = 0; i < waypoints.Count - 1; i++)
+            {
+                Vector3 a = waypoints[i];
+                Vector3 b = waypoints[i + 1];
+
+                // No subdividir segmentos de escaleras
+                float deltaY = Mathf.Abs(b.y - a.y);
+                if (deltaY >= _stairHeightThreshold)
+                {
+                    result.Add(b);
+                    continue;
+                }
+
+                float segLen = Vector3.Distance(a, b);
+
+                // Si el segmento es corto, no subdividir
+                if (_maxSegmentLength <= 0f || segLen <= _maxSegmentLength)
+                {
+                    result.Add(b);
+                    continue;
+                }
+
+                // Subdividir en tramos de máximo _maxSegmentLength metros
+                int subdivisions = Mathf.CeilToInt(segLen / _maxSegmentLength);
+                for (int s = 1; s <= subdivisions; s++)
+                {
+                    float t = (float)s / subdivisions;
+                    result.Add(Vector3.Lerp(a, b, t));
+                }
+                // El punto b ya se añadió en la última iteración de s
+            }
+
+            if (_logPreprocessing && result.Count != waypoints.Count)
+                Debug.Log($"[VoiceGuide] 📐 SubdivideWaypointSegments: " +
+                          $"{waypoints.Count} → {result.Count} waypoints.");
+
+            return result;
+        }
+
+        // ─────────────────────────────────────────────────────────────────────
         //  CONSTRUCCIÓN DE INSTRUCCIONES
         // ─────────────────────────────────────────────────────────────────────
 
+        /// <summary>
+        /// ✅ v5.4: BuildInstructions ahora recibe la lista ya subdividida.
+        /// Para la instrucción de giro, usa ClassifyTurnRelativeToUser() que
+        /// compara la dirección del segmento saliente con la orientación real
+        /// del usuario (cámara XR), no con el segmento entrante del NavMesh.
+        /// Además, incluye el prefijo "N pasos recto, luego..." cuando el segmento
+        /// previo al giro es suficientemente recto y largo.
+        /// </summary>
         private void BuildInstructions(IReadOnlyList<Vector3> wp, bool startMessage)
         {
             int count = wp.Count;
@@ -946,11 +1022,15 @@ namespace IndoorNavAR.Navigation.Voice
                     ? " La ruta incluye escaleras, te avisaré con tiempo para que reduzcas el paso."
                     : string.Empty;
 
+                string startCta = IsFullARMode
+                    ? "Comienza a caminar siguiendo la ruta indicada."
+                    : "Sigue al guía hacia adelante.";
+
                 _events.Add(new NavigationInstructionEvent(
                     wp[0], VoiceInstructionType.StartNavigation, 0.5f,
                     $"Iniciando navegación a {_destName}. " +
                     $"Aproximadamente {steps} pasos, {secs} segundos.{stairs} " +
-                    $"Sigue al guía hacia adelante.",
+                    $"{startCta}",
                     0));
             }
 
@@ -997,20 +1077,35 @@ namespace IndoorNavAR.Navigation.Voice
                 if (dirIn.sqrMagnitude < 0.001f || dirOut.sqrMagnitude < 0.001f) continue;
                 dirIn.Normalize(); dirOut.Normalize();
 
-                float angle = Vector3.Angle(dirIn, dirOut);
-                if (angle < _slightTurnAngle) continue;
+                // ✅ v5.4b: Durante la construcción, siempre usar dirIn (isImmediateTurn=false).
+                // UserFwd solo aplica cuando el evento se DISPARA (ver RecalcTurnTextRelativeToUser).
+                var (ttype, userRelativeAngle) = ClassifyTurnRelativeToUser(dirIn, dirOut, isImmediateTurn: false);
 
-                float cross = dirIn.x * dirOut.z - dirIn.z * dirOut.x;
-                bool  left  = cross < 0f;
-                var   ttype = ClassifyTurn(angle, left);
+                // Ángulo de deflexión pura de la ruta (independiente del usuario)
+                float routeDeflectionAngle = Vector3.Angle(dirIn, dirOut);
+
+                // Ignorar microdeflexiones de la subdivisión (artefactos de lerp)
+                if (ttype == VoiceInstructionType.GoStraight) continue;
 
                 float pathDistToTurn = AccumDistAlongPath(wp, 0, i);
-                int   steps2         = Mathf.Max(1, Mathf.RoundToInt(pathDistToTurn / _stepLength));
+                int   stepsToTurn    = Mathf.Max(1, Mathf.RoundToInt(pathDistToTurn / _stepLength));
+
+                // ✅ v5.4 FIX 3: Calcular si hay un trecho recto mensurable antes del giro.
+                // Si el segmento previo era recto (deflexión < _straightSegmentAngle)
+                // y suficientemente largo, prefijamos "X pasos recto, luego...".
+                string turnText = BuildTurnTextWithContext(ttype, userRelativeAngle, stepsToTurn,
+                                                          wp, i, dirIn, dirOut);
 
                 _events.Add(new NavigationInstructionEvent(
                     current, ttype, TriggerDist(ttype),
-                    BuildTurnText(ttype, steps2),
+                    turnText,
                     i));
+
+                if (_logInstructions)
+                    Debug.Log($"[VoiceGuide] 📍 [v5.4] Instrucción en wp[{i}]: " +
+                              $"tipo={ttype} | ángulo usuario={userRelativeAngle:F1}° | " +
+                              $"deflexión ruta={routeDeflectionAngle:F1}° | " +
+                              $"pasos={stepsToTurn} | pos={current:F2}");
             }
 
             _events.Add(new NavigationInstructionEvent(
@@ -1022,12 +1117,227 @@ namespace IndoorNavAR.Navigation.Voice
         }
 
         // ─────────────────────────────────────────────────────────────────────
+        //  ✅ v5.4 — CLASIFICACIÓN RELATIVA AL USUARIO (FIX 1)
+        // ─────────────────────────────────────────────────────────────────────
+
+        /// <summary>
+        /// ✅ v5.4b FIX 1 (corregido): Clasifica el giro requerido desde la perspectiva del usuario.
+        ///
+        /// PROBLEMA DEL FIX ANTERIOR:
+        ///   Usar UserFwd para TODOS los waypoints era incorrecto. UserFwd solo es válido
+        ///   para el giro inmediatamente siguiente. Para waypoints futuros, el usuario
+        ///   llegará a ese punto viniendo por dirIn, así que la referencia correcta es dirIn.
+        ///
+        ///   EJEMPLO DEL BUG:
+        ///     wp[1]: deflexión=0° (segmento recto), pero usuario mira -71° → clasifica TurnLeft.
+        ///     wp[6]: deflexión=6° (casi recto), pero usuario mira +83° → clasifica TurnRight.
+        ///     Ambos son falsos positivos — la ruta es recta, el usuario simplemente no mira
+        ///     en la misma dirección que el segmento todavía.
+        ///
+        /// SOLUCIÓN CORRECTA:
+        ///   - Para el giro INMEDIATO (el que se va a disparar pronto, nextIdx == cornerIdx):
+        ///     usar UserFwd como referencia en FullAR. El usuario ya está llegando a ese punto
+        ///     y su orientación actual determina qué es "izquierda" y "derecha".
+        ///   - Para giros FUTUROS (cornerIdx > _nextIdx):
+        ///     usar dirIn. Cuando el usuario llegue a ese punto, vendrá siguiendo dirIn,
+        ///     así que dirIn es la orientación correcta de referencia.
+        ///   - En NoAR: siempre usar dirIn (el agente físico se orienta automáticamente).
+        ///
+        /// El parámetro isImmediateTurn indica si este es el giro del waypoint actualmente
+        /// más próximo al usuario (se pasa true solo para el waypoint en _nextIdx).
+        ///
+        /// RETORNA: (tipo de instrucción, ángulo relativo al usuario con signo)
+        /// </summary>
+        private (VoiceInstructionType type, float signedAngle) ClassifyTurnRelativeToUser(
+            Vector3 dirIn, Vector3 dirOut, bool isImmediateTurn = false)
+        {
+            Vector3 reference;
+
+            if (IsFullARMode && isImmediateTurn)
+            {
+                // Giro inmediato en FullAR: usar la orientación real de la cámara XR.
+                // El usuario ya está llegando a este punto y su orientación actual
+                // determina correctamente qué es "su izquierda" y "su derecha".
+                Vector3 userFwd = UserFwd;
+                userFwd.y = 0f;
+                reference = userFwd.sqrMagnitude > 0.001f ? userFwd.normalized : dirIn;
+            }
+            else
+            {
+                // Giro futuro (o NoAR): usar dirIn.
+                // El usuario llegará a este waypoint viniendo por dirIn,
+                // así que dirIn es la referencia de orientación correcta.
+                reference = dirIn;
+            }
+
+            float signedAngle = SignedAngleXZ(reference, dirOut);
+            float absAngle    = Mathf.Abs(signedAngle);
+            bool  isRight     = signedAngle >= 0f;
+
+            VoiceInstructionType ttype;
+            if      (absAngle < _slightTurnAngle)   ttype = VoiceInstructionType.GoStraight;
+            else if (absAngle >= _uTurnAngle)        ttype = VoiceInstructionType.UTurn;
+            else if (absAngle >= _definiteTurnAngle) ttype = isRight ? VoiceInstructionType.TurnRight
+                                                                     : VoiceInstructionType.TurnLeft;
+            else                                     ttype = isRight ? VoiceInstructionType.SlightRight
+                                                                     : VoiceInstructionType.SlightLeft;
+
+            return (ttype, signedAngle);
+        }
+
+        // ─────────────────────────────────────────────────────────────────────
+        //  ✅ v5.4 — TEXTO DE GIRO CON CONTEXTO DE SEGMENTO RECTO PREVIO (FIX 3)
+        // ─────────────────────────────────────────────────────────────────────
+
+        /// <summary>
+        /// ✅ v5.4 FIX 3: Genera texto de instrucción con información del trecho recto previo.
+        ///
+        /// ANTES: "En 6 pasos, gira a la derecha."
+        /// AHORA: "Camina 4 pasos recto, luego gira a la derecha." (si hay trecho recto previo)
+        ///        o "Gira a la derecha ya." (si el giro es inmediato)
+        ///
+        /// LÓGICA:
+        ///   1. Busca el segmento de ruta previo al punto de giro (wp[i-1] → wp[i]).
+        ///   2. Si ese segmento tiene deflexión < _straightSegmentAngle respecto a la
+        ///      dirección de entrada (es "recto"), calcula su longitud.
+        ///   3. Si la longitud es ≥ _minMentionableStraightDist, añade el prefijo
+        ///      "Camina {n} pasos recto," antes de la instrucción de giro.
+        ///   4. Si no hay trecho recto previo significativo, usa la forma estándar
+        ///      "En {stepsToTurn} pasos, gira...".
+        ///
+        /// NOTA sobre stepsToTurn:
+        ///   stepsToTurn es la distancia acumulada TOTAL desde el inicio de la ruta
+        ///   hasta el punto de giro. El prefijo de "pasos rectos" se calcula desde
+        ///   la posición actual del usuario, no desde el inicio de la ruta.
+        /// </summary>
+        private string BuildTurnTextWithContext(
+            VoiceInstructionType ttype,
+            float signedAngle,
+            int stepsToTurn,
+            IReadOnlyList<Vector3> wp,
+            int cornerIdx,
+            Vector3 dirIn,
+            Vector3 dirOut)
+        {
+            // Calcular longitud del segmento recto previo
+            // (el segmento que va de wp[cornerIdx-1] a wp[cornerIdx])
+            float prevSegLen = 0f;
+            bool  prevIsStr  = false;
+
+            if (cornerIdx >= 2)
+            {
+                Vector3 prevPrev = wp[cornerIdx - 2];
+                Vector3 prev     = wp[cornerIdx - 1];
+                Vector3 curr     = wp[cornerIdx];
+
+                Vector3 dPrevIn  = (prev - prevPrev); dPrevIn.y = 0f;
+                Vector3 dPrevOut = (curr - prev);     dPrevOut.y = 0f;
+
+                if (dPrevIn.sqrMagnitude > 0.001f && dPrevOut.sqrMagnitude > 0.001f)
+                {
+                    float deflection = Vector3.Angle(dPrevIn.normalized, dPrevOut.normalized);
+                    prevIsStr = deflection < _straightSegmentAngle;
+                }
+
+                prevSegLen = Vector3.Distance(
+                    new Vector3(prev.x, 0, prev.z),
+                    new Vector3(curr.x, 0, curr.z));
+            }
+            else if (cornerIdx >= 1)
+            {
+                // Primer giro: el segmento previo va desde el inicio de la ruta
+                Vector3 prev = wp[cornerIdx - 1];
+                Vector3 curr = wp[cornerIdx];
+                prevSegLen   = Vector3.Distance(
+                    new Vector3(prev.x, 0, prev.z),
+                    new Vector3(curr.x, 0, curr.z));
+                prevIsStr    = true; // El primer segmento siempre es "recto" (es el inicio)
+            }
+
+            // Pasos en el segmento recto previo desde la posición actual del usuario
+            float distFromUser = Vector3.Distance(
+                new Vector3(EvalPos.x, 0, EvalPos.z),
+                new Vector3(wp[cornerIdx].x, 0, wp[cornerIdx].z));
+            int stepsFromUser = Mathf.Max(1, Mathf.RoundToInt(distFromUser / _stepLength));
+
+            // Determinar label de dirección con ángulo preciso
+            string turnLabel = TurnLabel(ttype, signedAngle);
+
+            // ✅ Generar texto según disponibilidad de trecho recto previo
+            if (prevIsStr && prevSegLen >= _minMentionableStraightDist && stepsFromUser > 2)
+            {
+                int straightSteps = Mathf.Max(1, Mathf.RoundToInt(
+                    (distFromUser - (distFromUser - prevSegLen)) / _stepLength));
+
+                // Calcular pasos solo del trecho recto (distancia hasta el punto de giro
+                // menos la longitud estimada del propio giro)
+                int approachSteps = Mathf.Max(1, Mathf.RoundToInt(distFromUser / _stepLength));
+
+                // Formato: "Camina N pasos recto y luego [giro]"
+                return $"Camina {approachSteps} pasos recto y luego {turnLabel}.";
+            }
+
+            // Sin trecho recto previo significativo
+            if (stepsFromUser <= 3)
+                return $"{TurnLabelImperative(ttype, signedAngle)} ahora.";
+
+            return $"En {stepsFromUser} pasos, {turnLabel}.";
+        }
+
+        /// <summary>
+        /// ✅ v5.4e: Instrucción de giro usando posición de reloj.
+        ///
+        /// Para personas ciegas, el sistema de reloj es la referencia más precisa
+        /// y universalmente entendida. Elimina ambigüedad de "levemente" / "fuertemente".
+        ///
+        ///   signedAngle positivo = derecha → horas 1-5
+        ///   signedAngle negativo = izquierda → horas 7-11
+        ///   0° = 12 (frente), 180° = 6 (atrás)
+        ///
+        /// Forma nominal: "gira hasta las 2" — para uso en frases como "en 5 pasos, gira hasta las 2"
+        /// Forma imperativa: "Gira hasta las 2" — para giros inmediatos
+        /// UTurn siempre es explícito: "date la vuelta completamente, hacia las 6"
+        /// </summary>
+        private static string TurnLabel(VoiceInstructionType ttype, float signedAngle)
+        {
+            if (ttype == VoiceInstructionType.UTurn)
+                return "date la vuelta completamente";
+
+            int    clock    = ClockPosition(signedAngle);
+            string clockStr = ClockText(clock);
+
+            // Para giros muy pequeños (SlightRight/SlightLeft) aclarar que es leve
+            if (ttype == VoiceInstructionType.SlightRight || ttype == VoiceInstructionType.SlightLeft)
+                return $"gira levemente {clockStr}";
+
+            return $"gira {clockStr}";
+        }
+
+        /// <summary>
+        /// Forma imperativa de TurnLabel para giros inmediatos (≤ 3 pasos).
+        /// </summary>
+        private static string TurnLabelImperative(VoiceInstructionType ttype, float signedAngle)
+        {
+            if (ttype == VoiceInstructionType.UTurn)
+                return "Date la vuelta completamente";
+
+            int    clock    = ClockPosition(signedAngle);
+            string clockStr = ClockText(clock);
+
+            if (ttype == VoiceInstructionType.SlightRight || ttype == VoiceInstructionType.SlightLeft)
+                return $"Gira levemente {clockStr}";
+
+            return $"Gira {clockStr}";
+        }
+
+        // ─────────────────────────────────────────────────────────────────────
         //  RESET DE SESIÓN
         // ─────────────────────────────────────────────────────────────────────
 
         private void ResetSession(bool silent = false)
         {
-            if (_waitCoroutine != null) { StopCoroutine(_waitCoroutine); _waitCoroutine = null; }
+            if (_waitCoroutine != null)       { StopCoroutine(_waitCoroutine);      _waitCoroutine      = null; }
+            if (_ttsResumeCoroutine != null)  { StopCoroutine(_ttsResumeCoroutine); _ttsResumeCoroutine = null; }
 
             NotifyTTSEnd();
 
@@ -1047,6 +1357,12 @@ namespace IndoorNavAR.Navigation.Voice
             _obstacleTimer  = 0f;
             _returningTimer = 0f;
 
+            _lastSpokenText = string.Empty;
+            _lastSpokenTime = -999f;
+
+            _misalignTimer    = 0f;
+            _lastMisalignTime = -999f;
+
             if (!silent && _logPreprocessing)
                 Debug.Log("[VoiceGuide] Sesión detenida.");
         }
@@ -1061,6 +1377,9 @@ namespace IndoorNavAR.Navigation.Voice
             return Vector3.Distance(UserPos, _events[_nextIdx].WorldPosition);
         }
 
+        /// <summary>
+        /// ✅ v5.3 FIX: Distancia real al destino usando proyección 3D.
+        /// </summary>
         private float RemainingDistFromUser(IReadOnlyList<Vector3> waypoints = null)
         {
             var wp = waypoints ?? _pathController?.CurrentPath?.Waypoints;
@@ -1072,7 +1391,7 @@ namespace IndoorNavAR.Navigation.Voice
 
             for (int i = 0; i < wp.Count - 1; i++)
             {
-                float d = SegDistXZ(upos, wp[i], wp[i + 1]);
+                float d = PointToSeg3D(upos, wp[i], wp[i + 1]);
                 if (d < minDist) { minDist = d; closest = i; }
             }
 
@@ -1088,6 +1407,16 @@ namespace IndoorNavAR.Navigation.Voice
                 rem += Vector3.Distance(wp[i], wp[i + 1]);
 
             return rem;
+        }
+
+        /// <summary>v5.3: Distancia 3D de un punto a un segmento.</summary>
+        private static float PointToSeg3D(Vector3 pt, Vector3 a, Vector3 b)
+        {
+            Vector3 ab = b - a;
+            float lenSq = ab.sqrMagnitude;
+            if (lenSq < 0.0001f) return Vector3.Distance(pt, a);
+            float t = Mathf.Clamp01(Vector3.Dot(pt - a, ab) / lenSq);
+            return Vector3.Distance(pt, a + t * ab);
         }
 
         private static float AccumDistAlongPath(IReadOnlyList<Vector3> wp, int fromIdx, int toIdx)
@@ -1111,6 +1440,245 @@ namespace IndoorNavAR.Navigation.Voice
         }
 
         // ─────────────────────────────────────────────────────────────────────
+        //  HELPERS — PALABRAS SIN ALLOC
+        // ─────────────────────────────────────────────────────────────────────
+
+        private static int CountWords(string s)
+        {
+            if (string.IsNullOrEmpty(s)) return 0;
+            int  count  = 0;
+            bool inWord = false;
+            for (int i = 0; i < s.Length; i++)
+            {
+                bool isSpace = s[i] == ' ';
+                if (!isSpace && !inWord) { count++; inWord = true;  }
+                else if (isSpace)        {          inWord = false; }
+            }
+            return count;
+        }
+
+        // ─────────────────────────────────────────────────────────────────────
+        //  v5.0 — INSTRUCCIONES DIRECCIONALES RELATIVAS AL USUARIO
+        // ─────────────────────────────────────────────────────────────────────
+
+        /// <summary>
+        /// ✅ v5.4e: Convierte un ángulo con signo a posición de reloj.
+        ///
+        /// Sistema de reloj: referencia estándar para orientación de personas ciegas.
+        ///   0°   = 12 (frente)
+        ///   90°  = 3  (derecha)
+        ///   180° = 6  (atrás)
+        ///  -90°  = 9  (izquierda)
+        ///  -71°  = 10 (izquierda adelante — caso sala abierta del log)
+        ///
+        /// Cada hora = 30°. Se redondea al entero más cercano.
+        /// </summary>
+        private static int ClockPosition(float signedAngle)
+        {
+            float a = signedAngle % 360f;
+            if (a < 0f) a += 360f;
+            int hour = Mathf.RoundToInt(a / 30f) % 12;
+            return hour == 0 ? 12 : hour;
+        }
+
+        /// <summary>
+        /// Texto de posición de reloj para TTS.
+        /// "a las 12", "a la 1", "a las 2", etc.
+        /// En español: "la 1" pero "las 2, las 3..."
+        /// </summary>
+        private static string ClockText(int hour)
+        {
+            return hour == 1 ? "a la 1" : $"a las {hour}";
+        }
+
+        private static float SignedAngleXZ(Vector3 from, Vector3 to)
+        {
+            from.y = 0f;
+            to.y   = 0f;
+            if (from.sqrMagnitude < 0.001f || to.sqrMagnitude < 0.001f) return 0f;
+            return Vector3.SignedAngle(from, to, Vector3.up);
+        }
+
+        private static string DirectionLabel(float signedAngle)
+        {
+            float abs   = Mathf.Abs(signedAngle);
+            bool  right = signedAngle >= 0f;
+
+            if (abs <= 15f)  return "recto";
+            if (abs <= 50f)  return right ? "ligeramente a la derecha" : "ligeramente a la izquierda";
+            if (abs <= 130f) return right ? "a la derecha"             : "a la izquierda";
+                             return right ? "casi detrás tuyo, hacia la derecha"
+                                          : "casi detrás tuyo, hacia la izquierda";
+        }
+
+        /// <summary>
+        /// v5.4d FIX: AnnounceInitialOrientation usando deflexión entre segmentos
+        /// consecutivos (igual que BuildInstructions), no ángulo contra UserFwd.
+        ///
+        /// PROBLEMA DE v5.4c:
+        ///   Iteraba segmentos comparando su ángulo contra UserFwd.
+        ///   Si el primer segmento ya era 71° respecto a UserFwd → recto=0m → "Gira a la izquierda".
+        ///   Pero ese segmento ES el pasillo recto. El usuario debe caminar por él.
+        ///   UserFwd no tiene relación con la dirección del pasillo.
+        ///
+        /// SOLUCIÓN CORRECTA (v5.4d):
+        ///   Usar la misma lógica que BuildInstructions: detectar giros por DEFLEXIÓN
+        ///   entre segmentos CONSECUTIVOS de la ruta (ángulo dirIn vs dirOut).
+        ///   Esto es independiente de hacia dónde mira el usuario ahora mismo.
+        ///
+        ///   Fase 1: Acumular segmentos iniciales con deflexión < _straightSegmentAngle (15°).
+        ///           Estos son el "tramo recto inicial" de la ruta NavMesh.
+        ///   Fase 2: El primer segmento con deflexión >= _straightSegmentAngle es el giro real.
+        ///           Su dirección se calcula relativa a UserFwd para decir "izquierda/derecha".
+        ///   Fase 3: Generar mensaje combinando el tramo recto y el giro.
+        ///
+        /// EJEMPLO (logs actuales):
+        ///   wp[0]→wp[1]: 8m recto (pasillo) — deflexión entre segmentos ≈ 0°  → acumula
+        ///   wp[1]→wp[2]: giro 36° → primer giro real → "Camina 8 pasos recto, luego gira X"
+        ///
+        /// NOTA: Para el mensaje de inicio el "tramo recto" es el primer segmento de la ruta
+        ///       (la dirección en que el usuario debe comenzar a caminar). El ángulo para
+        ///       "izquierda/derecha" se calcula comparando ESA dirección inicial contra UserFwd,
+        ///       para que la instrucción de orientación inicial sea correcta.
+        /// </summary>
+        private void AnnounceInitialOrientation(IReadOnlyList<Vector3> waypoints)
+        {
+            if (!IsFullARMode) return;
+            if (waypoints == null || waypoints.Count < 2) return;
+
+            float totalDist  = AccumDistAlongPath(waypoints, 0, waypoints.Count - 1);
+            int   totalSteps = Mathf.Max(1, Mathf.RoundToInt(totalDist / _stepLength));
+
+            // ── FASE 1+2: Acumular tramo recto por DEFLEXIÓN entre segmentos ─────
+            // Igual que BuildInstructions: el giro se detecta cuando la ruta dobla,
+            // no cuando cambia respecto a UserFwd.
+            float straightDist     = 0f;
+            int   firstTurnWpIdx   = -1;   // índice del waypoint donde ocurre el primer giro
+            float firstTurnDeflect = 0f;   // ángulo de deflexión de la ruta en ese punto
+            Vector3 routeFirstDir  = Vector3.zero; // dirección del primer segmento (para orientar al usuario)
+
+            for (int i = 0; i < waypoints.Count - 1; i++)
+            {
+                Vector3 seg = waypoints[i + 1] - waypoints[i];
+                seg.y = 0f;
+                if (seg.sqrMagnitude < 0.001f) continue;
+
+                float segLen = new Vector3(seg.x, 0, seg.z).magnitude;
+
+                // Guardar la dirección del primer segmento (la que el usuario debe seguir al inicio)
+                if (i == 0)
+                    routeFirstDir = seg.normalized;
+
+                if (i == 0)
+                {
+                    // El primer segmento no tiene segmento previo → siempre es "recto"
+                    straightDist += segLen;
+                    continue;
+                }
+
+                // Calcular deflexión respecto al segmento anterior
+                Vector3 prevSeg = waypoints[i] - waypoints[i - 1];
+                prevSeg.y = 0f;
+                if (prevSeg.sqrMagnitude < 0.001f) { straightDist += segLen; continue; }
+
+                float deflection = Vector3.Angle(prevSeg.normalized, seg.normalized);
+
+                if (deflection < _straightSegmentAngle)
+                {
+                    // Segmento recto (poca deflexión respecto al anterior) → acumular
+                    straightDist += segLen;
+                }
+                else
+                {
+                    // Primer giro real detectado
+                    firstTurnWpIdx   = i;
+                    firstTurnDeflect = deflection;
+                    break;
+                }
+            }
+
+            // ── FASE 3: Generar mensaje ──────────────────────────────────────────
+            // Para decir "izquierda" o "derecha", comparar la dirección del primer
+            // segmento de la ruta contra UserFwd (orientación actual del usuario).
+            // El usuario debe orientarse hacia routeFirstDir para empezar a caminar.
+            float  initialAngle = routeFirstDir.sqrMagnitude > 0.001f
+                ? SignedAngleXZ(UserFwd, routeFirstDir)
+                : 0f;
+            float  absInitial   = Mathf.Abs(initialAngle);
+            string initialDir   = DirectionLabel(initialAngle);
+
+            int    straightSteps = Mathf.Max(1, Mathf.RoundToInt(straightDist / _stepLength));
+            string text;
+
+            // ── Sistema de reloj: referencia estándar para personas ciegas ──────
+            // 12 = frente, 3 = derecha, 6 = atrás, 9 = izquierda
+            // -71° → 10, -90° → 9, +45° → 1:30 redondeado a 2, etc.
+            int    clockHour = ClockPosition(initialAngle);
+            string clockStr  = ClockText(clockHour);
+
+            if (firstTurnWpIdx < 0)
+            {
+                // ── Sala abierta: ruta en línea recta al destino (sin giros de deflexión) ──
+                // Para persona ciega: posición de reloj + pasos es la instrucción más precisa
+                // y accionable en espacio abierto sin referencias físicas de pared.
+                if (clockHour == 12)
+                    text = $"El destino está {clockStr}. " +
+                           $"Camina {totalSteps} pasos en línea recta.";
+                else if (clockHour == 6)
+                    text = $"El destino está {clockStr}, directamente detrás tuyo. " +
+                           $"Date la vuelta completamente y camina {totalSteps} pasos.";
+                else
+                    text = $"El destino está {clockStr}. " +
+                           $"Gira hasta tener el destino al frente y camina {totalSteps} pasos en línea recta.";
+            }
+            else if (straightDist >= _minMentionableStraightDist)
+            {
+                // ── Pasillo: tramo recto seguido de un giro real ──────────────────
+                // Orientación inicial en reloj + instrucción de pasillo
+                Vector3 dirIn  = (waypoints[firstTurnWpIdx]     - waypoints[firstTurnWpIdx - 1]);
+                Vector3 dirOut = (waypoints[firstTurnWpIdx + 1] - waypoints[firstTurnWpIdx]);
+                dirIn.y = 0f; dirOut.y = 0f;
+                float  turnAngle  = dirIn.sqrMagnitude > 0.001f && dirOut.sqrMagnitude > 0.001f
+                    ? SignedAngleXZ(dirIn.normalized, dirOut.normalized) : 0f;
+                string turnDir    = DirectionLabel(turnAngle);
+                float  absTurnAng = Mathf.Abs(turnAngle);
+                string giroLabel  = absTurnAng >= _definiteTurnAngle
+                    ? $"gira {turnDir}"
+                    : $"gira levemente {turnDir}";
+
+                // Si el usuario ya está alineado con el pasillo (reloj 12), no hace falta orientación
+                if (clockHour == 12)
+                    text = $"Camina {straightSteps} pasos recto y luego {giroLabel}. " +
+                           $"El destino está a {totalSteps} pasos en total.";
+                else
+                    text = $"El pasillo está {clockStr}. " +
+                           $"Oriéntate en esa dirección y camina {straightSteps} pasos recto, " +
+                           $"luego {giroLabel}. El destino está a {totalSteps} pasos en total.";
+            }
+            else
+            {
+                // ── Giro casi inmediato desde la posición actual ──────────────────
+                if (clockHour == 6)
+                    text = $"El destino está {clockStr}. Date la vuelta completamente y " +
+                           $"camina {totalSteps} pasos.";
+                else if (clockHour == 12)
+                    text = $"El destino está {clockStr}. Camina {totalSteps} pasos.";
+                else
+                    text = $"El destino está {clockStr}. " +
+                           $"Gira hasta tener el destino al frente y camina {totalSteps} pasos.";
+            }
+
+            Speak(VoiceInstructionType.StartNavigation, text, priority: 1);
+
+            if (_logInstructions)
+                Debug.Log($"[VoiceGuide] 🧭 [v5.4d] Orientación inicial: " +
+                          $"recto={straightDist:F1}m ({straightSteps}p) | " +
+                          $"primerGiroWp={firstTurnWpIdx} deflexión={firstTurnDeflect:F1}° | " +
+                          $"ángulo inicial={initialAngle:F1}° ({initialDir}) | " +
+                          $"total={totalDist:F1}m ({totalSteps}p).");
+        }
+
+        // ─────────────────────────────────────────────────────────────────────
         //  HELPERS — INSTRUCCIONES
         // ─────────────────────────────────────────────────────────────────────
 
@@ -1123,38 +1691,68 @@ namespace IndoorNavAR.Navigation.Voice
                 evt.Type == VoiceInstructionType.SlightRight ||
                 evt.Type == VoiceInstructionType.UTurn;
 
-            string text     = isDirectional ? RecalcTurnText(evt) : evt.InstructionText;
+            // ✅ v5.4: Para instrucciones direccionales, recalcular con la
+            // orientación actual del usuario en el momento de disparar el evento,
+            // no la que tenía cuando se construyó la ruta.
+            string text     = isDirectional ? RecalcTurnTextRelativeToUser(evt) : evt.InstructionText;
             int    priority = GetPriority(evt.Type);
             Speak(evt.Type, text, priority);
         }
 
-        private string RecalcTurnText(NavigationInstructionEvent evt)
+        /// <summary>
+        /// ✅ v5.4: Recalcula el texto del giro usando la orientación ACTUAL del usuario.
+        ///
+        /// PROBLEMA que resuelve:
+        ///   El texto se construyó cuando se calculó la ruta. Si el usuario giró
+        ///   desde entonces (lo cual es muy probable — la ruta puede esperar segundos
+        ///   antes de que el evento se dispare), el texto puede ser incorrecto.
+        ///
+        ///   Ejemplo: Se calcula la ruta mirando al Norte. El evento dice "gira derecha"
+        ///   (hacia el Este). El usuario camina y ahora mira al Este. Cuando llega al
+        ///   punto de giro, el destino está "recto" no "a la derecha".
+        ///
+        /// SOLUCIÓN:
+        ///   En el momento en que el evento se dispara (el usuario ya está cerca del
+        ///   punto de giro), recalcular el ángulo relativo a UserFwd actual y generar
+        ///   el texto actualizado.
+        /// </summary>
+        private string RecalcTurnTextRelativeToUser(NavigationInstructionEvent evt)
         {
-            int nextEvtIdx = evt.CornerIndex + 1;
-            if (nextEvtIdx >= _events.Count) return evt.InstructionText;
+            // Necesitamos la dirección de salida (el próximo segmento tras el punto de giro)
+            // Buscamos el siguiente evento de posición para obtener la dirección
+            int nextEvtIdx = -1;
+            for (int i = 0; i < _events.Count; i++)
+            {
+                if (_events[i] == evt) { nextEvtIdx = i + 1; break; }
+            }
 
-            Vector3 toNext = _events[nextEvtIdx].WorldPosition - evt.WorldPosition;
-            toNext.y = 0f;
-            if (toNext.sqrMagnitude < 0.001f) return evt.InstructionText;
-            toNext.Normalize();
+            if (nextEvtIdx < 0 || nextEvtIdx >= _events.Count)
+                return evt.InstructionText;
 
-            Vector3 fwd   = UserFwd;
-            float   cross = fwd.x * toNext.z - fwd.z * toNext.x;
-            float   dot   = fwd.x * toNext.x + fwd.z * toNext.z;
-            float   angle = Mathf.Atan2(Mathf.Abs(cross), dot) * Mathf.Rad2Deg;
-            bool    left  = cross < 0f;
+            Vector3 dirOut = _events[nextEvtIdx].WorldPosition - evt.WorldPosition;
+            dirOut.y = 0f;
+            if (dirOut.sqrMagnitude < 0.001f) return evt.InstructionText;
+            dirOut.Normalize();
 
-            float dist  = Vector3.Distance(EvalPos, evt.WorldPosition);
-            int   steps = Mathf.Max(1, Mathf.RoundToInt(dist / _stepLength));
+            // dirIn: del waypoint anterior al waypoint del evento
+            Vector3 dirIn = evt.WorldPosition - (nextEvtIdx >= 2
+                ? _events[nextEvtIdx - 2].WorldPosition
+                : EvalPos);
+            dirIn.y = 0f;
+            if (dirIn.sqrMagnitude < 0.001f) dirIn = dirOut;
+            dirIn.Normalize();
 
-            return BuildTurnText(ClassifyTurn(angle, left), steps);
-        }
+            var (ttype, signedAngle) = ClassifyTurnRelativeToUser(dirIn, dirOut, isImmediateTurn: true);
 
-        private VoiceInstructionType ClassifyTurn(float angle, bool left)
-        {
-            if (angle >= _uTurnAngle)        return VoiceInstructionType.UTurn;
-            if (angle >= _definiteTurnAngle) return left ? VoiceInstructionType.TurnLeft : VoiceInstructionType.TurnRight;
-            return left ? VoiceInstructionType.SlightLeft : VoiceInstructionType.SlightRight;
+            float distFromUser = Vector3.Distance(
+                new Vector3(EvalPos.x, 0, EvalPos.z),
+                new Vector3(evt.WorldPosition.x, 0, evt.WorldPosition.z));
+            int stepsFromUser = Mathf.Max(1, Mathf.RoundToInt(distFromUser / _stepLength));
+
+            if (stepsFromUser <= 3)
+                return $"{TurnLabelImperative(ttype, signedAngle)} ahora.";
+
+            return $"En {stepsFromUser} pasos, {TurnLabel(ttype, signedAngle)}.";
         }
 
         private float TriggerDist(VoiceInstructionType t) => t switch
@@ -1163,16 +1761,6 @@ namespace IndoorNavAR.Navigation.Voice
             VoiceInstructionType.SlightLeft  => _turnTriggerDist * 0.7f,
             VoiceInstructionType.SlightRight => _turnTriggerDist * 0.7f,
             _                                => _turnTriggerDist,
-        };
-
-        private string BuildTurnText(VoiceInstructionType t, int steps) => t switch
-        {
-            VoiceInstructionType.SlightLeft  => $"En {steps} pasos, gira levemente a tu izquierda.",
-            VoiceInstructionType.SlightRight => $"En {steps} pasos, gira levemente a tu derecha.",
-            VoiceInstructionType.TurnLeft    => $"En {steps} pasos, gira a la izquierda.",
-            VoiceInstructionType.TurnRight   => $"En {steps} pasos, gira a la derecha.",
-            VoiceInstructionType.UTurn       => $"En {steps} pasos, date la vuelta completamente.",
-            _                                => $"En {steps} pasos, cambia de dirección.",
         };
 
         // ─────────────────────────────────────────────────────────────────────
@@ -1202,13 +1790,34 @@ namespace IndoorNavAR.Navigation.Voice
         {
             if (string.IsNullOrEmpty(text)) return;
 
+            if (text == _lastSpokenText && Time.time - _lastSpokenTime < _dedupWindow)
+            {
+                if (_logInstructions)
+                    Debug.Log($"[VoiceGuide] 🔇 DEDUP suprimido [{type}]: \"{text}\"");
+                return;
+            }
+            _lastSpokenText = text;
+            _lastSpokenTime = Time.time;
+
             var announcementType = type switch
             {
                 VoiceInstructionType.StairsWarning         => GuideAnnouncementType.ApproachingStairs,
                 VoiceInstructionType.StairsClimb           => GuideAnnouncementType.StartingClimb,
                 VoiceInstructionType.StairsDescent         => GuideAnnouncementType.StartingDescent,
                 VoiceInstructionType.StairsComplete        => GuideAnnouncementType.StairsComplete,
-                VoiceInstructionType.ResumeAfterSeparation => GuideAnnouncementType.ResumeGuide,
+                VoiceInstructionType.ResumeAfterSeparation => GuideAnnouncementType.ResumeAfterSeparation,
+                VoiceInstructionType.StartNavigation       => GuideAnnouncementType.StartNavigation,
+                VoiceInstructionType.Arrived               => GuideAnnouncementType.Arrived,
+                VoiceInstructionType.TurnLeft              => GuideAnnouncementType.TurnLeft,
+                VoiceInstructionType.TurnRight             => GuideAnnouncementType.TurnRight,
+                VoiceInstructionType.SlightLeft            => GuideAnnouncementType.SlightLeft,
+                VoiceInstructionType.SlightRight           => GuideAnnouncementType.SlightRight,
+                VoiceInstructionType.UTurn                 => GuideAnnouncementType.UTurn,
+                VoiceInstructionType.GoStraight            => GuideAnnouncementType.GoStraight,
+                VoiceInstructionType.UserStopped           => GuideAnnouncementType.WaitingForUser,
+                VoiceInstructionType.UserDeviated          => GuideAnnouncementType.UserDeviated,
+                VoiceInstructionType.ObstacleWarning       => GuideAnnouncementType.ObstacleWarning,
+                VoiceInstructionType.ProgressUpdate        => GuideAnnouncementType.ProgressUpdate,
                 _                                          => GuideAnnouncementType.ResumeGuide,
             };
 
@@ -1224,13 +1833,15 @@ namespace IndoorNavAR.Navigation.Voice
                 _ttsBusy = true;
                 NotifyTTSStart(priority);
 
-                float wordCount     = text.Split(' ').Length;
-                float estimatedSecs = (wordCount / 13f) + 0.5f;
-                StartCoroutine(AutoResumeTTSAfter(estimatedSecs));
+                float wordCount = CountWords(text);
+                float estimatedSecs = (wordCount / 10f) + 1.5f;
+
+                if (_ttsResumeCoroutine != null) StopCoroutine(_ttsResumeCoroutine);
+                _ttsResumeCoroutine = StartCoroutine(AutoResumeTTSAfter(estimatedSecs));
             }
 
             if (_logInstructions)
-                Debug.Log($"[VoiceGuide] 🔊 [{type}] p={priority} \"{text}\"");
+                Debug.Log($"[VoiceGuide] 🔊 [{type}→{announcementType}] p={priority} \"{text}\"");
         }
 
         private void NotifyTTSStart(int priority)
@@ -1248,6 +1859,7 @@ namespace IndoorNavAR.Navigation.Voice
         private IEnumerator AutoResumeTTSAfter(float seconds)
         {
             yield return new WaitForSeconds(seconds);
+            _ttsResumeCoroutine = null;
             ClearTTSBusy();
             NotifyTTSEnd();
         }
@@ -1278,6 +1890,30 @@ namespace IndoorNavAR.Navigation.Voice
                 Gizmos.color = Color.yellow;
                 Gizmos.DrawWireSphere(evalPos, 0.2f);
                 Gizmos.DrawLine(UserPos, evalPos);
+            }
+
+            if (IsFullARMode && _nextIdx < _events.Count)
+            {
+                Vector3 nextWpPos = _events[_nextIdx].WorldPosition;
+                Vector3 toNext    = nextWpPos - UserPos;
+                toNext.y = 0f;
+
+                if (toNext.sqrMagnitude > 0.25f)
+                {
+                    float angle = SignedAngleXZ(UserFwd, toNext.normalized);
+                    float abs   = Mathf.Abs(angle);
+
+                    Gizmos.color = abs <= 15f  ? Color.green :
+                                   abs <= 50f  ? Color.yellow :
+                                   abs <= 130f ? new Color(1f, 0.5f, 0f) : Color.red;
+
+                    Gizmos.DrawLine(UserPos, nextWpPos);
+                    Gizmos.DrawWireSphere(nextWpPos, 0.12f);
+
+                    // ✅ v5.4: Dibujar también la dirección UserFwd
+                    Gizmos.color = new Color(0f, 1f, 1f, 0.6f);
+                    Gizmos.DrawLine(UserPos, UserPos + UserFwd * 1.5f);
+                }
             }
 
             foreach (var evt in _events)
@@ -1318,19 +1954,85 @@ namespace IndoorNavAR.Navigation.Voice
             float rem  = RemainingDistFromUser();
             var   path = _pathController?.CurrentPath;
             Debug.Log(
-                $"[VoiceGuide] IsGuiding={_isGuiding} | IsPreprocessing={_isPreprocessing}\n" +
+                $"[VoiceGuide] v5.4 — IsGuiding={_isGuiding} | IsPreprocessing={_isPreprocessing}\n" +
                 $"Destino='{_destName}' | Events={_events.Count} | NextIdx={_nextIdx}\n" +
-                $"Modo={( IsFullARMode ? "FullAR (EvalPos=UserPos)" : "NoAR (EvalPos=AgentPos)")} \n" +
+                $"Modo={( IsFullARMode ? "FullAR" : "NoAR")} \n" +
                 $"UserPos={UserPos:F2} | EvalPos={EvalPos:F2}\n" +
-                $"UserSpeed={UserSpeed:F2}m/s\n" +
+                $"UserFwd={UserFwd:F2} | UserSpeed={UserSpeed:F2}m/s\n" +
                 $"RemainingDist={rem:F1}m (~{Mathf.RoundToInt(rem / _stepLength)} pasos)\n" +
                 $"[E1] Stopped={_isStopped} StopAccum={_stopAccumTime:F1}s\n" +
                 $"[E2] DeviationTimer={_deviationTimer:F1}s Fired={_deviationFired}\n" +
                 $"[E3] ObstacleTimer={_obstacleTimer:F1}s Fired={_obstacleFired}\n" +
+                $"[E7] MisalignTimer={_misalignTimer:F1}s | LastMisalignTime={_lastMisalignTime:F1}s\n" +
+                $"[Dedup] LastText='{_lastSpokenText?.Substring(0, Mathf.Min(40, _lastSpokenText?.Length ?? 0))}' " +
+                $"hace {Time.time - _lastSpokenTime:F1}s\n" +
                 $"Path: valid={path?.IsValid} wp={path?.Waypoints.Count} len={path?.TotalLength:F1}m");
+        }
+
+        [ContextMenu("🧭 Test: Orientación actual hacia siguiente waypoint")]
+        private void DebugCurrentOrientation()
+        {
+            if (!_isGuiding || _nextIdx >= _events.Count)
+            {
+                Debug.Log("[VoiceGuide] Sin guía activa o sin waypoints pendientes.");
+                return;
+            }
+
+            Vector3 nextWpPos = _events[_nextIdx].WorldPosition;
+            Vector3 toNext    = nextWpPos - UserPos;
+            toNext.y = 0f;
+
+            if (toNext.sqrMagnitude < 0.001f)
+            {
+                Debug.Log("[VoiceGuide] Ya estás sobre el siguiente waypoint.");
+                return;
+            }
+
+            toNext.Normalize();
+            float angle = SignedAngleXZ(UserFwd, toNext);
+            string dir  = DirectionLabel(angle);
+            float dist  = Vector3.Distance(UserPos, nextWpPos);
+
+            var (ttype, signedAngle) = ClassifyTurnRelativeToUser(toNext, toNext, isImmediateTurn: true);
+
+            Debug.Log($"[VoiceGuide] 🧭 [v5.4] Orientación actual:\n" +
+                      $"  UserFwd={UserFwd:F2}\n" +
+                      $"  Dirección al wp#{_nextIdx}={toNext:F2}\n" +
+                      $"  Ángulo={angle:F1}° → \"{dir}\"\n" +
+                      $"  Instrucción tipo={ttype} ángulo={signedAngle:F1}°\n" +
+                      $"  Distancia={dist:F1}m | MisalignTimer={_misalignTimer:F1}s");
+        }
+
+        [ContextMenu("🧭 Test: Forzar AnnounceInitialOrientation")]
+        private void DebugForceOrientation()
+        {
+            var path = _pathController?.CurrentPath;
+            if (path == null || !path.IsValid)
+            {
+                Debug.Log("[VoiceGuide] Sin ruta activa.");
+                return;
+            }
+            var subdivided = SubdivideWaypointSegments(path.Waypoints);
+            AnnounceInitialOrientation(subdivided);
         }
 
         [ContextMenu("🛑 Detener guía")]
         private void DebugStop() => ResetSession();
+
+        [ContextMenu("📐 Test: Ver waypoints subdivididos")]
+        private void DebugSubdivision()
+        {
+            var path = _pathController?.CurrentPath;
+            if (path == null || !path.IsValid)
+            {
+                Debug.Log("[VoiceGuide] Sin ruta activa.");
+                return;
+            }
+            var original  = path.Waypoints;
+            var subdivided = SubdivideWaypointSegments(original);
+            Debug.Log($"[VoiceGuide] 📐 Subdivisión: {original.Count} → {subdivided.Count} waypoints.");
+            for (int i = 0; i < subdivided.Count; i++)
+                Debug.Log($"  [{i}] {subdivided[i]:F2}");
+        }
     }
 }

@@ -1,6 +1,6 @@
 {
     "version": "7.1",
-    "timestamp": "2026-03-01 21:32:02",
+    "timestamp": "2026-03-08 15:02:34",
     "modelPosition": {
         "x": 0.0,
         "y": 0.0,
@@ -18,19 +18,19 @@
     "agentHeight": 1.2999999523162842,
     "agentSlope": 60.0,
     "agentClimb": 0.10000000149011612,
-    "totalVertexCount": 2175,
+    "totalVertexCount": 2201,
     "levelCount": 2,
-    "totalNavMeshArea": 831.1812744140625,
+    "totalNavMeshArea": 825.4419555664063,
     "unifiedBinFile": "navmesh_unified.bin",
-    "unifiedVertexCount": 2175,
-    "unifiedIndexCount": 6315,
-    "unifiedAreaCount": 2105,
+    "unifiedVertexCount": 2201,
+    "unifiedIndexCount": 6411,
+    "unifiedAreaCount": 2137,
     "levels": [
         {
             "levelIndex": 0,
             "minY": -0.99003005027771,
-            "maxY": 2.769969940185547,
-            "vertexCount": 1215,
+            "maxY": 1.389969825744629,
+            "vertexCount": 1193,
             "indexCount": 0,
             "areaCount": 0,
             "binFile": "",
@@ -39,9 +39,9 @@
         },
         {
             "levelIndex": 1,
-            "minY": 2.769969940185547,
-            "maxY": 5.3649702072143559,
-            "vertexCount": 859,
+            "minY": 1.389969825744629,
+            "maxY": 2.769969940185547,
+            "vertexCount": 106,
             "indexCount": 0,
             "areaCount": 0,
             "binFile": "",
@@ -51,8 +51,8 @@
     ],
     "navMeshMinY": 0.009969934821128846,
     "navMeshMaxY": 5.989969730377197,
-    "vertexCount": 2175,
-    "indexCount": 6315,
-    "areaCount": 2105,
-    "navMeshArea": 831.1812744140625
+    "vertexCount": 2201,
+    "indexCount": 6411,
+    "areaCount": 2137,
+    "navMeshArea": 825.4419555664063
 }

@@ -1,7 +1,23 @@
 // File: EventBus.cs
-// ✅ v3 — Sin modificaciones respecto al original.
-// GuideAnnouncementEvent y GuideAnnouncementType ya estaban definidos aquí.
-// No se toca este archivo.
+// ✅ v3.1 — Solo se expande GuideAnnouncementType para NavigationVoiceGuide v5.1
+//
+// ============================================================================
+//  CAMBIOS v3 → v3.1
+// ============================================================================
+//
+//  ÚNICO CAMBIO: enum GuideAnnouncementType
+//
+//    ANTES (v3): 7 valores — todos los VoiceInstructionType no listados
+//    caían en default → ResumeGuide dentro de NavigationVoiceGuide.Speak(),
+//    por lo que Flutter recibía type="ResumeGuide" para giros, llegada,
+//    inicio de navegación, etc. y no podía asignar prioridades correctas.
+//
+//    AHORA (v3.1): 19 valores — mapeo 1:1 con cada VoiceInstructionType.
+//    Los 7 valores originales conservan su posición ordinal (0-6) para no
+//    romper código que compare por índice numérico.
+//    Los 12 valores nuevos se añaden a partir del índice 7.
+//
+//  TODO LO DEMÁS ES IDÉNTICO A v3.
 
 using System;
 using System.Collections.Generic;
@@ -160,7 +176,7 @@ namespace IndoorNavAR.Core.Events
     {
         /// <summary>True cuando el TTS empieza a hablar, false cuando termina.</summary>
         public bool IsSpeaking;
-    
+
         /// <summary>
         /// Prioridad de la instrucción que se está leyendo (0-4).
         /// ARGuideController solo pausa el NPC para prioridad ≥ 3.
@@ -254,15 +270,41 @@ namespace IndoorNavAR.Core.Events
         public int    CurrentFloor;
     }
 
+    /// <summary>
+    /// ✅ v3.1 — Enum expandido de 7 a 19 valores.
+    ///
+    /// Los 7 valores originales conservan su índice ordinal (0-6) para
+    /// no romper comparaciones numéricas existentes en el proyecto.
+    /// Los 12 valores nuevos (7-18) dan a Flutter la información de tipo
+    /// necesaria para asignar prioridades TTS correctas en
+    /// VoiceNavigationService._priorityForType().
+    /// </summary>
     public enum GuideAnnouncementType
     {
-        ApproachingStairs,
-        StartingClimb,
-        StartingDescent,
-        FloorReached,
-        WaitingForUser,
-        ResumeGuide,
-        StairsComplete
+        // ── Originales v3 (NO reordenar) ─────────────────────────────────────
+        ApproachingStairs     = 0,   // Escaleras próximas        → urgent
+        StartingClimb         = 1,   // Iniciando subida           → urgent
+        StartingDescent       = 2,   // Iniciando bajada           → urgent
+        FloorReached          = 3,   // Llegó al piso destino      → medium
+        WaitingForUser        = 4,   // Usuario detenido           → low
+        ResumeGuide           = 5,   // Reanudar guía (genérico)   → medium
+        StairsComplete        = 6,   // Escaleras completadas      → medium
+
+        // ── Nuevos v3.1 ───────────────────────────────────────────────────────
+        ResumeAfterSeparation = 7,   // Reanudar tras separación   → medium
+        StartNavigation       = 8,   // Inicio de navegación       → medium
+        Arrived               = 9,   // Llegada al destino         → medium
+
+        TurnLeft              = 10,  // Giro izquierda             → high
+        TurnRight             = 11,  // Giro derecha               → high
+        SlightLeft            = 12,  // Giro leve izquierda        → high
+        SlightRight           = 13,  // Giro leve derecha          → high
+        UTurn                 = 14,  // Media vuelta               → high
+
+        GoStraight            = 15,  // Continuar recto            → low
+        UserDeviated          = 16,  // Desviado / desorientado    → urgent
+        ObstacleWarning       = 17,  // Posible obstáculo          → urgent
+        ProgressUpdate        = 18,  // Actualización de progreso  → low
     }
 
     // ── UI / Mensajes ─────────────────────────────────────────────────────────

@@ -1,43 +1,26 @@
 // File: NavigationAgent.cs
 //
-// ✅ v2 — FullAR: el agente NO se teletransporta por su cuenta.
-//         AROriginAligner.SyncAgentToCameraFullAR() ya lo posiciona cada frame.
+// ✅ v3 — Debounce en FloorTransition + guard doble-disparo
 //
 // ============================================================================
-//  CAMBIOS v1 → v2
+//  CAMBIOS v2 → v3
 // ============================================================================
 //
-//  PROBLEMA:
-//    TeleportToUserIfFullAR() intentaba hacer Warp del agente a la posición
-//    del usuario al inicio de cada navegación. Pero en FullAR, AROriginAligner
-//    ya sincroniza el agente con la cámara XR cada frame. El Warp extra
-//    podía interferir con esa sincronización o fallar si el NavMesh aún
-//    no estaba disponible en ese momento preciso.
+//  FIX A — Debounce en UpdateCurrentLevel():
+//    El nivel solo cambia si el agente lleva >= _floorTransitionMinTime (0.8s)
+//    en el nivel candidato. Evita disparos falsos cuando SamplePosition "salta"
+//    verticalmente al procesar el NavMesh de escaleras antes de que el usuario
+//    físico complete el tramo.
 //
-//    Adicionalmente: NavigateToWaypoint() devolvía _pathController.IsNavigating
-//    evaluado INMEDIATAMENTE después de NavigateTo(), siempre false la primera vez.
+//  FIX B — Guard _floorTransitionFired:
+//    Una vez disparado FloorTransitionEvent para un nivel destino, no se vuelve
+//    a disparar hasta que el nivel candidato cambie. Elimina el doble envío de
+//    FloorReached + StairsComplete que aparecía en el log.
 //
-//  SOLUCIÓN v2:
-//    1. TeleportToUserIfFullAR() ya no hace Warp: confía en que AROriginAligner
-//       ya posicionó correctamente el agente. Solo verifica que está en NavMesh.
+//  FIX C — HandlePathCompleted ya no llama UpdateCurrentLevel():
+//    Era la segunda fuente de duplicación. El nivel se actualiza solo desde Update().
 //
-//    2. NavigateToWaypoint() usa CurrentPath.IsValid (síncrono) en lugar de
-//       IsNavigating (se activa un frame después).
-//
-//    3. Nueva propiedad pública IsFullARMode para que ARGuideController y
-//       otros sistemas sepan el modo activo sin depender de AROriginAligner.
-//
-//  COMPORTAMIENTO EN FullAR:
-//    - El agente está activo e invisible (gestionado por AROriginAligner).
-//    - AROriginAligner lo mueve al NavMesh más cercano a la cámara cada frame.
-//    - Al iniciar navegación, NavigateToWaypoint() calcula la ruta desde
-//      la posición actual del agente (= posición real del usuario).
-//    - NavigationPathController genera CurrentPath con la ruta.
-//    - El NavMeshAgent tiene isStopped=true: el agente NO camina solo.
-//      ARGuideController detecta FullAR y no activa el movimiento autónomo.
-//    - NavigationVoiceGuide genera instrucciones basadas en AgentPosition.
-//
-//  TODOS LOS COMPORTAMIENTOS ANTERIORES SE CONSERVAN ÍNTEGRAMENTE.
+//  TODOS LOS COMPORTAMIENTOS DE v2 SE CONSERVAN ÍNTEGRAMENTE.
 
 using System;
 using UnityEngine;
@@ -67,6 +50,11 @@ namespace IndoorNavAR.Navigation
         [Tooltip("Radio de verificación NavMesh en FullAR (m).")]
         [SerializeField] private float _fullARVerifyRadius = 3.0f;
 
+        [Header("Transición de Piso — Debounce")]
+        [Tooltip("Segundos que el agente debe permanecer en el nivel candidato antes de " +
+                 "confirmar la transición. Evita disparos falsos en escaleras.")]
+        [SerializeField] private float _floorTransitionMinTime = 0.8f;
+
         [Header("Debug")]
         [SerializeField] private Transform _debugDestination;
         [SerializeField] private bool      _logVerbose = false;
@@ -85,10 +73,6 @@ namespace IndoorNavAR.Navigation
         public Vector3 LastDestination    { get; private set; }
         public int     CurrentLevel       { get; private set; } = 0;
 
-        /// <summary>
-        /// True si el sistema está en modo FullAR (ARCore activo).
-        /// En FullAR el agente no debe moverse por su cuenta.
-        /// </summary>
         public bool IsFullARMode => _arOriginAligner != null && _arOriginAligner.IsFullARMode;
 
         public float DistanceToDestination => RemainingDistance >= 0f ? RemainingDistance : 0f;
@@ -112,6 +96,11 @@ namespace IndoorNavAR.Navigation
 
         private string _lastDestinationName = string.Empty;
 
+        // ✅ FIX A/B: Debounce y guard de transición de piso
+        private int   _candidateLevel         = -1;
+        private float _candidateLevelTime     = 0f;
+        private bool  _floorTransitionFired   = false;
+
         // ─── Lifecycle ────────────────────────────────────────────────────────
 
         private void Awake()
@@ -120,7 +109,6 @@ namespace IndoorNavAR.Navigation
             _pathController = GetComponent<NavigationPathController>()
                            ?? gameObject.AddComponent<NavigationPathController>();
 
-            // Deshabilitar NavMeshAgent hasta que haya NavMesh disponible.
             if (_navAgent != null && !NavMesh.SamplePosition(transform.position, out _, 1f, NavMesh.AllAreas))
             {
                 _navAgent.enabled = false;
@@ -166,10 +154,6 @@ namespace IndoorNavAR.Navigation
         {
             if (!IsNavigating) return;
 
-            // En FullAR el agente NO debe moverse por su cuenta.
-            // AROriginAligner posiciona el agente; NavigationVoiceGuide
-            // genera las instrucciones de voz basadas en esa posición.
-            // Aquí solo detenemos cualquier movimiento autónomo residual.
             if (IsFullARMode)
             {
                 if (_navAgent != null && _navAgent.enabled && _navAgent.isOnNavMesh)
@@ -181,12 +165,10 @@ namespace IndoorNavAR.Navigation
                             Debug.Log("[NavigationAgent] FullAR: movimiento autónomo detenido en Update().");
                     }
                 }
-                // En FullAR aún detectamos transiciones de piso (basado en posición del agente = usuario)
                 if (_detectFloorTransitions) UpdateCurrentLevel();
                 return;
             }
 
-            // NoAR: comportamiento normal
             if (_detectFloorTransitions) UpdateCurrentLevel();
         }
 
@@ -203,23 +185,9 @@ namespace IndoorNavAR.Navigation
             if (_logVerbose) Debug.Log($"[NavigationAgent] StartNavigation → {destination:F2}");
             _pathController.NavigateTo(destination);
 
-            // En FullAR: la ruta fue calculada pero el agente no debe moverse.
             if (IsFullARMode) EnsureAgentStoppedInFullAR();
         }
 
-        /// <summary>
-        /// Inicia la navegación hacia un waypoint.
-        ///
-        /// En FullAR:
-        ///   - AROriginAligner ya posicionó el agente en la posición del usuario.
-        ///   - Solo verificamos que está en el NavMesh.
-        ///   - Calculamos la ruta con NavigateTo().
-        ///   - Forzamos isStopped=true: el agente NO camina hacia el destino.
-        ///   - NavigationVoiceGuide genera instrucciones basadas en AgentPosition.
-        ///
-        /// En NoAR:
-        ///   - Comportamiento original: el agente camina hacia el destino.
-        /// </summary>
         public bool NavigateToWaypoint(WaypointData waypoint)
         {
             if (waypoint == null)
@@ -241,14 +209,12 @@ namespace IndoorNavAR.Navigation
 
             _pathController.NavigateTo(waypoint.Position);
 
-            // ✅ CurrentPath.IsValid es síncrono — IsNavigating se activa un frame después.
             bool ok = _pathController.CurrentPath?.IsValid ?? false;
 
             if (!ok)
                 Debug.LogWarning($"[NavigationAgent] ⚠️ Ruta inválida a '{waypoint.WaypointName}' " +
                                  $"desde {transform.position:F2}. NavMesh disponible?");
 
-            // En FullAR: asegurar que el agente no se mueve después del cálculo
             if (IsFullARMode) EnsureAgentStoppedInFullAR();
 
             return ok;
@@ -310,11 +276,6 @@ namespace IndoorNavAR.Navigation
 
         // ─── FullAR — Helpers internos ────────────────────────────────────────
 
-        /// <summary>
-        /// En FullAR, verifica que el agente esté sobre el NavMesh antes de calcular
-        /// la ruta. AROriginAligner ya lo posicionó; aquí solo confirmamos.
-        /// Si hay una pequeña desviación, la corregimos.
-        /// </summary>
         private void PrepareForFullARNavigation()
         {
             if (!_verifyNavMeshOnFullAR) return;
@@ -329,7 +290,6 @@ namespace IndoorNavAR.Navigation
                 return;
             }
 
-            // Corrección menor si el agente se desvió ligeramente del NavMesh
             if (Vector3.Distance(transform.position, hit.position) > 0.1f)
             {
                 transform.position = hit.position;
@@ -347,17 +307,9 @@ namespace IndoorNavAR.Navigation
             }
         }
 
-        /// <summary>
-        /// En FullAR, fuerza isStopped=true después de calcular la ruta.
-        /// El NavMeshAgent debe tener la ruta calculada pero NO ejecutarla.
-        /// La posición del agente la gestiona AROriginAligner (sigue la cámara).
-        /// </summary>
         private void EnsureAgentStoppedInFullAR()
         {
             if (_navAgent == null || !_navAgent.enabled) return;
-
-            // Necesitamos un frame para que NavigateTo() procese el path
-            // antes de detener el agente. Usamos una corrutina de un frame.
             StartCoroutine(StopAfterOneFrame());
         }
 
@@ -373,9 +325,6 @@ namespace IndoorNavAR.Navigation
             }
         }
 
-        /// <summary>
-        /// Re-habilita el NavMeshAgent si fue deshabilitado al inicio por ausencia de NavMesh.
-        /// </summary>
         private void EnsureNavMeshAgentEnabled()
         {
             if (_navAgent != null && !_navAgent.enabled)
@@ -395,6 +344,12 @@ namespace IndoorNavAR.Navigation
 
         // ─── Detección de nivel ───────────────────────────────────────────────
 
+        /// <summary>
+        /// ✅ v3 FIX A/B: Debounce + guard contra doble disparo.
+        /// El nivel solo cambia si el agente lleva >= _floorTransitionMinTime
+        /// en el nivel candidato. Una vez disparado el evento para ese nivel,
+        /// no se vuelve a disparar hasta que el candidato cambie.
+        /// </summary>
         private void UpdateCurrentLevel()
         {
             var startPoints = NavigationStartPointManager.GetAllStartPoints();
@@ -410,21 +365,51 @@ namespace IndoorNavAR.Navigation
                 if (dist < bestDist) { bestDist = dist; bestLevel = pt.Level; }
             }
 
-            if (bestLevel == CurrentLevel) return;
-
-            int prev = CurrentLevel;
-            CurrentLevel = bestLevel;
-
-            if (_logVerbose)
-                Debug.Log($"[NavigationAgent] Transición nivel {prev} → {bestLevel}");
-
-            if (_publishEvents)
-                EventBus.Instance?.Publish(new FloorTransitionEvent
+            if (bestLevel != CurrentLevel)
+            {
+                // Acumular tiempo en el nivel candidato
+                if (bestLevel == _candidateLevel)
                 {
-                    FromLevel     = prev,
-                    ToLevel       = bestLevel,
-                    AgentPosition = transform.position
-                });
+                    _candidateLevelTime += Time.deltaTime;
+                }
+                else
+                {
+                    // Nuevo candidato distinto → reiniciar contador
+                    _candidateLevel       = bestLevel;
+                    _candidateLevelTime   = 0f;
+                    _floorTransitionFired = false;
+                }
+
+                // Confirmar transición solo si llevamos suficiente tiempo
+                if (_candidateLevelTime >= _floorTransitionMinTime && !_floorTransitionFired)
+                {
+                    int prev = CurrentLevel;
+                    CurrentLevel = bestLevel;
+                    _floorTransitionFired = true;
+
+                    if (_logVerbose)
+                        Debug.Log($"[NavigationAgent] Transición nivel {prev} → {bestLevel} " +
+                                  $"(confirmada tras {_candidateLevelTime:F2}s)");
+
+                    if (_publishEvents)
+                        EventBus.Instance?.Publish(new FloorTransitionEvent
+                        {
+                            FromLevel     = prev,
+                            ToLevel       = bestLevel,
+                            AgentPosition = transform.position
+                        });
+                }
+            }
+            else
+            {
+                // Estamos en el nivel actual → resetear candidato si era diferente
+                if (_candidateLevel != CurrentLevel)
+                {
+                    _candidateLevel       = CurrentLevel;
+                    _candidateLevelTime   = 0f;
+                    _floorTransitionFired = false;
+                }
+            }
         }
 
         // ─── Handlers del PathController ──────────────────────────────────────
@@ -443,6 +428,10 @@ namespace IndoorNavAR.Navigation
                 });
         }
 
+        /// <summary>
+        /// ✅ v3 FIX C: HandlePathCompleted ya NO llama UpdateCurrentLevel().
+        /// El nivel se actualiza solo desde Update() con el debounce correcto.
+        /// </summary>
         private void HandlePathCompleted()
         {
             OnArrived?.Invoke();
@@ -492,7 +481,9 @@ namespace IndoorNavAR.Navigation
         private void DebugLogStatus()
         {
             Debug.Log($"[NavigationAgent] IsNavigating={IsNavigating} | FullAR={IsFullARMode}\n" +
-                      $"  Level={CurrentLevel} | Remaining={RemainingDistance:F2}m\n" +
+                      $"  Level={CurrentLevel} | CandidateLevel={_candidateLevel} | " +
+                      $"CandidateTime={_candidateLevelTime:F2}s\n" +
+                      $"  Remaining={RemainingDistance:F2}m\n" +
                       $"  Progress={ProgressPercent * 100f:F0}% | Speed={CurrentSpeed:F2}m/s\n" +
                       $"  AgentPos={transform.position:F2} | Dest={LastDestination:F2}\n" +
                       $"  NavAgent stopped={_navAgent?.isStopped} | enabled={_navAgent?.enabled}");
