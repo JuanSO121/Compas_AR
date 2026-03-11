@@ -4,56 +4,7 @@
 // ============================================================================
 //  PROBLEMA CORREGIDO (FIX #9 → FIX #10)
 // ============================================================================
-//
-//  SÍNTOMA (confirmado por log):
-//    [PathController] Ruta: 1 raw → 2 optimizados, 0,0m  ← ruta de CERO metros
-//    [ARGuideController] initialDist=3,1m                 ← usuario lejos del destino
-//
-//  CAUSA RAÍZ — Race condition entre NavigationStartPoint Level 1 y AROriginAligner:
-//
-//    1. NavigationStartPoint Level 1 tiene autoTeleportOnStart=true.
-//       En Start(), lanza TeleportAgentWhenReady().
-//       Esto mueve el agente a Y≈3.36 (piso 1, donde está el destino "Habitación 2° Piso").
-//
-//    2. AROriginAligner.SyncAgentToCameraFullAR() debería corregir esto
-//       warpando el agente de vuelta a la cámara XR (piso 0).
-//       Pero hay una ventana de tiempo (hasta 2s por _stableFramesRequired y
-//       _syncFailThreshold) en que el agente puede seguir en piso 1.
-//
-//    3. Cuando el usuario dice "navegar a Habitación 2° Piso",
-//       NavigationManager.NavigateToWaypoint() confía en que AROriginAligner
-//       ya posicionó el agente correctamente (FIX #9).
-//       Pero si la race condition ganó, el agente está en Y≈3.36 (= posición del
-//       destino) → PathController computa ruta de 0m → VoiceGuide no genera
-//       instrucciones → ARGuideController cree que ya se llegó.
-//
-//  FIX #10:
-//    En NavigateToWaypoint() en modo FullAR, ANTES de llamar NavigateToWaypoint()
-//    en el agente, llamar explícitamente AROriginAligner.ForceSnapAgentToCamera().
-//    Este método hace un warp inmediato al NavMesh más cercano a la cámara XR,
-//    sin depender del ciclo de Update de AROriginAligner.
-//
-//    Esto garantiza que el agente esté en la posición del usuario (cámara XR)
-//    en el momento exacto en que se calcula la ruta, eliminando la race condition.
-//
-//  FIX COMPLEMENTARIO (Inspector, no código):
-//    NavigationStartPoint Level 1 → desactivar _autoTeleportOnStart en el Inspector.
-//    Solo el StartPoint del nivel de entrada (Level 0) debe teleportar al agente.
-//    Los StartPoints de niveles superiores existen para definir FloorHeight,
-//    no para teleportar. Ver nota en NavigationStartPoint.cs sobre _autoTeleportOnStart.
-//
-// ============================================================================
-//  TODOS LOS FIXES ANTERIORES SE MANTIENEN:
-//  ✅ FIX #1 — Exclusión mutua estricta con sesión guardada.
-//  ✅ FIX #2 — ConfirmModelPositioned() antes de cargar NavMesh.
-//  ✅ FIX #3 — ForceRealign() eliminado de InitializeFromSavedSession().
-//  ✅ FIX #4 — Initialize() espera al primer frame antes de arrancar.
-//  ✅ FIX #5 — ConfirmModelPositionedToAllStartPoints() eliminado.
-//  ✅ FIX #6 — AROriginAligner.NotifySessionRestored() al final.
-//  ✅ FIX #7 — VoiceGuide.TriggerFromWaypoint() conservado.
-//  ✅ FIX #8 — Navegación pasa por PathController (conservado, sin TeleportTo).
-//  ✅ FIX #9 — SetFullARMode(true) antes de navegar.
-//  ✅ FIX #10 — ForceSnapAgentToCamera() antes de calcular ruta en FullAR.
+
 
 using System;
 using System.Threading.Tasks;
