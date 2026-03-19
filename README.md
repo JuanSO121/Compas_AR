@@ -1,100 +1,78 @@
-# Compas AR, módulo IndoorNavAR
+# COMPAS AR, módulo IndoorNavAR
 
-## Introducción
+Proyecto de grado de Ingeniería de Sistemas, Universidad de San Buenaventura Cali.
 
-Este repositorio contiene el módulo de navegación en interiores asistido por realidad aumentada del proyecto de grado **Compas**, desarrollado en el programa de Ingeniería de Sistemas. El objetivo del módulo es resolver un problema concreto, orientar a una persona dentro de un edificio cuando no dispone de referencias visuales fiables, o cuando requiere apoyo adicional para desplazarse con seguridad.
+Este repositorio contiene el módulo Unity de navegación en interiores asistida por realidad aumentada, pensado para integrarse con una aplicación móvil Flutter orientada a accesibilidad.
 
-El módulo está implementado en Unity y se integra en una aplicación móvil principal desarrollada en Flutter. Su responsabilidad es modelar el entorno interior, calcular rutas navegables y renderizar guías visuales en tiempo real sobre el espacio físico detectado por AR. A nivel de accesibilidad, también publica mensajes de estado que la app Flutter convierte en voz mediante TTS, mientras Flutter captura comandos por voz con VTT y los reenvía a Unity como instrucciones de navegación.
+Autores: Juan Jose Sanchez, Carlos Eduardo Rangel.
 
-En términos prácticos, este componente no reemplaza la lógica de interacción accesible de Flutter. La complementa. Unity se ocupa de la capa espacial y de navegación AR, Flutter gobierna la experiencia de usuario, la entrada por voz y la salida hablada.
+## Tabla de contenidos
 
-## Arquitectura del módulo
+1. [Propósito del repositorio](#1-propósito-del-repositorio)
+2. [Objetivos del proyecto](#2-objetivos-del-proyecto)
+3. [Resumen ejecutivo del sistema](#3-resumen-ejecutivo-del-sistema)
+4. [Estado real del proyecto, implementado vs planificado](#4-estado-real-del-proyecto-implementado-vs-planificado)
+5. [Arquitectura del módulo](#5-arquitectura-del-módulo)
+6. [Flujo operativo de navegación](#6-flujo-operativo-de-navegación)
+7. [Tecnologías y su rol](#7-tecnologías-y-su-rol)
+8. [Modelo de datos y conceptos clave](#8-modelo-de-datos-y-conceptos-clave)
+9. [Algoritmo de cálculo de rutas](#9-algoritmo-de-cálculo-de-rutas)
+10. [Uso de realidad aumentada en el módulo](#10-uso-de-realidad-aumentada-en-el-módulo)
+11. [Integración con Flutter](#11-integración-con-flutter)
+12. [Estructura del repositorio](#12-estructura-del-repositorio)
+13. [Instalación, ejecución y validación](#13-instalación-ejecución-y-validación)
+14. [Limitaciones técnicas actuales](#14-limitaciones-técnicas-actuales)
+15. [Requisitos de hardware y software](#15-requisitos-de-hardware-y-software)
+16. [Guía para investigación y marco teórico](#16-guía-para-investigación-y-marco-teórico)
+17. [Hoja de ruta sugerida](#17-hoja-de-ruta-sugerida)
 
-La arquitectura sigue un esquema por capas y responsabilidades. Unity opera como motor de ejecución AR y cálculo de rutas, y Flutter opera como host de la aplicación móvil.
+## 1. Propósito del repositorio
 
-En Unity, la lógica principal se divide en gestión de sesión AR, administración de waypoints, planificación de rutas sobre NavMesh, renderizado de guía y persistencia. La comunicación interna entre subsistemas usa un bus de eventos para reducir acoplamiento y evitar dependencias rígidas entre managers y controladores. Este patrón permite escalar el módulo, por ejemplo para añadir detección de obstáculos o reglas contextuales de asistencia.
+Este README está diseñado para dos usos prácticos.
 
-La integración con Flutter se realiza mediante un puente de comandos. Flutter envía instrucciones hacia Unity en formato JSON. Unity interpreta acciones como navegación a destino, creación de waypoints, guardado y restauración de sesión. El puente actual está implementado en `FlutterUnityBridge`, diseñado para funcionar con el flujo Flutter, canal nativo Android, UnitySendMessage.
+Primero, documentación técnica para desarrollo y mantenimiento del módulo Unity IndoorNavAR.
 
-### Flujo general entre componentes
+Segundo, contexto completo y consistente para que un modelo de IA pueda comprender el problema, el alcance, la arquitectura, los límites actuales y las líneas de investigación sin ambigüedad.
 
-1. Flutter recibe un comando de usuario, táctil o por voz.
-2. Flutter procesa intención y envía comando al módulo Unity.
-3. Unity valida la instrucción, consulta waypoints y solicita ruta.
-4. El sistema de navegación calcula trayectoria y activa seguimiento.
-5. Unity renderiza indicadores AR y publica estados de avance.
-6. Flutter transforma esos estados en mensajes auditivos para el usuario.
+## 2. Objetivos del proyecto
 
-## Tecnologías utilizadas
+### 2.1 Objetivo general
 
-### Unity
+Desarrollar un sistema de navegación asistida para interiores dirigido a personas con discapacidad visual, mediante la integración de una plataforma robótica basada en Jetson Nano y una aplicación móvil accesible con capacidades de realidad aumentada, para orientar desplazamientos seguros en espacios cerrados.
 
-Unity es el entorno de ejecución del módulo AR. Aquí se implementan escena, objetos de navegación, agentes, controladores y servicios de persistencia. También se gestionan ciclo de vida, renderizado en tiempo real y despliegue móvil Android.
+### 2.2 Objetivos específicos
 
-### AR Foundation
+- Investigar el estado del arte sobre movilidad asistida en interiores para personas con discapacidad visual.
+- Adaptar e integrar algoritmos de percepción y evasión de obstáculos en la plataforma robótica.
+- Desarrollar la aplicación móvil accesible en Flutter con interacción por voz y síntesis de voz.
+- Implementar el módulo Unity de navegación indoor con representación del entorno, waypoints y rutas sobre NavMesh.
+- Evaluar el funcionamiento del sistema en escenarios controlados con métricas de precisión, estabilidad y tiempo de respuesta.
 
-AR Foundation es la capa de abstracción de AR en Unity. Permite trabajar con detección de planos, raycast espacial y anclaje sin reescribir lógica para cada proveedor nativo. En este proyecto se usa para iniciar sesión AR, detectar superficies útiles y posicionar contenido virtual alineado con el entorno físico.
+## 3. Resumen ejecutivo del sistema
 
-### ARCore y ARKit
+COMPAS aborda la orientación en espacios cerrados para personas con discapacidad visual, donde GPS no ofrece precisión útil. La solución divide responsabilidades en dos capas.
 
-ARCore se usa como backend principal en Android para tracking y plane detection. ARKit es el backend equivalente en iOS, aplicable si el despliegue se extiende a ecosistema Apple. La base del módulo es compatible por diseño con ambos proveedores por medio de AR Foundation, aunque el objetivo operativo actual está centrado en Android.
+Flutter gestiona la interacción accesible, voz a texto, texto a voz, flujo conversacional y experiencia de usuario.
 
-### Flutter
+Unity gestiona la capa espacial, sesión AR, detección de planos, carga de entorno, navegación sobre NavMesh, waypoints y persistencia de sesión.
 
-Flutter es la aplicación contenedora y el punto de interacción accesible con la persona usuaria. Desde Flutter se manejan la interfaz principal, el reconocimiento de voz, la síntesis de voz y la orquestación de comandos hacia Unity. Esta separación es útil porque evita acoplar funciones de accesibilidad a la escena 3D.
+En términos funcionales, Flutter envía comandos y Unity ejecuta navegación indoor en tiempo real con retroalimentación de estado.
 
-### C#
+## 4. Estado real del proyecto, implementado vs planificado
 
-C# es el lenguaje de implementación del módulo Unity. Se utiliza para modelar entidades de navegación, controladores de ruta, servicios de AR, integración con Flutter y persistencia de sesiones.
+### 4.1 Implementado en este repositorio
 
-### Librerías y paquetes relevantes
+- Gestión de sesión AR con detección de planos y raycast (`ARSessionManager`).
+- Gestión de waypoints, creación, búsqueda, edición y limpieza (`WaypointManager`, `WaypointData`).
+- Cálculo y seguimiento de rutas sobre NavMesh con optimización de trayectoria y control anti atasco (`NavigationPathController`, `NavigationPathOptimizer`, `NavigationAgent`).
+- Generación y serialización de NavMesh multinivel (`MultiLevelNavMeshGenerator`, `NavMeshSerializer`, servicios auxiliares).
+- Orquestación de navegación desde manager principal (`NavigationManager`).
+- Persistencia de sesión (`PersistenceManager`).
+- Puente de comandos Flutter a Unity con acciones JSON definidas (`FlutterUnityBridge`).
 
-El proyecto utiliza paquetes del ecosistema Unity para XR, navegación y entrada. Entre los más relevantes están ARCore XR Plugin, AI Navigation, Input System y XR Interaction Toolkit. Además, se usan componentes de TextMeshPro para UI textual y recursos visuales de soporte.
+### 4.2 Contrato de comandos implementado hoy
 
-## Funcionamiento del sistema de navegación
-
-El entorno interior se representa en una escena Unity donde se combinan modelos 3D del edificio con superficies navegables generadas mediante NavMesh. El resultado operativo no es solo geometría visual, es una malla de navegación sobre la cual un agente puede calcular trayectorias válidas, incluso en escenarios multinivel.
-
-Los puntos de interés se definen como waypoints con metadatos, identificador, nombre, tipo, posición y configuración visual. Estos waypoints pueden crearse durante ejecución y permanecer persistidos para sesiones posteriores.
-
-El cálculo de rutas parte de la posición actual del agente y del waypoint destino. El sistema solicita una ruta base y luego la optimiza para suavizar el recorrido y evitar comportamientos poco naturales, por ejemplo acercamiento excesivo a bordes o cambios bruscos de dirección. Durante el seguimiento existe control anti bloqueo, con recálculo en caso de estancamiento y validaciones para evitar falsos positivos de llegada.
-
-## Algoritmo de cálculo de rutas
-
-El enfoque general corresponde a planificación sobre grafo navegable derivado de NavMesh. Internamente, Unity resuelve el pathfinding sobre polígonos conectados y entrega una secuencia de esquinas o puntos de control.
-
-Sobre esa ruta base, el módulo aplica una fase de optimización que filtra waypoints, proyecta puntos con mayor holgura y ajusta el seguimiento para un desplazamiento más estable. En otras palabras, no se limita a pedir una ruta y dibujarla, también la refina para que sea usable en navegación asistida real.
-
-La instrucción de navegación se genera como una combinación de estado continuo y eventos discretos. Estado continuo, distancia restante y progreso. Eventos discretos, inicio de ruta, waypoint alcanzado, recálculo, llegada o fallo. Estos eventos alimentan mensajes que Flutter puede verbalizar.
-
-## Uso de realidad aumentada
-
-AR Foundation habilita la detección de planos y el raycast sobre el mundo físico capturado por cámara. Con esa información se fijan anclajes espaciales, lo que permite ubicar elementos virtuales sin deriva excesiva cuando el usuario se desplaza.
-
-Los elementos de guía se posicionan en coordenadas del mundo AR y se actualizan conforme avanza la navegación. Dependiendo de la configuración de escena, la guía puede mostrarse como marcadores de ruta, puntos de referencia, indicadores de dirección y objetos de destino.
-
-La precisión depende del tracking del dispositivo, de la calidad del mapeo inicial y de las condiciones del entorno, iluminación, textura de superficies y presencia de oclusiones.
-
-## Lógica de funcionamiento del módulo
-
-El ciclo operativo del módulo sigue esta secuencia:
-
-1. Inicialización de la sesión AR y validación de dependencias.
-2. Detección de superficies y alineación inicial del contenido.
-3. Carga de entorno, modelos y configuración de navegación.
-4. Disponibilización de waypoints y selección de destino.
-5. Cálculo de ruta en NavMesh y optimización de trayectoria.
-6. Ejecución del seguimiento con control de progreso y recálculo cuando aplica.
-7. Renderizado de guía AR y emisión de eventos de estado.
-8. Finalización por llegada, cancelación o fallo de ruta.
-
-## Integración con Flutter
-
-La integración se plantea con Unity as a Library en Android. Flutter conserva el control de la aplicación y Unity se carga como módulo especializado para navegación AR.
-
-El intercambio de comandos sigue un esquema de mensajería JSON. Flutter envía acciones y parámetros, Unity procesa y ejecuta. Para integración de accesibilidad, Unity publica estados que Flutter consume para text to speech. En sentido inverso, Flutter convierte voz a texto e invoca acciones de navegación sobre Unity.
-
-Acciones de puente actualmente contempladas:
+Acciones aceptadas por `FlutterUnityBridge`:
 
 - `navigate_to_waypoint`
 - `add_waypoint`
@@ -102,59 +80,211 @@ Acciones de puente actualmente contempladas:
 - `save_session`
 - `load_session`
 
-Este diseño es suficiente para un MVP funcional. Si el proyecto crece, conviene versionar explícitamente el contrato de mensajes para evitar rupturas entre app Flutter y módulo Unity.
+### 4.3 Planificado o sujeto a evolución
 
-## Estructura del proyecto
+- Canal robusto Unity a Flutter para eventos semánticos de navegación estandarizados.
+- Versionado formal del protocolo de mensajería JSON.
+- Capa explícita de guía de voz contextual en Unity o totalmente delegada a Flutter según estrategia final.
+- Detección dinámica de obstáculos y recálculo contextual en línea.
 
-La organización del repositorio prioriza separación entre activos de Unity, configuración del editor, documentación e integración:
+Esta separación es intencional para evitar confundir estado actual con diseño objetivo.
 
-- `Assets/IndoorNavAR/`, núcleo del módulo, scripts de AR, navegación, managers, integración, materiales y recursos.
-- `Assets/Scenes/`, escenas de trabajo, incluida la escena de navegación principal.
-- `Assets/StreamingAssets/` y `Assets/IndoorNavAR/StreamingAssets/`, recursos cargables en ejecución, por ejemplo modelos del entorno.
-- `Packages/`, manifiesto y lock de paquetes Unity.
-- `ProjectSettings/`, configuración del proyecto Unity, XR, build y parámetros del editor.
-- `docs/`, documentación técnica complementaria, incluida guía de integración Flutter Unity.
+## 5. Arquitectura del módulo
 
-## Consideraciones técnicas
+La arquitectura usa separación por dominios para reducir acoplamiento.
 
-### Limitaciones
+### 5.1 Núcleo de dominio
 
-La solución depende de la calidad de tracking AR en tiempo real. Ambientes con pocas texturas, iluminación deficiente o alto tránsito pueden degradar el anclaje espacial. También hay limitaciones inherentes a GPS indoor inexistente, por eso la calidad del modelo del edificio y del NavMesh es crítica.
+- `Core/Managers`: coordinación de navegación, waypoints, minimapa y carga de modelos.
+- `Core/Data`: entidades como waypoint y metadatos asociados.
+- `Core/Events`: bus de eventos para comunicación desacoplada.
 
-Otro punto débil es la dependencia de un contrato de mensajes ad hoc con Flutter. Funciona, pero sin versionado formal puede romperse si cualquiera de los dos módulos cambia nombres de acciones o estructura JSON.
+### 5.2 Capa AR
 
-### Requisitos de hardware
+- `Scripts/AR`: inicialización de AR, capacidades y gestión de planos.
+- `AR/`: utilidades de alineación del origen para sincronizar contenido virtual con entorno físico.
 
-Se requiere dispositivo móvil compatible con ARCore, cámara funcional, sensores inerciales estables y capacidad gráfica suficiente para renderizar escena 3D en tiempo real. En pruebas de campo se recomienda gama media alta en adelante para mantener fluidez y estabilidad de tracking.
+### 5.3 Capa de navegación
 
-### Dependencias de software
+- `Scripts/Navigation`: pathfinding sobre NavMesh, optimización, coordinación de agentes, soporte multinivel y serialización.
 
-- Unity 6, versión del proyecto `6000.2.14f1`.
-- Android SDK compatible con configuración del módulo host.
-- Paquetes XR y navegación definidos en `Packages/manifest.json`.
-- Aplicación Flutter con canal nativo Android para invocar Unity.
+### 5.4 Capa de integración
 
-## Ejecución y validación básica
+- `Scripts/Integration`: recepción de comandos desde Flutter y delegación a managers internos.
 
-Para ejecutar el módulo de forma local:
+## 6. Flujo operativo de navegación
 
-1. Abrir el repositorio en Unity 6.
-2. Verificar resolución de paquetes.
-3. Abrir la escena `Assets/Scenes/Navegacion.unity`.
-4. Ejecutar pruebas iniciales en editor para validar flujo interno.
-5. Compilar a dispositivo Android para pruebas AR reales.
+1. Se inicia la escena y se validan dependencias AR.
+2. El usuario o sistema carga entorno y estado previo.
+3. Flutter solicita una acción, por ejemplo navegar a un waypoint.
+4. Unity resuelve destino, calcula ruta y activa seguimiento.
+5. El controlador actualiza progreso, waypoints alcanzados y llegada.
+6. Si hay fallo de ruta o estancamiento, se dispara recálculo o evento de error.
+7. El estado puede persistirse para sesiones futuras.
 
-Para validar integración con Flutter, se recomienda una prueba de extremo a extremo simple, enviar comando de navegación desde Flutter y confirmar en Unity el inicio de ruta, luego verificar locución TTS de estado en Flutter.
+## 7. Tecnologías y su rol
 
-## Recomendaciones de mejora
+### Unity
 
-Si el módulo se va a usar en producción académica o piloto institucional, hay tres mejoras que valen la pena. Primero, incorporar detección dinámica de obstáculos para recálculo contextual. Segundo, formalizar contrato de mensajería con esquema versionado y pruebas automáticas. Tercero, añadir telemetría de navegación para medir tiempos, errores de ruta y puntos de abandono.
+Motor de ejecución de lógica AR, navegación y renderizado en tiempo real.
 
-## Autores y contexto académico
+### AR Foundation
 
-Desarrollo realizado en el marco de un proyecto de grado en Ingeniería de Sistemas, Universidad de San Buenaventura Cali.
+Capa de abstracción AR en Unity para planos, raycast y anclajes con backend nativo.
 
-Autores:
+### ARCore
 
-- Juan Jose Sanchez
-- Carlos Eduardo Rangel
+Backend principal en Android para tracking visual inercial y mapeo del entorno.
+
+### ARKit
+
+Backend equivalente en iOS, aplicable si se extiende despliegue fuera de Android.
+
+### Flutter
+
+Aplicación host, interfaz accesible y punto de interacción por voz.
+
+### C#
+
+Lenguaje de implementación del módulo Unity.
+
+### Paquetes Unity relevantes
+
+- `com.unity.xr.arcore`
+- `com.unity.ai.navigation`
+- `com.unity.inputsystem`
+- `com.unity.xr.interaction.toolkit`
+
+## 8. Modelo de datos y conceptos clave
+
+### Waypoint
+
+Punto de interés navegable con identificador, nombre y pose tridimensional.
+
+### NavMesh
+
+Representación navegable del entorno. Permite pathfinding sobre superficies válidas y conexión entre niveles.
+
+### Ruta optimizada
+
+Secuencia procesada a partir de una ruta base para mejorar estabilidad de seguimiento y usabilidad en navegación asistida.
+
+### Sesión
+
+Conjunto persistible de waypoints, configuración de navegación y datos relacionados con malla navegable.
+
+## 9. Algoritmo de cálculo de rutas
+
+El módulo trabaja sobre NavMesh de Unity. A nivel conceptual, el problema se modela como búsqueda de camino en un grafo navegable derivado de polígonos conectados.
+
+Pipeline técnico actual:
+
+1. Solicitud de ruta entre posición actual y destino.
+2. Validación de estado y factibilidad del path.
+3. Optimización de trayectoria para reducir puntos redundantes y mejorar holgura.
+4. Seguimiento progresivo por waypoints con umbrales de llegada intermedia y llegada final.
+5. Mecanismo anti atasco que evita falsos completados y prioriza recálculo.
+
+## 10. Uso de realidad aumentada en el módulo
+
+AR Foundation detecta superficies y ofrece raycast para ubicar contenido virtual en el espacio físico. El módulo usa esta base para alinear escena y navegación con entorno real capturado por cámara.
+
+La estabilidad final depende de calidad de tracking, condiciones de iluminación, textura de superficies y deriva acumulada de la sesión.
+
+## 11. Integración con Flutter
+
+El patrón recomendado en la documentación del proyecto es Unity as a Library en Android, con puente de comandos vía canal nativo y `UnitySendMessage`.
+
+Flujo de integración resumido:
+
+1. Flutter interpreta intención del usuario.
+2. Flutter envía JSON al GameObject `FlutterBridge`.
+3. `FlutterUnityBridge` procesa la acción y ejecuta lógica interna.
+4. Unity publica mensajes de estado por eventos internos y logging.
+5. Flutter decide qué comunicar por TTS al usuario final.
+
+Nota importante, este repositorio implementa de forma explícita el canal Flutter a Unity. La salida Unity a Flutter para eventos enriquecidos debe definirse o consolidarse según la arquitectura final del host Flutter.
+
+## 12. Estructura del repositorio
+
+- `Assets/IndoorNavAR/`: núcleo del módulo.
+- `Assets/IndoorNavAR/Scripts/AR/`: gestión de sesión y capacidades AR.
+- `Assets/IndoorNavAR/Scripts/Core/`: managers, datos y eventos.
+- `Assets/IndoorNavAR/Scripts/Navigation/`: cálculo, optimización y seguimiento de rutas.
+- `Assets/IndoorNavAR/Scripts/Integration/`: puente con Flutter.
+- `Assets/IndoorNavAR/Core/`: persistencia y carga en runtime.
+- `Assets/Scenes/`: escenas Unity, incluida `Navegacion.unity`.
+- `Packages/`: dependencias Unity.
+- `ProjectSettings/`: configuración de proyecto y XR.
+- `docs/`: documentación complementaria de integración.
+
+## 13. Instalación, ejecución y validación
+
+### 13.1 Requisitos previos
+
+- Unity 6000.2.14f1.
+- Android SDK operativo para despliegue móvil.
+- Dispositivo Android compatible con ARCore para pruebas de campo.
+
+### 13.2 Ejecución local
+
+1. Abrir proyecto en Unity.
+2. Verificar paquetes en `Packages/manifest.json`.
+3. Abrir `Assets/Scenes/Navegacion.unity`.
+4. Ejecutar en editor para validación lógica básica.
+5. Compilar a Android para validar comportamiento AR real.
+
+### 13.3 Validación mínima recomendada
+
+- Crear o cargar waypoints.
+- Lanzar `navigate_to_waypoint` desde integración Flutter.
+- Confirmar inicio de navegación y progreso en Unity.
+- Guardar sesión, cerrar, recargar sesión y verificar consistencia.
+
+## 14. Limitaciones técnicas actuales
+
+- Dependencia fuerte de tracking AR, ambientes con baja textura o iluminación degradan precisión.
+- No existe posicionamiento absoluto indoor tipo GPS, la calidad del modelo y del NavMesh es crítica.
+- El contrato JSON actual no está versionado formalmente.
+- Rendimiento sensible al hardware del dispositivo.
+
+## 15. Requisitos de hardware y software
+
+### 15.1 Hardware
+
+- Android compatible con ARCore.
+- Cámara trasera funcional.
+- Sensores inerciales estables.
+- Recomendado dispositivo de gama media alta para pruebas continuas.
+
+### 15.2 Software
+
+- Unity `6000.2.14f1`.
+- Paquetes definidos en `Packages/manifest.json`.
+- Integración Flutter Android siguiendo `docs/INTEGRACION_FLUTTER_UNITY.md`.
+
+## 16. Guía para investigación y marco teórico
+
+Para un marco teórico sólido, las líneas que mejor conectan con este módulo son:
+
+- Navegación asistiva en interiores para discapacidad visual.
+- Limitaciones del posicionamiento indoor sin infraestructura dedicada.
+- Realidad aumentada móvil, tracking visual inercial y deriva espacial.
+- Modelado de espacios navegables con grafos y NavMesh.
+- Planificación de rutas y criterios de robustez en asistencia peatonal.
+- Interacción multimodal accesible, voz, feedback auditivo y carga cognitiva.
+- Integración de motores 3D en apps móviles híbridas, Unity as a Library.
+
+Este README describe qué está implementado y qué está proyectado para evitar sesgos en la redacción del estado del arte y en la metodología del trabajo de grado.
+
+## 17. Hoja de ruta sugerida
+
+- Versionar contrato JSON, campo `protocolVersion` y catálogo formal de acciones.
+- Definir telemetría de navegación para evaluación experimental reproducible.
+- Añadir pruebas automatizadas de integración Flutter Unity en escenarios críticos.
+- Incorporar detección de obstáculos y recálculo adaptativo.
+- Publicar guía de despliegue de investigación, dataset de recorridos y métricas de evaluación.
+
+---
+
+Si necesitas usar este README como prompt base para IA, úsalo junto con `docs/INTEGRACION_FLUTTER_UNITY.md` para darle contexto de arquitectura y contexto de integración Android Flutter Unity en paralelo.
