@@ -1,45 +1,28 @@
 // File: VoiceCommandAPI.cs
-// ✅ v8.2 — FIX RAÍZ TTS: Flutter es el único dueño del engine TTS
+// ✅ v8.4 — Fix mensajes TTS repetidos 3 veces
 //
-// ============================================================================
-//  CAMBIOS v8.1 → v8.2
-// ============================================================================
+// ════════════════════════════════════════════════════════════════════════════
+// CAMBIOS v8.3 → v8.4
+// ════════════════════════════════════════════════════════════════════════════
 //
-//  PROBLEMA RAÍZ (corregido en esta versión):
-//    VoiceCommandAPI suscribía GuideAnnouncementEvent y lo reenviaba a Flutter
-//    con action="guide_announcement". Flutter lo procesaba en VoiceNavService
-//    y hablaba por TTS. Sin embargo:
+//  FIX — SpeakArbitraryText(): publicar en EventBus causaba loop de repetición.
 //
-//    1. GuideAnnouncementEvent incluía mensajes de GoStraight/ProgressUpdate
-//       (p=0/1) que cruzaban el bridge aunque el TTS estuviera ocupado.
+//  PROBLEMA EN v8.3:
+//    SpeakArbitraryText() publicaba TTSRequestEvent en EventBus.
+//    OnTTSRequest() (suscrito al mismo EventBus) lo capturaba y enviaba
+//    tts_request a Flutter. PERO Flutter ya había enviado el texto
+//    directamente via speakArbitraryText() en el bridge.
+//    Resultado: Flutter recibía el mismo texto DOS veces por dos canales
+//    distintos y lo hablaba DOS veces.
+//    Sumado al canal legacy guide_announcement → hasta 3 repeticiones.
 //
-//    2. Unity liberaba _ttsBusy con AutoResumeTTSAfter() basado en word-count
-//       (wordCount / 10 + 1.5s) → siempre erróneo → mensajes cortados o
-//       instrucciones solapadas.
+//  FIX EN v8.4:
+//    SpeakArbitraryText() envía tts_request DIRECTAMENTE a Flutter via
+//    Reply(), sin publicar en EventBus. Así corta el loop:
+//      ❌ ANTES: Flutter → Unity EventBus → OnTTSRequest → tts_request → Flutter
+//      ✅ AHORA: Flutter → Reply(tts_request) → Flutter (una sola vez)
 //
-//    3. No existía un canal de vuelta real: Flutter no confirmaba cuándo
-//       terminaba de hablar. OnTTSStatus existía pero Unity lo ignoraba
-//       para gestionar _ttsBusy.
-//
-//  FIX v8.2 — Nuevo flujo:
-//
-//    A. Suscripción a TTSRequestEvent (nuevo evento de v5.6):
-//       NavigationVoiceGuide.Speak() → TTSRequestEvent → VoiceCommandAPI
-//       → JSON action="tts_request" → Flutter VoiceNavigationService → TTS.
-//
-//    B. OnGuideAnnouncement() conservado para consumidores de estado/UI
-//       (ARGuideController, etc.) pero ya NO reenvía TTS a Flutter.
-//       Solo escribe un log de diagnóstico.
-//
-//    C. OnTTSStatus() mejorado: cuando Flutter confirma isSpeaking=false,
-//       llama NavigationVoiceGuide.Instance.ClearTTSBusy() para liberar
-//       _ttsBusy con el evento REAL de completion, no con una estimación.
-//
-//    D. Nuevo método SendFlutterTtsStatus(): Flutter llama "tts_status" →
-//       OnFlutterCommand() → SendFlutterTtsStatus() → misma lógica que
-//       OnTTSStatus() existente.
-//
-//  TODOS LOS CAMBIOS DE v8.0 y v8.1 SE CONSERVAN ÍNTEGRAMENTE.
+//  TODO LO DEMÁS ES IDÉNTICO A v8.3.
 
 using System;
 using System.Text;
@@ -58,16 +41,16 @@ namespace IndoorNavAR.Integration
         public static VoiceCommandAPI Instance { get; private set; }
 
         [Header("Dependencias (auto-detectadas si quedan vacías)")]
-        [SerializeField] private WaypointManager    _waypointManager;
-        [SerializeField] private NavigationManager  _navigationManager;
+        [SerializeField] private WaypointManager _waypointManager;
+        [SerializeField] private NavigationManager _navigationManager;
         [SerializeField] private PersistenceManager _persistenceManager;
 
         [Header("Canal de respuesta a Flutter")]
         [SerializeField] private string _flutterGameObject = "FlutterBridge";
-        [SerializeField] private string _responseMethod    = "OnUnityResponse";
+        [SerializeField] private string _responseMethod = "OnUnityResponse";
 
         [Header("─── Debug ───────────────────────────────────────────────────")]
-        [SerializeField] private bool _logTTSSync  = true;
+        [SerializeField] private bool _logTTSSync = true;
         [SerializeField] private bool _logTracking = true;
 
         [Header("─── Tracking State ──────────────────────────────────────────")]
@@ -75,16 +58,19 @@ namespace IndoorNavAR.Integration
                  "de mismo estado. Cambios stable→unstable o viceversa siempre se envían.")]
         [SerializeField] private float _trackingNotifyInterval = 1.0f;
 
-        private bool   _waypointCacheDirty = true;
-        private string _waypointListCache  = "[]";
+        [Header("─── TTS Speak throttle (v8.3) ─────────────────────────────")]
+        [Tooltip("Tiempo mínimo (s) entre llamadas a SpeakArbitraryText desde Flutter.")]
+        [SerializeField] private float _ttsRequestThrottle = 3.0f;
 
-        // Throttle de tracking state
+        private bool _waypointCacheDirty = true;
+        private string _waypointListCache = "[]";
+
         private float _lastTrackingNotifyTime = -999f;
-        private bool  _lastTrackingStable     = true;
+        private bool _lastTrackingStable = true;
+        private float _lastArbitraryTTSTime = -999f;
 
-        // StringBuilders
-        private readonly StringBuilder _sb      = new StringBuilder(512);
-        private readonly StringBuilder _ttsSb   = new StringBuilder(256);
+        private readonly StringBuilder _sb = new StringBuilder(512);
+        private readonly StringBuilder _ttsSb = new StringBuilder(256);
 
         #region Lifecycle
 
@@ -93,8 +79,8 @@ namespace IndoorNavAR.Integration
             if (Instance != null && Instance != this) { Destroy(gameObject); return; }
             Instance = this;
 
-            _waypointManager    ??= FindFirstObjectByType<WaypointManager>();
-            _navigationManager  ??= FindFirstObjectByType<NavigationManager>();
+            _waypointManager ??= FindFirstObjectByType<WaypointManager>();
+            _navigationManager ??= FindFirstObjectByType<NavigationManager>();
             _persistenceManager ??= FindFirstObjectByType<PersistenceManager>();
         }
 
@@ -102,28 +88,26 @@ namespace IndoorNavAR.Integration
         {
             var bus = EventBus.Instance;
             if (bus == null) return;
-            bus.Subscribe<WaypointPlacedEvent>      (OnWaypointPlaced);
-            bus.Subscribe<WaypointRemovedEvent>     (OnWaypointRemoved);
+            bus.Subscribe<WaypointPlacedEvent>(OnWaypointPlaced);
+            bus.Subscribe<WaypointRemovedEvent>(OnWaypointRemoved);
             bus.Subscribe<WaypointsBatchLoadedEvent>(OnWaypointsBatchLoaded);
-            bus.Subscribe<NavigationArrivedEvent>   (OnNavigationArrived);
-            bus.Subscribe<FloorTransitionEvent>     (OnFloorTransition);
-            // ✅ v8.2: canal TTS directo — GuideAnnouncementEvent ya no hace TTS
-            bus.Subscribe<TTSRequestEvent>          (OnTTSRequest);
-            // GuideAnnouncementEvent se conserva solo para diagnóstico/estado
-            bus.Subscribe<GuideAnnouncementEvent>   (OnGuideAnnouncement);
+            bus.Subscribe<NavigationArrivedEvent>(OnNavigationArrived);
+            bus.Subscribe<FloorTransitionEvent>(OnFloorTransition);
+            bus.Subscribe<TTSRequestEvent>(OnTTSRequest);
+            bus.Subscribe<GuideAnnouncementEvent>(OnGuideAnnouncement);
         }
 
         private void OnDisable()
         {
             var bus = EventBus.Instance;
             if (bus == null) return;
-            bus.Unsubscribe<WaypointPlacedEvent>      (OnWaypointPlaced);
-            bus.Unsubscribe<WaypointRemovedEvent>     (OnWaypointRemoved);
+            bus.Unsubscribe<WaypointPlacedEvent>(OnWaypointPlaced);
+            bus.Unsubscribe<WaypointRemovedEvent>(OnWaypointRemoved);
             bus.Unsubscribe<WaypointsBatchLoadedEvent>(OnWaypointsBatchLoaded);
-            bus.Unsubscribe<NavigationArrivedEvent>   (OnNavigationArrived);
-            bus.Unsubscribe<FloorTransitionEvent>     (OnFloorTransition);
-            bus.Unsubscribe<TTSRequestEvent>          (OnTTSRequest);
-            bus.Unsubscribe<GuideAnnouncementEvent>   (OnGuideAnnouncement);
+            bus.Unsubscribe<NavigationArrivedEvent>(OnNavigationArrived);
+            bus.Unsubscribe<FloorTransitionEvent>(OnFloorTransition);
+            bus.Unsubscribe<TTSRequestEvent>(OnTTSRequest);
+            bus.Unsubscribe<GuideAnnouncementEvent>(OnGuideAnnouncement);
         }
 
         private void OnDestroy()
@@ -139,28 +123,23 @@ namespace IndoorNavAR.Integration
 
         #region Tracking State
 
-        /// <summary>
-        /// Llamado por AROriginAligner cuando ARSession.state cambia.
-        /// ✅ v8 BUG B FIX: Throttle unificado (conservado de v8).
-        /// </summary>
         public void NotifyTrackingState(bool isStable, string stateStr)
         {
             bool stateChanged = isStable != _lastTrackingStable;
-            bool throttled    = Time.unscaledTime - _lastTrackingNotifyTime < _trackingNotifyInterval;
+            bool throttled = Time.unscaledTime - _lastTrackingNotifyTime < _trackingNotifyInterval;
 
-            if (!stateChanged && throttled)
-                return;
+            if (!stateChanged && throttled) return;
 
-            _lastTrackingStable     = isStable;
+            _lastTrackingStable = isStable;
             _lastTrackingNotifyTime = Time.unscaledTime;
 
-            string state  = stateStr ?? "Unknown";
+            string state = stateStr ?? "Unknown";
             string reason = "None";
             int pipeIdx = state.IndexOf('|');
             if (pipeIdx >= 0)
             {
                 reason = state.Substring(pipeIdx + 1);
-                state  = state.Substring(0, pipeIdx);
+                state = state.Substring(0, pipeIdx);
             }
 
             _sb.Clear();
@@ -188,21 +167,6 @@ namespace IndoorNavAR.Integration
 
         #region TTS Request (Unity → Flutter)
 
-        /// <summary>
-        /// ✅ v8.2: Recibe TTSRequestEvent de NavigationVoiceGuide y lo
-        /// envía a Flutter como action="tts_request".
-        ///
-        /// Flutter (VoiceNavigationService) es el único escritor del engine TTS.
-        /// Unity solo produce el texto con prioridad e indicación de interrupción.
-        ///
-        /// JSON enviado:
-        /// {
-        ///   "action":    "tts_request",
-        ///   "text":      "En 5 pasos, gira a las 10.",
-        ///   "priority":  2,
-        ///   "interrupt": false
-        /// }
-        /// </summary>
         private void OnTTSRequest(TTSRequestEvent evt)
         {
             if (string.IsNullOrEmpty(evt.Text)) return;
@@ -231,18 +195,6 @@ namespace IndoorNavAR.Integration
 
         #region TTS Status (Flutter → Unity)
 
-        /// <summary>
-        /// ✅ v8.2: Llamado cuando Flutter reporta inicio o fin real del TTS.
-        ///
-        /// Cuando isSpeaking=false, notifica a NavigationVoiceGuide para que
-        /// libere _ttsBusy con el evento REAL de completion — no con una
-        /// estimación de words. Este es el fix raíz del corte de mensajes.
-        ///
-        /// Llamado desde:
-        ///   - FlutterUnityBridge.OnFlutterCommand() con action="tts_status"
-        ///   - Directamente desde ar_navigation_screen vía UnitySendMessage
-        ///     (canal existente de v8.1)
-        /// </summary>
         public void OnTTSStatus(string json)
         {
             if (_logTTSSync)
@@ -252,26 +204,19 @@ namespace IndoorNavAR.Integration
             {
                 var data = JsonUtility.FromJson<TTSStatusPayload>(json);
 
-                // Publicar en EventBus para ARGuideController y otros listeners
                 EventBus.Instance?.Publish(new TTSSpeakingEvent
                 {
                     IsSpeaking = data.isSpeaking,
-                    Priority   = data.priority,
+                    Priority = data.priority,
                 });
 
-                // ✅ v8.2: Cuando Flutter confirma que terminó de hablar,
-                // liberar _ttsBusy en NavigationVoiceGuide con el evento REAL.
                 if (!data.isSpeaking)
                 {
                     var guide = NavigationVoiceGuide.Instance;
                     if (guide != null)
-                    {
                         guide.ClearTTSBusy();
-                    }
                     else
-                    {
                         Debug.LogWarning("[VoiceAPI] OnTTSStatus: NavigationVoiceGuide.Instance es null.");
-                    }
                 }
             }
             catch (Exception ex)
@@ -284,45 +229,107 @@ namespace IndoorNavAR.Integration
         private class TTSStatusPayload
         {
             public bool isSpeaking;
-            public int  priority;
+            public int priority;
         }
 
         #endregion
 
         // =====================================================================
-        //  GuideAnnouncement — SOLO DIAGNÓSTICO/ESTADO (v8.2)
+        //  GuideAnnouncement — SOLO DIAGNÓSTICO/ESTADO
         // =====================================================================
 
         #region GuideAnnouncement (estado, no TTS)
 
-        /// <summary>
-        /// ✅ v8.2: GuideAnnouncementEvent ya NO reenvía texto a Flutter para TTS.
-        /// El canal TTS es ahora TTSRequestEvent → action="tts_request".
-        ///
-        /// Este handler solo registra el evento para diagnóstico. Si en el
-        /// futuro se necesita un action="guide_state" para overlays de UI en
-        /// Flutter (mostrar tipo de instrucción visualmente), se puede agregar
-        /// aquí sin mezclar con el canal TTS.
-        ///
-        /// ARGuideController y otros consumidores de estado siguen recibiendo
-        /// el evento normalmente via EventBus — este handler no interfiere.
-        /// </summary>
         private void OnGuideAnnouncement(GuideAnnouncementEvent evt)
         {
             if (_logTTSSync)
                 Debug.Log($"[VoiceAPI] 📋 GuideAnnouncement (estado, sin TTS): " +
                           $"[{evt.AnnouncementType}] floor={evt.CurrentFloor} \"{evt.Message}\"");
+        }
 
-            // Si se necesita notificar overlays de UI en Flutter sobre el tipo
-            // de instrucción (sin TTS), descomentar y usar action="guide_state":
-            //
-            // _sb.Clear();
-            // _sb.Append("{\"action\":\"guide_state\",\"type\":\"");
-            // _sb.Append(evt.AnnouncementType.ToString());
-            // _sb.Append("\",\"floor\":");
-            // _sb.Append(evt.CurrentFloor);
-            // _sb.Append('}');
-            // Reply(_sb.ToString());
+        #endregion
+
+        // =====================================================================
+        //  MÉTODOS v8.3 / v8.4 — Comandos desde Flutter
+        // =====================================================================
+
+        #region Métodos desde Flutter (v8.3/v8.4)
+
+        /// <summary>
+        /// Retorna el estado de la guía de voz a Flutter.
+        /// Llamado por FlutterUnityBridge cuando recibe action="voice_status".
+        /// </summary>
+        public void GetVoiceStatus()
+        {
+            var guide = NavigationVoiceGuide.Instance;
+            if (guide == null)
+            {
+                Reply("{\"action\":\"voice_status\",\"ok\":false," +
+                      "\"message\":\"NavigationVoiceGuide no disponible\"}");
+                return;
+            }
+
+            string statusJson = guide.GetVoiceStatusJson();
+            Reply(statusJson);
+
+            if (_logTTSSync)
+                Debug.Log($"[VoiceAPI] 📊 voice_status → Flutter: {statusJson}");
+        }
+
+        /// <summary>
+        /// ✅ v8.4 FIX — Habla texto libre generado por Flutter (COMPAS).
+        ///
+        /// CAMBIO RESPECTO A v8.3:
+        ///   Antes publicaba TTSRequestEvent en EventBus, lo que causaba que
+        ///   OnTTSRequest() lo capturara y enviara tts_request a Flutter de nuevo.
+        ///   Flutter ya había enviado el texto → se escuchaba DOS VECES.
+        ///
+        ///   Ahora envía tts_request DIRECTAMENTE a Flutter via Reply(),
+        ///   sin pasar por EventBus. Evita el loop y el mensaje se escucha
+        ///   una sola vez.
+        ///
+        /// Restricciones de prioridad aplicadas:
+        ///   • priority clamp: 0-2 (p=3 reservado para urgencias de Unity)
+        ///   • throttle: mínimo _ttsRequestThrottle segundos entre llamadas
+        ///   • interrupt=true solo si priority=2 Y el caller lo pidió
+        /// </summary>
+        public void SpeakArbitraryText(string text, int priority, bool interrupt)
+        {
+            if (string.IsNullOrWhiteSpace(text))
+            {
+                Debug.LogWarning("[VoiceAPI] SpeakArbitraryText: text vacío.");
+                return;
+            }
+
+            if (Time.unscaledTime - _lastArbitraryTTSTime < _ttsRequestThrottle)
+            {
+                Debug.Log($"[VoiceAPI] 🔇 SpeakArbitraryText throttled: \"{text}\"");
+                return;
+            }
+
+            int clampedPriority = Mathf.Clamp(priority, 0, 2);
+            bool clampedInterrupt = (clampedPriority >= 2) && interrupt;
+
+            _lastArbitraryTTSTime = Time.unscaledTime;
+
+            // ✅ v8.4 FIX: Reply() directo sin EventBus.
+            // En v8.3 se usaba EventBus.Publish(TTSRequestEvent) lo que
+            // disparaba OnTTSRequest() que enviaba tts_request a Flutter.
+            // Sumado al canal directo de Flutter = mensaje 2 veces.
+            _ttsSb.Clear();
+            _ttsSb.Append("{\"action\":\"tts_request\",\"text\":\"");
+            _ttsSb.Append(EscapeJson(text));
+            _ttsSb.Append("\",\"priority\":");
+            _ttsSb.Append(clampedPriority);
+            _ttsSb.Append(",\"interrupt\":");
+            _ttsSb.Append(clampedInterrupt ? "true" : "false");
+            _ttsSb.Append('}');
+
+            Reply(_ttsSb.ToString());
+
+            if (_logTTSSync)
+                Debug.Log($"[VoiceAPI] 💬 tts_speak directo (COMPAS): " +
+                          $"p={clampedPriority} interrupt={clampedInterrupt} \"{text}\"");
         }
 
         #endregion
@@ -333,8 +340,8 @@ namespace IndoorNavAR.Integration
 
         #region Event handlers — Waypoints
 
-        private void OnWaypointPlaced(WaypointPlacedEvent _)             => _waypointCacheDirty = true;
-        private void OnWaypointRemoved(WaypointRemovedEvent _)           => _waypointCacheDirty = true;
+        private void OnWaypointPlaced(WaypointPlacedEvent _) => _waypointCacheDirty = true;
+        private void OnWaypointRemoved(WaypointRemovedEvent _) => _waypointCacheDirty = true;
         private void OnWaypointsBatchLoaded(WaypointsBatchLoadedEvent _) => _waypointCacheDirty = true;
 
         #endregion
@@ -391,11 +398,11 @@ namespace IndoorNavAR.Integration
             { Reply(Err("nav_status", "NavigationAgent no disponible")); return; }
 
             Reply(Ok("nav_status", "ok",
-                new Arg("is_navigating",  agent.IsNavigating.ToString()),
-                new Arg("remaining_m",    agent.RemainingDistance.ToString("F1")),
-                new Arg("progress_pct",   (agent.ProgressPercent * 100f).ToString("F0")),
-                new Arg("current_level",  agent.CurrentLevel.ToString()),
-                new Arg("destination",    agent.LastDestination.ToString())
+                new Arg("is_navigating", agent.IsNavigating.ToString()),
+                new Arg("remaining_m", agent.RemainingDistance.ToString("F1")),
+                new Arg("progress_pct", (agent.ProgressPercent * 100f).ToString("F0")),
+                new Arg("current_level", agent.CurrentLevel.ToString()),
+                new Arg("destination", agent.LastDestination.ToString())
             ));
         }
 
@@ -412,7 +419,8 @@ namespace IndoorNavAR.Integration
             if (_waypointManager == null)
             { Reply(Err("list_waypoints", "WaypointManager no disponible")); return; }
 
-            Debug.Log($"[VoiceAPI] ListWaypoints — WaypointCount={_waypointManager.WaypointCount} | dirty={_waypointCacheDirty}");
+            Debug.Log($"[VoiceAPI] ListWaypoints — WaypointCount={_waypointManager.WaypointCount} " +
+                      $"| dirty={_waypointCacheDirty}");
 
             if (_waypointCacheDirty) RebuildWaypointCache();
 
@@ -441,11 +449,11 @@ namespace IndoorNavAR.Integration
             if (!string.IsNullOrWhiteSpace(name)) wp.WaypointName = name;
 
             Reply(Ok("create_waypoint", $"Baliza '{wp.WaypointName}' creada",
-                new Arg("id",   wp.WaypointId),
+                new Arg("id", wp.WaypointId),
                 new Arg("name", wp.WaypointName),
-                new Arg("x",    SafeFloat(wp.Position.x)),
-                new Arg("y",    SafeFloat(wp.Position.y)),
-                new Arg("z",    SafeFloat(wp.Position.z))
+                new Arg("x", SafeFloat(wp.Position.x)),
+                new Arg("y", SafeFloat(wp.Position.y)),
+                new Arg("z", SafeFloat(wp.Position.z))
             ));
         }
 
@@ -495,10 +503,6 @@ namespace IndoorNavAR.Integration
                 : Err("save_session", "Error al guardar"));
         }
 
-        /// <summary>
-        /// ✅ v8.1 FIX conservado: await Task.Yield() tras LoadSession() para que
-        /// los Instantiate() de WaypointManager se completen antes de responder.
-        /// </summary>
         private async System.Threading.Tasks.Task LoadAsync()
         {
             if (_persistenceManager == null)
@@ -553,7 +557,7 @@ namespace IndoorNavAR.Integration
             var list = _waypointManager.Waypoints;
             if (list == null || list.Count == 0)
             {
-                _waypointListCache  = "[]";
+                _waypointListCache = "[]";
                 _waypointCacheDirty = false;
                 return;
             }
@@ -568,18 +572,18 @@ namespace IndoorNavAR.Integration
                 if (!first) _sb.Append(',');
                 first = false;
 
-                _sb.Append("{\"id\":\"");        _sb.Append(w.WaypointId);
-                _sb.Append("\",\"name\":\"");    _sb.Append(EscapeJson(w.WaypointName));
-                _sb.Append("\",\"type\":\"");    _sb.Append(w.Type);
+                _sb.Append("{\"id\":\""); _sb.Append(w.WaypointId);
+                _sb.Append("\",\"name\":\""); _sb.Append(EscapeJson(w.WaypointName));
+                _sb.Append("\",\"type\":\""); _sb.Append(w.Type);
                 _sb.Append("\",\"navigable\":"); _sb.Append(w.IsNavigable ? "true" : "false");
-                _sb.Append(",\"pos\":{\"x\":");  _sb.Append(SafeFloat(w.Position.x));
-                _sb.Append(",\"y\":");           _sb.Append(SafeFloat(w.Position.y));
-                _sb.Append(",\"z\":");           _sb.Append(SafeFloat(w.Position.z));
+                _sb.Append(",\"pos\":{\"x\":"); _sb.Append(SafeFloat(w.Position.x));
+                _sb.Append(",\"y\":"); _sb.Append(SafeFloat(w.Position.y));
+                _sb.Append(",\"z\":"); _sb.Append(SafeFloat(w.Position.z));
                 _sb.Append("}}");
             }
             _sb.Append(']');
 
-            _waypointListCache  = _sb.ToString();
+            _waypointListCache = _sb.ToString();
             _waypointCacheDirty = false;
 
             Debug.Log($"[VoiceAPI] RebuildCache OK: {list.Count} waypoints.");
@@ -728,13 +732,12 @@ namespace IndoorNavAR.Integration
         private void DbgTrackingLost()
             => NotifyTrackingState(false, "SessionInitializing|ExcessiveMotion");
 
-        [ContextMenu("Test: Tracking perdido (InsufficientFeatures)")]
-        private void DbgTrackingLostFeatures()
-            => NotifyTrackingState(false, "SessionInitializing|InsufficientFeatures");
+        [ContextMenu("Test: Voice Status")]
+        private void DbgVoiceStatus() => GetVoiceStatus();
 
-        [ContextMenu("Test: Tracking perdido (InsufficientLight)")]
-        private void DbgTrackingLostLight()
-            => NotifyTrackingState(false, "SessionInitializing|InsufficientLight");
+        [ContextMenu("Test: COMPAS tts_speak (p=1)")]
+        private void DbgCompasSpeak()
+            => SpeakArbitraryText("Claro, ¿en qué puedo ayudarte?", 1, false);
 
         #endregion
     }

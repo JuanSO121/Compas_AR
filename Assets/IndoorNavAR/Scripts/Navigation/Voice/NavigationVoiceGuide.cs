@@ -1,15 +1,46 @@
 // File: NavigationVoiceGuide.cs
-// ✅ v5.8 — Prioridades reordenadas + mensaje inicio simplificado
+// ✅ v6.3 — Escaleras en cola · Orientación sin interrupt · TTS coordinado con Flutter
 //
-//  p=3 URGENTE  ObstacleWarning, Escaleras, Orientación inicial
-//  p=2 ALTO     Giros (TurnLeft/Right/Slight/UTurn), UserDeviated
-//  p=1 MEDIO    StartNavigation ("Listo, vamos a X"), Arrived, StairsComplete
-//  p=0 BAJO     GoStraight, ProgressUpdate, UserStopped
-//               → descartados en Speak() si _ttsBusy, nunca cruzan el bridge
+// ══════════════════════════════════════════════════════════════════════════════
+// CAMBIOS v6.2 → v6.3
+// ══════════════════════════════════════════════════════════════════════════════
 //
-//  Orientación inicial sube a p=3: activa _ttsBusy=true al instante.
-//  Todos los p≤1 generados por Update() se descartan antes de llegar a Flutter.
-//  La cola de Flutter nunca se llena con mensajes informativos.
+// 1. ESCALERAS COMO COLA (no interrupt)
+//    — StairsWarning, StairsClimb, StairsDescent: prioridad 2 (no 3).
+//      Solo ObstacleWarning y UTurn mantienen prioridad 3 con interrupt.
+//    — Mensajes de escaleras reducidos a frases cortas:
+//        StairsWarning:  "Escaleras en X pasos."        (sin "Reduce el paso")
+//        StairsClimb:    "Sube."
+//        StairsDescent:  "Baja."
+//        StairsComplete: "Escaleras terminadas."
+//    — Resultado: las escaleras se encolan detrás de la instrucción activa
+//      en lugar de cortarla.
+//
+// 2. ORIENTACIÓN INICIAL SIN INTERRUPT
+//    — AnnounceInitialOrientation() cambia de priority=3 a priority=2.
+//    — Esto evita que la orientación corte "Listo, vamos a X." que acaba
+//      de empezar a leerse.
+//    — El WaitForPath coroutine ya introduce 0.2s entre el StartNavigation
+//      y la orientación; con priority=2 la orientación espera a que termine
+//      el TTS en curso antes de reproducirse.
+//
+// 3. TIMEOUT DE ttsBusy REDUCIDO
+//    — _ttsFallbackTimeout: 20s → 8s.
+//      El motor Android tarda máximo 4-6s en leer las frases más largas.
+//      20s de fallback era el motivo por el que el sistema quedaba bloqueado
+//      tras un cancel/interrupt sin confirmación de Flutter.
+//
+// 4. _ttsBusy SOLO EN PRIORITY >= 2 (sin cambio) — documentado explícitamente
+//    — Priority 0 y 1 nunca setean _ttsBusy, así que no bloquean el evaluador.
+//    — Priority >= 2 sí lo setean. Flutter debe enviar tts_status done/cancel
+//      para liberarlo, o el fallback de 8s lo libera automáticamente.
+//
+// 5. MENSAJES ELIMINADOS
+//    — No se genera ningún TTS de "Sistema detenido" desde este componente.
+//      Ese mensaje lo generaba NavigationCoordinator.stop() desde Flutter;
+//      ya no se genera (ver NavigationCoordinator v7.3).
+//
+// TODOS LOS CAMBIOS DE v6.2 SE CONSERVAN ÍNTEGRAMENTE.
 
 using System.Collections;
 using System.Collections.Generic;
@@ -29,22 +60,22 @@ namespace IndoorNavAR.Navigation.Voice
 
     public sealed class NavigationInstructionEvent
     {
-        public Vector3              WorldPosition   { get; }
-        public VoiceInstructionType Type            { get; }
-        public float                TriggerDistance { get; }
-        public string               InstructionText { get; }
-        public bool                 HasFired        { get; internal set; }
-        public int                  CornerIndex     { get; }
+        public Vector3 WorldPosition { get; }
+        public VoiceInstructionType Type { get; }
+        public float TriggerDistance { get; }
+        public string InstructionText { get; }
+        public bool HasFired { get; internal set; }
+        public int CornerIndex { get; }
 
         public NavigationInstructionEvent(
             Vector3 worldPosition, VoiceInstructionType type,
             float triggerDistance, string instructionText, int cornerIndex)
         {
-            WorldPosition   = worldPosition;
-            Type            = type;
+            WorldPosition = worldPosition;
+            Type = type;
             TriggerDistance = triggerDistance;
             InstructionText = instructionText;
-            CornerIndex     = cornerIndex;
+            CornerIndex = cornerIndex;
         }
     }
 
@@ -53,13 +84,13 @@ namespace IndoorNavAR.Navigation.Voice
         public static NavigationVoiceGuide Instance { get; private set; }
 
         [Header("─── Referencias ─────────────────────────────────────────────")]
-        [SerializeField] private UserPositionBridge       _userBridge;
+        [SerializeField] private UserPositionBridge _userBridge;
         [SerializeField] private NavigationPathController _pathController;
 
         [Header("─── Triggers de distancia ──────────────────────────────────")]
-        [SerializeField] private float _turnTriggerDist      = 5.0f;
-        [SerializeField] private float _stairTriggerDist     = 6.0f;
-        [SerializeField] private float _arrivalTriggerDist   = 1.5f;
+        [SerializeField] private float _turnTriggerDist = 5.0f;
+        [SerializeField] private float _stairTriggerDist = 6.0f;
+        [SerializeField] private float _arrivalTriggerDist = 1.5f;
         [SerializeField] private float _straightReminderDist = 12.0f;
 
         [Header("─── Rendimiento ─────────────────────────────────────────────")]
@@ -67,8 +98,8 @@ namespace IndoorNavAR.Navigation.Voice
         private float _evalInterval = 0.10f;
 
         [Header("─── Espera de Ruta ──────────────────────────────────────────")]
-        [SerializeField] private float _pathWaitTimeout            = 3.0f;
-        [SerializeField] private float _pathPollInterval           = 0.1f;
+        [SerializeField] private float _pathWaitTimeout = 3.0f;
+        [SerializeField] private float _pathPollInterval = 0.1f;
         [SerializeField] private float _destinationChangeThreshold = 0.5f;
 
         [Header("─── Timing de inicio ───────────────────────────────────────")]
@@ -76,110 +107,121 @@ namespace IndoorNavAR.Navigation.Voice
 
         [Header("─── Escaleras ──────────────────────────────────────────────")]
         [SerializeField] private float _stairHeightThreshold = 0.3f;
-        [SerializeField] private float _stairYTolerance      = 1.2f;
+        [SerializeField] private float _stairYTolerance = 1.2f;
 
         [Header("─── Ángulos de Giro ─────────────────────────────────────────")]
-        [SerializeField] private float _slightTurnAngle   = 20f;
+        [SerializeField] private float _slightTurnAngle = 20f;
         [SerializeField] private float _definiteTurnAngle = 50f;
-        [SerializeField] private float _uTurnAngle        = 140f;
+        [SerializeField] private float _uTurnAngle = 140f;
 
         [Header("─── Subdivisión de segmentos ───────────────────────────────")]
-        [SerializeField] private float _maxSegmentLength           = 3.0f;
-        [SerializeField] private float _straightSegmentAngle       = 15f;
+        [SerializeField] private float _maxSegmentLength = 3.0f;
+        [SerializeField] private float _straightSegmentAngle = 15f;
         [SerializeField] private float _minMentionableStraightDist = 1.5f;
 
         [Header("─── Física Humana ─────────────────────────────────────────")]
-        [SerializeField] private float _walkSpeedFlat   = 0.8f;
+        [SerializeField] private float _walkSpeedFlat = 0.8f;
         [SerializeField] private float _walkSpeedStairs = 0.4f;
-        [SerializeField] private float _stepLength      = 0.7f;
+        [SerializeField] private float _stepLength = 0.7f;
 
         [Header("─── Recordatorios ───────────────────────────────────────────")]
         [SerializeField] private float _straightReminderInterval = 20f;
-        [SerializeField] private float _progressInterval         = 45f;
+        [SerializeField] private float _progressInterval = 45f;
 
         [Header("─── [E1] Parada ─────────────────────────────────────────────")]
-        [SerializeField] private float _stopTimeout          = 4.0f;
-        [SerializeField] private float _stopMinMovement      = 0.25f;
-        [SerializeField] private float _stopReminderInterval = 15.0f;
+        [SerializeField] private float _stopTimeout = 4.0f;
+        [SerializeField] private float _stopMinMovement = 0.25f;
+        [SerializeField] private float _stopReminderInterval = 45.0f;
 
         [Header("─── [E2] Desviación ────────────────────────────────────────")]
-        [SerializeField] private float _deviationDist  = 2.0f;
+        [SerializeField] private float _deviationDist = 2.0f;
         [SerializeField] private float _deviationDelay = 2.5f;
 
         [Header("─── [E3] Obstáculo ─────────────────────────────────────────")]
-        [SerializeField] private float _obstacleCheckTime       = 6.0f;
+        [SerializeField] private float _obstacleCheckTime = 6.0f;
         [SerializeField] private float _obstacleWarningCooldown = 60f;
 
         [Header("─── [E6] Separación ────────────────────────────────────────")]
         [SerializeField] private float _longSeparationTime = 12.0f;
 
         [Header("─── [E7] Desorientación ────────────────────────────────────")]
-        [SerializeField] private float _misalignAngleThreshold   = 45f;
-        [SerializeField] private float _misalignConfirmTime      = 3.0f;
+        [SerializeField] private float _misalignAngleThreshold = 45f;
+        [SerializeField] private float _misalignConfirmTime = 3.0f;
         [SerializeField] private float _misalignReminderInterval = 12f;
-        [SerializeField] private float _misalignMinSpeed         = 0.2f;
+        [SerializeField] private float _misalignMinSpeed = 0.2f;
 
         [Header("─── Anti-saturación ──────────────────────────────────────")]
         [SerializeField] private float _dedupWindow = 15.0f;
-        [SerializeField] private float _minMessageInterval  = 3.5f;
-        [SerializeField] private float _ttsFallbackTimeout  = 20f;
+        [SerializeField] private float _minMessageInterval = 3.5f;
+        // ✅ v6.3: reducido de 20s a 8s — el motor Android tarda máx ~6s
+        //          en leer las frases más largas del sistema.
+        [SerializeField] private float _ttsFallbackTimeout = 8f;
+        [SerializeField] private float _sameTypeCooldown = 8.0f;
 
         [Header("─── Debug ────────────────────────────────────────────────────")]
-        [SerializeField] private bool _logInstructions  = true;
+        [SerializeField] private bool _logInstructions = true;
         [SerializeField] private bool _logPreprocessing = true;
 
         // ── Estado ────────────────────────────────────────────────────────────
         private readonly List<NavigationInstructionEvent> _events = new(24);
-        private int     _nextIdx         = 0;
-        private bool    _isGuiding       = false;
-        private bool    _isPreprocessing = false;
-        private string  _destName        = string.Empty;
-        private Vector3 _destPos         = new(float.PositiveInfinity, 0, 0);
+        private int _nextIdx = 0;
+        private bool _isGuiding = false;
+        private bool _isPreprocessing = false;
+        private string _destName = string.Empty;
+        private Vector3 _destPos = new(float.PositiveInfinity, 0, 0);
 
-        private float _lastStraightTime   = -999f;
-        private int   _lastStraightIdx    = -1;
-        private float _lastProgressTime   = -999f;
+        private string _pendingDestinationId = string.Empty;
+
+        private float _lastStraightTime = -999f;
+        private int _lastStraightIdx = -1;
+        private float _lastProgressTime = -999f;
         private float _lastAnyMessageTime = -999f;
 
-        private Vector3 _stopRefPos       = Vector3.zero;
-        private float   _stopAccumTime    = 0f;
-        private bool    _isStopped        = false;
-        private float   _lastStopReminder = -999f;
+        private Vector3 _stopRefPos = Vector3.zero;
+        private float _stopAccumTime = 0f;
+        private bool _isStopped = false;
+        private float _lastStopReminder = -999f;
 
         private float _deviationTimer = 0f;
-        private bool  _deviationFired = false;
+        private bool _deviationFired = false;
 
-        private float _obstacleTimer           = 0f;
-        private float _lastDistToNext          = float.MaxValue;
-        private bool  _obstacleFired           = false;
+        private float _obstacleTimer = 0f;
+        private float _lastDistToNext = float.MaxValue;
+        private bool _obstacleFired = false;
         private float _lastObstacleWarningTime = -999f;
 
         private float _returningTimer = 0f;
-        private int   _currentFloor   = 0;
+        private int _currentFloor = 0;
 
-        private Coroutine _waitCoroutine        = null;
+        private Coroutine _waitCoroutine = null;
         private Coroutine _ttsFallbackCoroutine = null;
 
-        private float _evalAccum       = 0f;
+        private float _evalAccum = 0f;
         private string _lastSpokenText = string.Empty;
-        private float  _lastSpokenTime = -999f;
+        private float _lastSpokenTime = -999f;
 
-        private float _misalignTimer    = 0f;
+        private float _misalignTimer = 0f;
         private float _lastMisalignTime = -999f;
 
         private bool _ttsBusy = false;
+
+        private readonly Dictionary<VoiceInstructionType, float> _lastSpokenByType
+            = new Dictionary<VoiceInstructionType, float>();
+
+        private string _lastSpokenTextForRepeat = string.Empty;
+        private int _lastSpokenPriorityRepeat = 0;
 
         // ─────────────────────────────────────────────────────────────────────
         //  POSICIONES
         // ─────────────────────────────────────────────────────────────────────
 
-        private bool    IsFullARMode => _userBridge != null && !_userBridge.IsNoArMode;
-        private Vector3 UserPos      => _userBridge != null ? _userBridge.UserPosition
+        private bool IsFullARMode => _userBridge != null && !_userBridge.IsNoArMode;
+        private Vector3 UserPos => _userBridge != null ? _userBridge.UserPosition
                                         : (Camera.main != null ? Camera.main.transform.position : Vector3.zero);
-        private Vector3 UserFwd      => _userBridge != null ? _userBridge.UserForward
+        private Vector3 UserFwd => _userBridge != null ? _userBridge.UserForward
                                         : FlatFwd(Camera.main != null ? Camera.main.transform.forward : Vector3.forward);
-        private float   UserSpeed    => _userBridge?.UserSpeed ?? 0f;
-        private Vector3 EvalPos      => IsFullARMode ? UserPos : (_userBridge?.AgentPosition ?? UserPos);
+        private float UserSpeed => _userBridge?.UserSpeed ?? 0f;
+        private Vector3 EvalPos => IsFullARMode ? UserPos : (_userBridge?.AgentPosition ?? UserPos);
 
         // ─────────────────────────────────────────────────────────────────────
         //  LIFECYCLE
@@ -206,30 +248,30 @@ namespace IndoorNavAR.Navigation.Voice
             }
 
             SubscribeEvents();
-            Debug.Log($"[VoiceGuide] ✅ v5.8");
+            Debug.Log($"[VoiceGuide] ✅ v6.3");
         }
 
-        private void OnEnable()  => SubscribeEvents();
+        private void OnEnable() => SubscribeEvents();
         private void OnDisable() => UnsubscribeEvents();
 
         private void SubscribeEvents()
         {
             var bus = EventBus.Instance;
             if (bus == null) return;
-            bus.Subscribe<NavigationStartedEvent>  (OnNavStarted);
+            bus.Subscribe<NavigationStartedEvent>(OnNavStarted);
             bus.Subscribe<NavigationCompletedEvent>(OnNavCompleted);
             bus.Subscribe<NavigationCancelledEvent>(OnNavCancelled);
-            bus.Subscribe<FloorTransitionEvent>    (OnFloorTransition);
+            bus.Subscribe<FloorTransitionEvent>(OnFloorTransition);
         }
 
         private void UnsubscribeEvents()
         {
             var bus = EventBus.Instance;
             if (bus == null) return;
-            bus.Unsubscribe<NavigationStartedEvent>  (OnNavStarted);
+            bus.Unsubscribe<NavigationStartedEvent>(OnNavStarted);
             bus.Unsubscribe<NavigationCompletedEvent>(OnNavCompleted);
             bus.Unsubscribe<NavigationCancelledEvent>(OnNavCancelled);
-            bus.Unsubscribe<FloorTransitionEvent>    (OnFloorTransition);
+            bus.Unsubscribe<FloorTransitionEvent>(OnFloorTransition);
         }
 
         private void OnDestroy()
@@ -263,7 +305,12 @@ namespace IndoorNavAR.Navigation.Voice
 
         private void EvaluateInstructions()
         {
-            if (_nextIdx >= _events.Count || _ttsBusy) return;
+            if (_nextIdx >= _events.Count) return;
+
+            // ✅ v6.3: _ttsBusy solo bloquea instrucciones de priority < 3.
+            // Las de priority 3 (ObstacleWarning, UTurn) siguen pasando.
+            // Esto permite que un obstáculo real interrumpa siempre,
+            // pero las escaleras (priority 2) esperan educadamente en cola.
 
             Vector3 evalPos = EvalPos;
             Vector3 userPos = UserPos;
@@ -273,13 +320,19 @@ namespace IndoorNavAR.Navigation.Voice
                 var evt = _events[i];
                 if (evt.HasFired) { _nextIdx = i + 1; continue; }
 
+                // Si TTS ocupado, solo dejamos pasar urgencias (p=3)
+                if (_ttsBusy && GetPriority(evt.Type) < 3) break;
+
                 Vector3 checkPos = evt.Type == VoiceInstructionType.Arrived ? userPos : evalPos;
                 if (!ShouldFireEvent(evt, checkPos)) break;
 
                 FireEvent(evt);
                 evt.HasFired = true;
                 _nextIdx = i + 1;
-                if (GetPriority(evt.Type) >= 2) return;
+                // Solo hacer return anticipado para prioridad >= 3
+                // Prioridad 2 (giros, escaleras) deja que el loop continúe
+                // para marcar eventos ya superados como fired.
+                if (GetPriority(evt.Type) >= 3) return;
             }
 
             EvaluateStraightReminder();
@@ -293,12 +346,15 @@ namespace IndoorNavAR.Navigation.Voice
             return true;
         }
 
+        /// <summary>
+        /// Llamado desde VoiceCommandAPI cuando Flutter confirma TTS done/cancel.
+        /// </summary>
         public void ClearTTSBusy()
         {
             if (!_ttsBusy) return;
             _ttsBusy = false;
             if (_ttsFallbackCoroutine != null) { StopCoroutine(_ttsFallbackCoroutine); _ttsFallbackCoroutine = null; }
-            if (_logInstructions) Debug.Log("[VoiceGuide] ✅ _ttsBusy liberado.");
+            if (_logInstructions) Debug.Log("[VoiceGuide] ✅ _ttsBusy liberado por Flutter.");
         }
 
         private void EvaluateStraightReminder()
@@ -310,12 +366,19 @@ namespace IndoorNavAR.Navigation.Voice
             float dist = Vector3.Distance(EvalPos, next.WorldPosition);
             if (dist < _straightReminderDist) return;
             if (Time.time - _lastStraightTime < _straightReminderInterval) return;
+
             if (_ttsBusy || Time.time - _lastAnyMessageTime < _minMessageInterval) return;
 
+            if (IsTypeCoolingDown(VoiceInstructionType.GoStraight)) return;
+
             int steps = Mathf.Max(1, Mathf.RoundToInt(dist / _stepLength));
-            Speak(VoiceInstructionType.GoStraight, $"Sigue recto. {steps} pasos.", 0);
-            _lastStraightTime = Time.time;
-            _lastStraightIdx  = _nextIdx;
+            bool sent = Speak(VoiceInstructionType.GoStraight, $"Sigue recto. {steps} pasos.", 0);
+
+            if (sent)
+            {
+                _lastStraightTime = Time.time;
+                _lastStraightIdx = _nextIdx;
+            }
         }
 
         private void EvaluateUserStop(float dt)
@@ -336,16 +399,20 @@ namespace IndoorNavAR.Navigation.Voice
                 _obstacleTimer = 0f; _lastDistToNext = DistUserToNextWp();
                 int steps = Mathf.Max(1, Mathf.RoundToInt(_lastDistToNext / _stepLength));
                 Speak(VoiceInstructionType.UserStopped,
-                    $"Cuando estés listo, continúa. Próxima indicación en {steps} pasos.", 0);
+                    $"Cuando estés listo, continúa. {steps} pasos.", 0);
                 return;
             }
 
             if (_isStopped && Time.time - _lastStopReminder >= _stopReminderInterval)
             {
-                if (_ttsBusy || Time.time - _lastAnyMessageTime < _minMessageInterval) return;
+                if (_ttsBusy || Time.time - _lastAnyMessageTime < _minMessageInterval)
+                {
+                    _lastStopReminder = Time.time;
+                    return;
+                }
                 _lastStopReminder = Time.time;
                 int steps = Mathf.Max(1, Mathf.RoundToInt(RemainingDistFromUser() / _stepLength));
-                Speak(VoiceInstructionType.UserStopped, $"Tómate tu tiempo. {steps} pasos al destino.", 0);
+                Speak(VoiceInstructionType.UserStopped, $"Tómate tu tiempo. {steps} pasos.", 0);
             }
         }
 
@@ -361,8 +428,8 @@ namespace IndoorNavAR.Navigation.Voice
                 {
                     _deviationFired = true;
                     string msg = IsFullARMode
-                        ? "Te desviaste. Detente, gira hacia la ruta y retoma el camino."
-                        : "Te desviaste. Busca al guía y vuelve a la ruta.";
+                        ? "Te desviaste. Detente y gira hacia la ruta."
+                        : "Te desviaste. Busca al guía.";
                     Speak(VoiceInstructionType.UserDeviated, msg, 2);
                 }
             }
@@ -390,13 +457,13 @@ namespace IndoorNavAR.Navigation.Voice
             if (_obstacleTimer < _obstacleCheckTime) return;
             if (Time.time - _lastObstacleWarningTime < _obstacleWarningCooldown) return;
 
-            float current   = DistUserToNextWp();
+            float current = DistUserToNextWp();
             float reduction = _lastDistToNext - current;
             if (reduction < 0.4f)
             {
                 _obstacleFired = true; _lastObstacleWarningTime = Time.time;
                 Speak(VoiceInstructionType.ObstacleWarning,
-                    "Posible obstáculo. Rodéalo con cuidado hacia un lado.", 3);
+                    "Posible obstáculo. Rodéalo por un lado.", 3);
             }
         }
 
@@ -409,7 +476,7 @@ namespace IndoorNavAR.Navigation.Voice
             if (rem <= _arrivalTriggerDist * 3f) return;
             int steps = Mathf.Max(1, Mathf.RoundToInt(rem / _stepLength));
             _lastProgressTime = Time.time;
-            Speak(VoiceInstructionType.ProgressUpdate, $"Vas bien. {steps} pasos para {_destName}.", 0);
+            Speak(VoiceInstructionType.ProgressUpdate, $"Vas bien. {steps} pasos.", 0);
         }
 
         private void EvaluateMisalignment(float dt)
@@ -422,7 +489,7 @@ namespace IndoorNavAR.Navigation.Voice
             toNext.Normalize();
 
             float signedAngle = SignedAngleXZ(UserFwd, toNext);
-            float absAngle    = Mathf.Abs(signedAngle);
+            float absAngle = Mathf.Abs(signedAngle);
 
             if (absAngle > _misalignAngleThreshold)
             {
@@ -431,12 +498,12 @@ namespace IndoorNavAR.Navigation.Voice
                     Time.time - _lastMisalignTime >= _misalignReminderInterval)
                 {
                     _lastMisalignTime = Time.time; _misalignTimer = 0f;
-                    string dir   = DirectionLabel(signedAngle);
-                    float  dist  = Vector3.Distance(UserPos, _events[_nextIdx].WorldPosition);
-                    int    steps = Mathf.Max(1, Mathf.RoundToInt(dist / _stepLength));
-                    string text  = absAngle <= 50f  ? $"El camino está {dir}. Gira levemente. {steps} pasos."
-                                 : absAngle <= 130f ? $"Dirección equivocada. Gira {dir}. {steps} pasos."
-                                                    : $"Estás al revés. Date la vuelta {dir}. {steps} pasos.";
+                    string dir = DirectionLabel(signedAngle);
+                    float dist = Vector3.Distance(UserPos, _events[_nextIdx].WorldPosition);
+                    int steps = Mathf.Max(1, Mathf.RoundToInt(dist / _stepLength));
+                    string text = absAngle <= 50f ? $"El camino está {dir}. {steps} pasos."
+                                 : absAngle <= 130f ? $"Gira {dir}. {steps} pasos."
+                                                    : $"Date la vuelta {dir}. {steps} pasos.";
                     Speak(VoiceInstructionType.UserDeviated, text, 2);
                 }
             }
@@ -451,20 +518,30 @@ namespace IndoorNavAR.Navigation.Voice
         private void OnNavStarted(NavigationStartedEvent evt)
         {
             if (string.IsNullOrEmpty(evt.DestinationWaypointId)) return;
+
+            if (evt.DestinationWaypointId == _pendingDestinationId)
+            {
+                if (_logPreprocessing)
+                    Debug.Log($"[VoiceGuide] 🔒 OnNavStarted duplicado bloqueado: {evt.DestinationWaypointId}");
+                return;
+            }
+
             if (Vector3.Distance(evt.DestinationPosition, _destPos) < _destinationChangeThreshold
                 && (_isGuiding || _isPreprocessing)) return;
+
+            _pendingDestinationId = evt.DestinationWaypointId;
             StartSession(evt.DestinationWaypointId, evt.DestinationPosition);
         }
 
         private void OnNavCompleted(NavigationCompletedEvent _)
         {
             if (!_isGuiding) return;
-            bool  arrivedFired = _events.Exists(e => e.Type == VoiceInstructionType.Arrived && e.HasFired);
-            float distToGoal   = Vector3.Distance(UserPos, _destPos);
+            bool arrivedFired = _events.Exists(e => e.Type == VoiceInstructionType.Arrived && e.HasFired);
+            float distToGoal = Vector3.Distance(UserPos, _destPos);
             if (!arrivedFired && distToGoal > _arrivalTriggerDist * 2f) return;
             if (!arrivedFired)
                 Speak(VoiceInstructionType.Arrived,
-                    string.IsNullOrEmpty(_destName) ? "Llegaste. ¡Bien hecho!" : $"Llegaste a {_destName}. ¡Bien hecho!", 1);
+                    string.IsNullOrEmpty(_destName) ? "Llegaste." : $"Llegaste a {_destName}.", 1);
             ResetSession();
         }
 
@@ -472,9 +549,18 @@ namespace IndoorNavAR.Navigation.Voice
 
         private void OnFloorTransition(FloorTransitionEvent e)
         {
-            _currentFloor = e.ToLevel; _obstacleFired = false; _isStopped = false; _stopAccumTime = 0f;
-            _lastSpokenText = string.Empty; _lastSpokenTime = -999f;
-            _misalignTimer = 0f; _lastMisalignTime = -999f;
+            _currentFloor = e.ToLevel;
+            _obstacleFired = false;
+            _isStopped = false;
+            _stopAccumTime = 0f;
+
+            ResetTypeCooldown(VoiceInstructionType.StairsWarning);
+            ResetTypeCooldown(VoiceInstructionType.StairsClimb);
+            ResetTypeCooldown(VoiceInstructionType.StairsDescent);
+            ResetTypeCooldown(VoiceInstructionType.StairsComplete);
+
+            _misalignTimer = 0f;
+            _lastMisalignTime = -999f;
         }
 
         // ─────────────────────────────────────────────────────────────────────
@@ -501,25 +587,36 @@ namespace IndoorNavAR.Navigation.Voice
             _lastStraightTime = Time.time; _lastStraightIdx = -1;
             var subdivided = SubdivideWaypointSegments(waypoints);
             BuildInstructions(subdivided, startMessage: false);
-            float rem   = RemainingDistFromUser(subdivided);
-            int   steps = Mathf.Max(1, Mathf.RoundToInt(rem / _stepLength));
+            float rem = RemainingDistFromUser(subdivided);
+            int steps = Mathf.Max(1, Mathf.RoundToInt(rem / _stepLength));
             if (fullSummary)
                 Speak(VoiceInstructionType.ResumeAfterSeparation,
                     IsFullARMode ? $"Ruta recalculada. {steps} pasos a {_destName}."
-                                 : $"El guía te encontró. {steps} pasos a {_destName}.", 1);
+                                 : $"El guía te encontró. {steps} pasos.", 1);
             else
-                Speak(VoiceInstructionType.GoStraight, $"Ruta actualizada. {steps} pasos a {_destName}.", 0);
+                Speak(VoiceInstructionType.GoStraight, $"Ruta actualizada. {steps} pasos.", 0);
         }
 
         // ─────────────────────────────────────────────────────────────────────
-        //  API PÚBLICA
+        //  API PÚBLICA — uso interno
         // ─────────────────────────────────────────────────────────────────────
 
+        // ✅ v6.2 FIX conservado — guard idéntico al de OnNavStarted().
         public void TriggerFromWaypoint(IndoorNavAR.Core.Data.WaypointData waypoint)
         {
             if (waypoint == null) return;
+
+            if (waypoint.WaypointName == _pendingDestinationId)
+            {
+                if (_logPreprocessing)
+                    Debug.Log($"[VoiceGuide] 🔒 TriggerFromWaypoint duplicado bloqueado: {waypoint.WaypointName}");
+                return;
+            }
+
             if (Vector3.Distance(waypoint.Position, _destPos) < _destinationChangeThreshold
                 && (_isGuiding || _isPreprocessing)) return;
+
+            _pendingDestinationId = waypoint.WaypointName;
             StartSession(waypoint.WaypointName, waypoint.Position);
         }
 
@@ -536,6 +633,64 @@ namespace IndoorNavAR.Navigation.Voice
         public bool IsGuiding => _isGuiding;
 
         // ─────────────────────────────────────────────────────────────────────
+        //  API PÚBLICA — llamable desde FlutterUnityBridge
+        // ─────────────────────────────────────────────────────────────────────
+
+        public void RepeatLastInstruction()
+        {
+            if (string.IsNullOrEmpty(_lastSpokenTextForRepeat))
+            {
+                Debug.Log("[VoiceGuide] RepeatLastInstruction: no hay instrucción previa.");
+                return;
+            }
+            if (!_isGuiding && !_isPreprocessing)
+            {
+                Debug.Log("[VoiceGuide] RepeatLastInstruction: guía no activa.");
+                return;
+            }
+
+            EventBus.Instance?.Publish(new TTSRequestEvent
+            {
+                Text = _lastSpokenTextForRepeat,
+                Priority = Mathf.Max(1, _lastSpokenPriorityRepeat),
+                Interrupt = false,
+            });
+
+            Debug.Log($"[VoiceGuide] 🔁 RepeatLastInstruction: \"{_lastSpokenTextForRepeat}\"");
+        }
+
+        public void StopVoiceGuideFromBridge()
+        {
+            Debug.Log("[VoiceGuide] 🛑 StopVoiceGuideFromBridge().");
+            ResetSession();
+        }
+
+        public string GetVoiceStatusJson()
+        {
+            float rem = _isGuiding ? RemainingDistFromUser() : 0f;
+            int steps = Mathf.Max(0, Mathf.RoundToInt(rem / _stepLength));
+            return $"{{" +
+                   $"\"action\":\"voice_status\"," +
+                   $"\"isGuiding\":{(_isGuiding ? "true" : "false")}," +
+                   $"\"isPreprocessing\":{(_isPreprocessing ? "true" : "false")}," +
+                   $"\"ttsBusy\":{(_ttsBusy ? "true" : "false")}," +
+                   $"\"destination\":\"{EscapeJson(_destName)}\"," +
+                   $"\"remainingSteps\":{steps}," +
+                   $"\"nextInstruction\":\"{EscapeJson(GetNextInstructionText())}\"" +
+                   $"}}";
+        }
+
+        private string GetNextInstructionText()
+        {
+            for (int i = _nextIdx; i < _events.Count; i++)
+                if (!_events[i].HasFired) return _events[i].InstructionText;
+            return string.Empty;
+        }
+
+        private static string EscapeJson(string s) =>
+            s?.Replace("\\", "\\\\").Replace("\"", "\\\"").Replace("\n", "\\n") ?? "";
+
+        // ─────────────────────────────────────────────────────────────────────
         //  SESIÓN
         // ─────────────────────────────────────────────────────────────────────
 
@@ -545,6 +700,7 @@ namespace IndoorNavAR.Navigation.Voice
             ResetSession(silent: true);
             _destName = destName; _destPos = destPosition;
             _isPreprocessing = true; _stopRefPos = UserPos; _stopAccumTime = 0f; _returningTimer = 0f;
+            _pendingDestinationId = destName;
             _waitCoroutine = StartCoroutine(WaitForPath());
         }
 
@@ -570,12 +726,11 @@ namespace IndoorNavAR.Navigation.Voice
 
             if (path == null || !path.IsValid || path.Waypoints.Count < 2)
             {
-                // v5.8: mensaje corto incluso en timeout
                 Speak(VoiceInstructionType.StartNavigation, $"Listo, vamos a {_destName}.", 1);
                 _events.Clear(); _nextIdx = 0;
                 _events.Add(new NavigationInstructionEvent(_destPos, VoiceInstructionType.Arrived,
                     _arrivalTriggerDist,
-                    string.IsNullOrEmpty(_destName) ? "Llegaste. ¡Bien hecho!" : $"Llegaste a {_destName}. ¡Bien hecho!", 0));
+                    string.IsNullOrEmpty(_destName) ? "Llegaste." : $"Llegaste a {_destName}.", 0));
                 _isGuiding = true; _ttsBusy = false;
                 yield break;
             }
@@ -588,23 +743,22 @@ namespace IndoorNavAR.Navigation.Voice
 
             if (_events.Count > 0)
             {
-                // ✅ v5.8: Primero el mensaje corto (p=1): "Listo, vamos a X"
                 var startEvt = _events[0];
-                FireEvent(startEvt);
+                FireEvent(startEvt);          // "Listo, vamos a X." → p=1, no setea _ttsBusy
                 startEvt.HasFired = true;
                 _nextIdx = 1;
 
-                // ✅ v5.9: esperar a que el bridge procese el p=1 antes de enviar el p=3.
-                // Sin este delay, ambos llegan al bridge en el mismo frame y el orden
-                // no está garantizado. 200ms es suficiente para que Flutter los separe.
+                // 0.2s de gracia antes de la orientación
                 yield return new WaitForSeconds(0.2f);
 
+                ResetTypeCooldown(VoiceInstructionType.GoStraight);
+                // ✅ v6.3: orientación con p=2 — NO interrumpe el TTS de inicio,
+                // se encola detrás de él.
                 AnnounceInitialOrientation(subdivided);
             }
 
             yield return new WaitForSeconds(_startDelay);
 
-            // Esperar a que no haya eventos inminentes antes de soltar la guía
             float safetyTimeout = _startDelay + 3f, waited = 0f, checkInterval = 0.15f;
             while (waited < safetyTimeout)
             {
@@ -626,20 +780,7 @@ namespace IndoorNavAR.Navigation.Voice
 
             _isGuiding = true; _ttsBusy = false;
             if (_logPreprocessing)
-                Debug.Log($"[VoiceGuide] ✅ v5.8 activo. {_events.Count} instrucciones, nextIdx={_nextIdx}.");
-        }
-
-        private float GetDistToFirstActionEvent()
-        {
-            for (int i = 1; i < _events.Count; i++)
-            {
-                var t = _events[i].Type;
-                if (t == VoiceInstructionType.TurnLeft  || t == VoiceInstructionType.TurnRight   ||
-                    t == VoiceInstructionType.SlightLeft || t == VoiceInstructionType.SlightRight ||
-                    t == VoiceInstructionType.UTurn      || t == VoiceInstructionType.StairsWarning)
-                    return Vector3.Distance(EvalPos, _events[i].WorldPosition);
-            }
-            return float.MaxValue;
+                Debug.Log($"[VoiceGuide] ✅ v6.3 activo. {_events.Count} instrucciones, nextIdx={_nextIdx}.");
         }
 
         // ─────────────────────────────────────────────────────────────────────
@@ -674,7 +815,6 @@ namespace IndoorNavAR.Navigation.Voice
 
             if (startMessage)
             {
-                // ✅ v5.8: mensaje de inicio corto
                 _events.Add(new NavigationInstructionEvent(
                     wp[0], VoiceInstructionType.StartNavigation, 0.5f,
                     $"Listo, vamos a {_destName}.", 0));
@@ -687,19 +827,26 @@ namespace IndoorNavAR.Navigation.Voice
 
                 if (Mathf.Abs(deltaY) >= _stairHeightThreshold)
                 {
+                    // ✅ v6.3: mensajes de escaleras cortos y en cola (p=2, interrupt=false).
+                    // — StairsWarning: "Escaleras en X pasos." (sin texto extra)
+                    // — StairsClimb/Descent: una sola palabra + punto
+                    // — StairsComplete: frase corta
                     float pathDist = AccumDistAlongPath(wp, 0, i);
-                    int   wSteps   = Mathf.Max(1, Mathf.RoundToInt(pathDist / _stepLength));
+                    int wSteps = Mathf.Max(1, Mathf.RoundToInt(pathDist / _stepLength));
+                    string warnText = wSteps > 5
+                        ? $"Escaleras en {wSteps} pasos."
+                        : "Escaleras cerca.";
                     _events.Add(new NavigationInstructionEvent(current, VoiceInstructionType.StairsWarning,
-                        _stairTriggerDist, wSteps > 5 ? $"En {wSteps} pasos, escaleras. Reduce el paso."
-                                                      : "Escaleras muy cerca. Reduce el paso.", i));
-                    float stairLen = Vector3.Distance(current, next);
-                    int   stairSec = Mathf.Max(1, Mathf.RoundToInt(stairLen / _walkSpeedStairs));
-                    bool  up = deltaY > 0f;
+                        _stairTriggerDist, warnText, i));
+
+                    bool up = deltaY > 0f;
+                    string actionText = up ? "Sube." : "Baja.";
                     _events.Add(new NavigationInstructionEvent(current,
-                        up ? VoiceInstructionType.StairsClimb : VoiceInstructionType.StairsDescent, 1.0f,
-                        up ? $"Sube. Tómate tu tiempo. {stairSec}s." : $"Baja con cuidado. Agárrate al pasamanos. {stairSec}s.", i));
+                        up ? VoiceInstructionType.StairsClimb : VoiceInstructionType.StairsDescent,
+                        1.0f, actionText, i));
+
                     _events.Add(new NavigationInstructionEvent(next, VoiceInstructionType.StairsComplete,
-                        0.8f, "Terminaste las escaleras. Continúa.", i));
+                        0.8f, "Escaleras terminadas.", i));
                     continue;
                 }
 
@@ -721,7 +868,7 @@ namespace IndoorNavAR.Navigation.Voice
 
             _events.Add(new NavigationInstructionEvent(wp[count - 1], VoiceInstructionType.Arrived,
                 _arrivalTriggerDist,
-                string.IsNullOrEmpty(_destName) ? "Llegaste. ¡Bien hecho!" : $"Llegaste a {_destName}. ¡Bien hecho!",
+                string.IsNullOrEmpty(_destName) ? "Llegaste." : $"Llegaste a {_destName}.",
                 count - 1));
         }
 
@@ -737,12 +884,12 @@ namespace IndoorNavAR.Navigation.Voice
                 : dirIn;
 
             float signedAngle = SignedAngleXZ(reference, dirOut);
-            float absAngle    = Mathf.Abs(signedAngle);
-            bool  isRight     = signedAngle >= 0f;
+            float absAngle = Mathf.Abs(signedAngle);
+            bool isRight = signedAngle >= 0f;
 
             VoiceInstructionType ttype =
-                absAngle < _slightTurnAngle   ? VoiceInstructionType.GoStraight :
-                absAngle >= _uTurnAngle       ? VoiceInstructionType.UTurn :
+                absAngle < _slightTurnAngle ? VoiceInstructionType.GoStraight :
+                absAngle >= _uTurnAngle ? VoiceInstructionType.UTurn :
                 absAngle >= _definiteTurnAngle ? (isRight ? VoiceInstructionType.TurnRight : VoiceInstructionType.TurnLeft) :
                                                  (isRight ? VoiceInstructionType.SlightRight : VoiceInstructionType.SlightLeft);
             return (ttype, signedAngle);
@@ -754,8 +901,8 @@ namespace IndoorNavAR.Navigation.Voice
             float prevSegLen = 0f; bool prevIsStr = false;
             if (cornerIdx >= 2)
             {
-                Vector3 dPIn  = (wp[cornerIdx - 1] - wp[cornerIdx - 2]); dPIn.y  = 0f;
-                Vector3 dPOut = (wp[cornerIdx]     - wp[cornerIdx - 1]); dPOut.y = 0f;
+                Vector3 dPIn = (wp[cornerIdx - 1] - wp[cornerIdx - 2]); dPIn.y = 0f;
+                Vector3 dPOut = (wp[cornerIdx] - wp[cornerIdx - 1]); dPOut.y = 0f;
                 if (dPIn.sqrMagnitude > 0.001f && dPOut.sqrMagnitude > 0.001f)
                     prevIsStr = Vector3.Angle(dPIn.normalized, dPOut.normalized) < _straightSegmentAngle;
                 prevSegLen = Vector3.Distance(new Vector3(wp[cornerIdx - 1].x, 0, wp[cornerIdx - 1].z),
@@ -765,13 +912,13 @@ namespace IndoorNavAR.Navigation.Voice
             {
                 prevSegLen = Vector3.Distance(new Vector3(wp[cornerIdx - 1].x, 0, wp[cornerIdx - 1].z),
                                               new Vector3(wp[cornerIdx].x, 0, wp[cornerIdx].z));
-                prevIsStr  = true;
+                prevIsStr = true;
             }
 
             float distFromUser = Vector3.Distance(new Vector3(EvalPos.x, 0, EvalPos.z),
                                                    new Vector3(wp[cornerIdx].x, 0, wp[cornerIdx].z));
             int stepsFromUser = Mathf.Max(1, Mathf.RoundToInt(distFromUser / _stepLength));
-            string turnLabel  = TurnLabel(ttype, signedAngle);
+            string turnLabel = TurnLabel(ttype, signedAngle);
 
             if (prevIsStr && prevSegLen >= _minMentionableStraightDist && stepsFromUser > 2)
                 return $"{stepsFromUser} pasos recto, luego {turnLabel}.";
@@ -802,7 +949,7 @@ namespace IndoorNavAR.Navigation.Voice
 
         private void ResetSession(bool silent = false)
         {
-            if (_waitCoroutine != null)        { StopCoroutine(_waitCoroutine);        _waitCoroutine        = null; }
+            if (_waitCoroutine != null) { StopCoroutine(_waitCoroutine); _waitCoroutine = null; }
             if (_ttsFallbackCoroutine != null) { StopCoroutine(_ttsFallbackCoroutine); _ttsFallbackCoroutine = null; }
 
             _isGuiding = false; _isPreprocessing = false; _ttsBusy = false;
@@ -814,6 +961,8 @@ namespace IndoorNavAR.Navigation.Voice
             _lastObstacleWarningTime = -999f;
             _lastSpokenText = string.Empty; _lastSpokenTime = -999f; _lastAnyMessageTime = -999f;
             _misalignTimer = 0f; _lastMisalignTime = -999f;
+            _lastSpokenByType.Clear();
+            _pendingDestinationId = string.Empty;
 
             if (!silent && _logPreprocessing) Debug.Log("[VoiceGuide] Sesión detenida.");
         }
@@ -822,38 +971,58 @@ namespace IndoorNavAR.Navigation.Voice
         //  SPEAK
         // ─────────────────────────────────────────────────────────────────────
 
-        private void Speak(VoiceInstructionType type, string text, int priority)
+        private bool Speak(VoiceInstructionType type, string text, int priority)
         {
-            if (string.IsNullOrEmpty(text)) return;
+            if (string.IsNullOrEmpty(text)) return false;
 
             if (text == _lastSpokenText && Time.time - _lastSpokenTime < _dedupWindow)
             {
                 if (_logInstructions) Debug.Log($"[VoiceGuide] 🔇 DEDUP [{type}]");
-                return;
+                return false;
             }
 
-            // p≤1 se descartan si _ttsBusy — nunca cruzan el bridge hacia Flutter
-            if (priority <= 1 && _ttsBusy)
+            if (IsTypeCoolingDown(type))
             {
-                if (_logInstructions) Debug.Log($"[VoiceGuide] 🚫 DROP p={priority} (TTS busy): \"{text}\"");
-                return;
+                if (_logInstructions) Debug.Log($"[VoiceGuide] 🔇 COOLDOWN [{type}]");
+                return false;
             }
 
-            _lastSpokenText = text; _lastSpokenTime = Time.time; _lastAnyMessageTime = Time.time;
+            // ✅ v6.3: solo descartamos si priority <= 1 Y TTS ocupado.
+            // Priority 2 (escaleras, giros) se deja pasar aunque _ttsBusy==true:
+            // Flutter decide si encola o interrumpe según su propia cola.
+            // Priority 3 siempre pasa (ya manejado en EvaluateInstructions).
+            if (priority == 0 && _ttsBusy)
+            {
+                if (_logInstructions) Debug.Log($"[VoiceGuide] 🚫 DROP p=0 (TTS busy): \"{text}\"");
+                return false;
+            }
+
+            _lastSpokenText = text;
+            _lastSpokenTime = Time.time;
+            _lastAnyMessageTime = Time.time;
+            _lastSpokenByType[type] = Time.time;
+
+            _lastSpokenTextForRepeat = text;
+            _lastSpokenPriorityRepeat = priority;
 
             EventBus.Instance?.Publish(new TTSRequestEvent
             {
-                Text = text, Priority = priority, Interrupt = priority >= 3,
+                Text = text,
+                Priority = priority,
+                // ✅ v6.3: interrupt=true SOLO para priority=3 (ObstacleWarning, UTurn).
+                // Escaleras (p=2) usan interrupt=false → se encolan en Flutter.
+                Interrupt = priority >= 3,
             });
 
             EventBus.Instance?.Publish(new GuideAnnouncementEvent
             {
                 AnnouncementType = MapToAnnouncementType(type),
-                Message          = text,
-                CurrentFloor     = _currentFloor,
+                Message = text,
+                CurrentFloor = _currentFloor,
             });
 
-            // p≥2 activa _ttsBusy: orientación (p=3), giros (p=2), obstáculos (p=3)
+            // _ttsBusy solo para p>=2 — evita que mensajes de bajo nivel
+            // bloqueen el evaluador indefinidamente.
             if (priority >= 2)
             {
                 _ttsBusy = true;
@@ -861,7 +1030,23 @@ namespace IndoorNavAR.Navigation.Voice
                 _ttsFallbackCoroutine = StartCoroutine(TTSFallbackTimeout(_ttsFallbackTimeout));
             }
 
-            if (_logInstructions) Debug.Log($"[VoiceGuide] 🔊 [{type}] p={priority} \"{text}\"");
+            if (_logInstructions) Debug.Log($"[VoiceGuide] 🔊 [{type}] p={priority} int={priority >= 3} \"{text}\"");
+            return true;
+        }
+
+        // ─────────────────────────────────────────────────────────────────────
+        //  HELPERS DE COOLDOWN POR TIPO
+        // ─────────────────────────────────────────────────────────────────────
+
+        private bool IsTypeCoolingDown(VoiceInstructionType type)
+        {
+            if (!_lastSpokenByType.TryGetValue(type, out float lastTime)) return false;
+            return Time.time - lastTime < _sameTypeCooldown;
+        }
+
+        private void ResetTypeCooldown(VoiceInstructionType type)
+        {
+            _lastSpokenByType.Remove(type);
         }
 
         private IEnumerator TTSFallbackTimeout(float seconds)
@@ -870,7 +1055,7 @@ namespace IndoorNavAR.Navigation.Voice
             _ttsFallbackCoroutine = null;
             if (_ttsBusy)
             {
-                Debug.LogWarning($"[VoiceGuide] ⚠️ TTSFallbackTimeout ({seconds}s).");
+                Debug.LogWarning($"[VoiceGuide] ⚠️ TTSFallback ({seconds}s) — liberando _ttsBusy.");
                 _ttsBusy = false;
             }
         }
@@ -881,24 +1066,24 @@ namespace IndoorNavAR.Navigation.Voice
 
         private static GuideAnnouncementType MapToAnnouncementType(VoiceInstructionType type) => type switch
         {
-            VoiceInstructionType.StairsWarning         => GuideAnnouncementType.ApproachingStairs,
-            VoiceInstructionType.StairsClimb           => GuideAnnouncementType.StartingClimb,
-            VoiceInstructionType.StairsDescent         => GuideAnnouncementType.StartingDescent,
-            VoiceInstructionType.StairsComplete        => GuideAnnouncementType.StairsComplete,
+            VoiceInstructionType.StairsWarning => GuideAnnouncementType.ApproachingStairs,
+            VoiceInstructionType.StairsClimb => GuideAnnouncementType.StartingClimb,
+            VoiceInstructionType.StairsDescent => GuideAnnouncementType.StartingDescent,
+            VoiceInstructionType.StairsComplete => GuideAnnouncementType.StairsComplete,
             VoiceInstructionType.ResumeAfterSeparation => GuideAnnouncementType.ResumeAfterSeparation,
-            VoiceInstructionType.StartNavigation       => GuideAnnouncementType.StartNavigation,
-            VoiceInstructionType.Arrived               => GuideAnnouncementType.Arrived,
-            VoiceInstructionType.TurnLeft              => GuideAnnouncementType.TurnLeft,
-            VoiceInstructionType.TurnRight             => GuideAnnouncementType.TurnRight,
-            VoiceInstructionType.SlightLeft            => GuideAnnouncementType.SlightLeft,
-            VoiceInstructionType.SlightRight           => GuideAnnouncementType.SlightRight,
-            VoiceInstructionType.UTurn                 => GuideAnnouncementType.UTurn,
-            VoiceInstructionType.GoStraight            => GuideAnnouncementType.GoStraight,
-            VoiceInstructionType.UserStopped           => GuideAnnouncementType.WaitingForUser,
-            VoiceInstructionType.UserDeviated          => GuideAnnouncementType.UserDeviated,
-            VoiceInstructionType.ObstacleWarning       => GuideAnnouncementType.ObstacleWarning,
-            VoiceInstructionType.ProgressUpdate        => GuideAnnouncementType.ProgressUpdate,
-            _                                          => GuideAnnouncementType.ResumeGuide,
+            VoiceInstructionType.StartNavigation => GuideAnnouncementType.StartNavigation,
+            VoiceInstructionType.Arrived => GuideAnnouncementType.Arrived,
+            VoiceInstructionType.TurnLeft => GuideAnnouncementType.TurnLeft,
+            VoiceInstructionType.TurnRight => GuideAnnouncementType.TurnRight,
+            VoiceInstructionType.SlightLeft => GuideAnnouncementType.SlightLeft,
+            VoiceInstructionType.SlightRight => GuideAnnouncementType.SlightRight,
+            VoiceInstructionType.UTurn => GuideAnnouncementType.UTurn,
+            VoiceInstructionType.GoStraight => GuideAnnouncementType.GoStraight,
+            VoiceInstructionType.UserStopped => GuideAnnouncementType.WaitingForUser,
+            VoiceInstructionType.UserDeviated => GuideAnnouncementType.UserDeviated,
+            VoiceInstructionType.ObstacleWarning => GuideAnnouncementType.ObstacleWarning,
+            VoiceInstructionType.ProgressUpdate => GuideAnnouncementType.ProgressUpdate,
+            _ => GuideAnnouncementType.ResumeGuide,
         };
 
         // ─────────────────────────────────────────────────────────────────────
@@ -907,13 +1092,13 @@ namespace IndoorNavAR.Navigation.Voice
 
         private void FireEvent(NavigationInstructionEvent evt)
         {
-            bool isDirectional = evt.Type == VoiceInstructionType.TurnLeft   ||
-                                 evt.Type == VoiceInstructionType.TurnRight  ||
+            bool isDirectional = evt.Type == VoiceInstructionType.TurnLeft ||
+                                 evt.Type == VoiceInstructionType.TurnRight ||
                                  evt.Type == VoiceInstructionType.SlightLeft ||
                                  evt.Type == VoiceInstructionType.SlightRight ||
                                  evt.Type == VoiceInstructionType.UTurn;
-            string text    = isDirectional ? RecalcTurnTextRelativeToUser(evt) : evt.InstructionText;
-            int    priority = GetPriority(evt.Type);
+            string text = isDirectional ? RecalcTurnTextRelativeToUser(evt) : evt.InstructionText;
+            int priority = GetPriority(evt.Type);
             Speak(evt.Type, text, priority);
         }
 
@@ -934,43 +1119,44 @@ namespace IndoorNavAR.Navigation.Voice
             dirIn.Normalize();
 
             var (ttype, signedAngle) = ClassifyTurnRelativeToUser(dirIn, dirOut, true);
-            float dist  = Vector3.Distance(new Vector3(EvalPos.x, 0, EvalPos.z),
+            float dist = Vector3.Distance(new Vector3(EvalPos.x, 0, EvalPos.z),
                                            new Vector3(evt.WorldPosition.x, 0, evt.WorldPosition.z));
-            int   steps = Mathf.Max(1, Mathf.RoundToInt(dist / _stepLength));
+            int steps = Mathf.Max(1, Mathf.RoundToInt(dist / _stepLength));
             if (steps <= 3) return $"{TurnLabelImperative(ttype, signedAngle)} ahora.";
             return $"En {steps} pasos, {TurnLabel(ttype, signedAngle)}.";
         }
 
         private float TriggerDist(VoiceInstructionType t) => t switch
         {
-            VoiceInstructionType.UTurn       => _turnTriggerDist * 1.5f,
-            VoiceInstructionType.SlightLeft  => _turnTriggerDist * 0.7f,
+            VoiceInstructionType.UTurn => _turnTriggerDist * 1.5f,
+            VoiceInstructionType.SlightLeft => _turnTriggerDist * 0.7f,
             VoiceInstructionType.SlightRight => _turnTriggerDist * 0.7f,
-            _                                => _turnTriggerDist,
+            _ => _turnTriggerDist,
         };
 
-        // ✅ v5.8: esquema de prioridades definitivo
         private static int GetPriority(VoiceInstructionType t) => t switch
         {
-            VoiceInstructionType.ObstacleWarning => 3,  // urgente
-            VoiceInstructionType.StairsWarning   => 3,
-            VoiceInstructionType.StairsClimb     => 3,
-            VoiceInstructionType.StairsDescent   => 3,
-            VoiceInstructionType.TurnLeft        => 2,  // alto
-            VoiceInstructionType.TurnRight       => 2,
-            VoiceInstructionType.SlightLeft      => 2,
-            VoiceInstructionType.SlightRight     => 2,
-            VoiceInstructionType.UTurn           => 2,
-            VoiceInstructionType.UserDeviated    => 2,
-            VoiceInstructionType.StartNavigation       => 1,  // medio
-            VoiceInstructionType.Arrived               => 1,
-            VoiceInstructionType.StairsComplete        => 1,
+            // ✅ v6.3: ObstacleWarning y UTurn son los únicos con p=3 (interrupt=true).
+            //          Escaleras bajadas a p=2 — se encolan sin cortar.
+            VoiceInstructionType.ObstacleWarning => 3,
+            VoiceInstructionType.UTurn => 3,
+            VoiceInstructionType.TurnLeft => 2,
+            VoiceInstructionType.TurnRight => 2,
+            VoiceInstructionType.SlightLeft => 2,
+            VoiceInstructionType.SlightRight => 2,
+            VoiceInstructionType.UserDeviated => 2,
+            VoiceInstructionType.StairsWarning => 2,
+            VoiceInstructionType.StairsClimb => 2,
+            VoiceInstructionType.StairsDescent => 2,
+            VoiceInstructionType.StartNavigation => 1,
+            VoiceInstructionType.Arrived => 1,
+            VoiceInstructionType.StairsComplete => 1,
             VoiceInstructionType.ResumeAfterSeparation => 1,
-            _                                          => 0,  // bajo → descartado si _ttsBusy
+            _ => 0,
         };
 
         // ─────────────────────────────────────────────────────────────────────
-        //  ORIENTACIÓN INICIAL — p=3
+        //  ORIENTACIÓN INICIAL
         // ─────────────────────────────────────────────────────────────────────
 
         private void AnnounceInitialOrientation(IReadOnlyList<Vector3> waypoints)
@@ -978,7 +1164,7 @@ namespace IndoorNavAR.Navigation.Voice
             if (!IsFullARMode || waypoints == null || waypoints.Count < 2) return;
 
             float totalDist = AccumDistAlongPath(waypoints, 0, waypoints.Count - 1);
-            int totalSteps  = Mathf.Max(1, Mathf.RoundToInt(totalDist / _stepLength));
+            int totalSteps = Mathf.Max(1, Mathf.RoundToInt(totalDist / _stepLength));
 
             float straightDist = 0f; int firstTurnWpIdx = -1; float firstTurnAngle = 0f;
             Vector3 routeFirstDir = Vector3.zero;
@@ -1004,22 +1190,22 @@ namespace IndoorNavAR.Navigation.Voice
                 }
             }
 
-            float  initialAngle  = routeFirstDir.sqrMagnitude > 0.001f ? SignedAngleXZ(UserFwd, routeFirstDir) : 0f;
-            int    clockHour     = ClockPosition(initialAngle);
-            string clockStr      = ClockText(clockHour);
-            int    straightSteps = Mathf.Max(1, Mathf.RoundToInt(straightDist / _stepLength));
+            float initialAngle = routeFirstDir.sqrMagnitude > 0.001f ? SignedAngleXZ(UserFwd, routeFirstDir) : 0f;
+            int clockHour = ClockPosition(initialAngle);
+            string clockStr = ClockText(clockHour);
+            int straightSteps = Mathf.Max(1, Mathf.RoundToInt(straightDist / _stepLength));
             string text;
 
             if (firstTurnWpIdx < 0)
             {
-                text = clockHour == 12 ? $"Destino al frente. {totalSteps} pasos en línea recta."
-                     : clockHour == 6  ? $"Destino {clockStr}. Date la vuelta y camina {totalSteps} pasos."
-                                       : $"Destino {clockStr}. Gira hasta tenerlo al frente y camina {totalSteps} pasos.";
+                text = clockHour == 12 ? $"Destino al frente. {totalSteps} pasos."
+                     : clockHour == 6 ? $"Destino {clockStr}. Date la vuelta y camina {totalSteps} pasos."
+                                       : $"Destino {clockStr}. Gira al frente y camina {totalSteps} pasos.";
             }
             else if (straightDist >= _minMentionableStraightDist)
             {
                 var (turnType, _) = ClassifyTurnRelativeToUser(
-                    (waypoints[firstTurnWpIdx]     - waypoints[firstTurnWpIdx - 1]).normalized,
+                    (waypoints[firstTurnWpIdx] - waypoints[firstTurnWpIdx - 1]).normalized,
                     (waypoints[firstTurnWpIdx + 1] - waypoints[firstTurnWpIdx]).normalized, false);
                 string giroLabel = TurnLabel(turnType, firstTurnAngle);
                 text = clockHour == 12
@@ -1028,16 +1214,17 @@ namespace IndoorNavAR.Navigation.Voice
             }
             else
             {
-                text = clockHour == 6  ? $"Destino {clockStr}. Date la vuelta y camina {totalSteps} pasos."
+                text = clockHour == 6 ? $"Destino {clockStr}. Date la vuelta y camina {totalSteps} pasos."
                      : clockHour == 12 ? $"Destino al frente. {totalSteps} pasos."
                                        : $"Destino {clockStr}. Gira al frente y camina {totalSteps} pasos.";
             }
 
-            // ✅ v5.8: p=3 → _ttsBusy=true → GoStraight/UserStopped se descartan
-            Speak(VoiceInstructionType.StartNavigation, text, priority: 3);
+            // ✅ v6.3: priority=2 (era 3). No interrumpe "Listo, vamos a X.",
+            // se encola detrás en Flutter.
+            Speak(VoiceInstructionType.GoStraight, text, priority: 2);
 
             if (_logInstructions)
-                Debug.Log($"[VoiceGuide] 🧭 Orientación p=3: \"{text}\"");
+                Debug.Log($"[VoiceGuide] 🧭 Orientación p=2: \"{text}\"");
         }
 
         // ─────────────────────────────────────────────────────────────────────
@@ -1088,12 +1275,9 @@ namespace IndoorNavAR.Navigation.Voice
             var p = new Vector2(pt.x, pt.z);
             var p1 = new Vector2(a.x, a.z);
             var p2 = new Vector2(b.x, b.z);
-
             var seg = p2 - p1;
             float lenSq = seg.sqrMagnitude;
-
             if (lenSq < 0.0001f) return Vector2.Distance(p, p1);
-
             return Vector2.Distance(p, p1 + Mathf.Clamp01(Vector2.Dot(p - p1, seg) / lenSq) * seg);
         }
 
@@ -1116,10 +1300,10 @@ namespace IndoorNavAR.Navigation.Voice
         private static string DirectionLabel(float a)
         {
             float abs = Mathf.Abs(a); bool right = a >= 0f;
-            if (abs <= 15f)  return "recto";
-            if (abs <= 50f)  return right ? "ligeramente a la derecha" : "ligeramente a la izquierda";
+            if (abs <= 15f) return "recto";
+            if (abs <= 50f) return right ? "ligeramente a la derecha" : "ligeramente a la izquierda";
             if (abs <= 130f) return right ? "a la derecha" : "a la izquierda";
-                             return right ? "casi detrás tuyo, hacia la derecha" : "casi detrás tuyo, hacia la izquierda";
+            return right ? "casi detrás tuyo, hacia la derecha" : "casi detrás tuyo, hacia la izquierda";
         }
 
         private static Vector3 FlatFwd(Vector3 v) { v.y = 0f; return v.sqrMagnitude > 0.001f ? v.normalized : Vector3.forward; }
@@ -1132,8 +1316,8 @@ namespace IndoorNavAR.Navigation.Voice
         private void OnDrawGizmos()
         {
             if (!Application.isPlaying || !_isGuiding) return;
-            Gizmos.color = Color.cyan;  Gizmos.DrawWireSphere(UserPos, 0.25f);
-            Gizmos.color = Color.blue;  Gizmos.DrawLine(UserPos, UserPos + UserFwd * 0.7f);
+            Gizmos.color = Color.cyan; Gizmos.DrawWireSphere(UserPos, 0.25f);
+            Gizmos.color = Color.blue; Gizmos.DrawLine(UserPos, UserPos + UserFwd * 0.7f);
             foreach (var evt in _events)
             {
                 Gizmos.color = evt.HasFired ? new Color(0.3f, 0.3f, 0.3f, 0.4f) : GizmoColor(evt.Type);
@@ -1143,19 +1327,19 @@ namespace IndoorNavAR.Navigation.Voice
         }
         private static Color GizmoColor(VoiceInstructionType t) => t switch
         {
-            VoiceInstructionType.TurnLeft        => Color.red,
-            VoiceInstructionType.TurnRight       => Color.blue,
-            VoiceInstructionType.SlightLeft      => new Color(1f, 0.5f, 0.5f),
-            VoiceInstructionType.SlightRight     => new Color(0.5f, 0.5f, 1f),
-            VoiceInstructionType.UTurn           => Color.magenta,
-            VoiceInstructionType.StairsWarning   => Color.yellow,
-            VoiceInstructionType.StairsClimb     => new Color(1f, 0.6f, 0f),
-            VoiceInstructionType.StairsDescent   => new Color(0.8f, 0.4f, 0f),
-            VoiceInstructionType.Arrived         => Color.green,
-            VoiceInstructionType.UserStopped     => Color.cyan,
-            VoiceInstructionType.UserDeviated    => new Color(1f, 0f, 0.5f),
+            VoiceInstructionType.TurnLeft => Color.red,
+            VoiceInstructionType.TurnRight => Color.blue,
+            VoiceInstructionType.SlightLeft => new Color(1f, 0.5f, 0.5f),
+            VoiceInstructionType.SlightRight => new Color(0.5f, 0.5f, 1f),
+            VoiceInstructionType.UTurn => Color.magenta,
+            VoiceInstructionType.StairsWarning => Color.yellow,
+            VoiceInstructionType.StairsClimb => new Color(1f, 0.6f, 0f),
+            VoiceInstructionType.StairsDescent => new Color(0.8f, 0.4f, 0f),
+            VoiceInstructionType.Arrived => Color.green,
+            VoiceInstructionType.UserStopped => Color.cyan,
+            VoiceInstructionType.UserDeviated => new Color(1f, 0f, 0.5f),
             VoiceInstructionType.ObstacleWarning => new Color(1f, 0.3f, 0f),
-            _                                    => Color.white,
+            _ => Color.white,
         };
 #endif
 
@@ -1163,16 +1347,23 @@ namespace IndoorNavAR.Navigation.Voice
         //  CONTEXT MENU
         // ─────────────────────────────────────────────────────────────────────
 
-        [ContextMenu("ℹ️ Estado")]
+        [ContextMenu("Estado v6.3")]
         private void DebugStatus() =>
-            Debug.Log($"[VoiceGuide] v5.8 | ttsBusy={_ttsBusy} | guiding={_isGuiding} | " +
+            Debug.Log($"[VoiceGuide] v6.3 | ttsBusy={_ttsBusy} | guiding={_isGuiding} | " +
+                      $"pendingDest=\"{_pendingDestinationId}\" | " +
                       $"events={_events.Count} nextIdx={_nextIdx} | " +
                       $"obstacle fired={_obstacleFired} last={Time.time - _lastObstacleWarningTime:F0}s ago");
 
-        [ContextMenu("🛑 Detener")]
+        [ContextMenu("Detener")]
         private void DebugStop() => ResetSession();
 
-        [ContextMenu("🔊 Simular TTS done")]
+        [ContextMenu("Simular TTS done")]
         private void DebugTTSDone() { ClearTTSBusy(); Debug.Log("[VoiceGuide] TTS done simulado."); }
+
+        [ContextMenu("Simular Repeat")]
+        private void DebugRepeat() => RepeatLastInstruction();
+
+        [ContextMenu("Voice Status JSON")]
+        private void DebugVoiceStatus() => Debug.Log(GetVoiceStatusJson());
     }
 }

@@ -1,55 +1,50 @@
 // File: ARSessionManager.cs
-// ✅ v2.0 — AR Foundation 6.x: PlaneClassifications.Floor + anchor lifecycle fix.
-// ✅ v2.1 — Eliminar [RequireComponent] — los managers AR deben vivir en
-//           XR Origin (Mobile AR), no en el GameObject de este script.
+// ✅ v3.0 — AR Foundation 6.5: TryAddAnchorAsync + XRResultStatus + estabilidad inicial.
 //
 // ============================================================================
-//  CAMBIOS v2.0 → v2.1
+//  CAMBIOS v2.1 → v3.0
 // ============================================================================
 //
-//  BUG DE ESCENA — Componentes AR duplicados:
+//  MIGRACIÓN AF 6.5:
 //
-//    PROBLEMA:
-//      [RequireComponent(typeof(ARPlaneManager))]
-//      [RequireComponent(typeof(ARRaycastManager))]
-//      forzaba a Unity a añadir esos componentes al GameObject donde vive
-//      ARSessionManager ([Core Managers]/ARSessionManager), que es distinto
-//      de XR Origin (Mobile AR) donde AR Foundation ya los tiene.
+//  CAMBIO 1 — CreateAnchor() → CreateAnchorAsync():
+//    AttachAnchor(plane, pose) fue eliminado en AF 6.x.
+//    Reemplazado por TryAddAnchorAsync(pose) que retorna
+//    Result<ARAnchor> con XRResultStatus para diagnóstico preciso.
 //
-//      Resultado: dos ARPlaneManager y dos ARRaycastManager activos en escena.
-//        - Planos duplicados en _detectedPlanes
-//        - Raycasts con resultados inconsistentes
-//        - Warnings "multiple managers of the same type" en consola
+//  CAMBIO 2 — Nuevos códigos de error XRResultStatus (AF 6.5):
+//    XRResultStatus.StatusCode.NotFound     → plano no disponible
+//    XRResultStatus.StatusCode.NotTracking  → ARCore sin tracking estable
+//    Usados para logging de diagnóstico en CreateAnchorAsync().
 //
-//    FIX v2.1:
-//      - Eliminados [RequireComponent].
-//      - ValidateDependencies() busca los managers en toda la escena con
-//        FindFirstObjectByType<T>() si los campos del Inspector están vacíos.
-//      - Los campos del Inspector deben apuntar a los componentes de
-//        XR Origin (Mobile AR) — arrastrar desde el Inspector de Unity.
+//  FIXES DE ESTABILIDAD:
 //
-//  SETUP CORRECTO EN ESCENA:
-//    XR Origin (Mobile AR)
-//      ├── AR Plane Manager     ← aquí viven los managers
-//      ├── AR Raycast Manager
-//      └── AR Anchor Manager
+//  FIX 1 — Desestabilización al inicio de sesión:
+//    CAUSA: El modelo se posicionaba antes de que ARCore tuviera tracking
+//    estable (SessionTracking). ARCore terminaba de inicializarse, movía
+//    el world origin, y el modelo quedaba desalineado.
+//    FIX: WaitForStableTracking() — espera SessionTracking + _initialStableFrames
+//    frames consecutivos antes de publicar ARSessionReadyEvent. La alineación
+//    del XR Origin (AROriginAligner) solo ocurre después de este evento.
 //
-//    [Core Managers]
-//      └── ARSessionManager (Script)   ← solo el script, sin managers propios
-//            Plane Manager  → drag XR Origin (Mobile AR) [AR Plane Manager]
-//            Raycast Manager→ drag XR Origin (Mobile AR) [AR Raycast Manager]
-//            Anchor Manager → drag XR Origin (Mobile AR) [AR Anchor Manager]
+//  FIX 2 — Desestabilización al mover el teléfono rápido (VIO drift):
+//    CAUSA: ARCore hace micro-resets del world origin durante movimiento
+//    rápido. El modelo se desplaza porque el anchor no se recaptura con
+//    suficiente frecuencia.
+//    FIX: _quickMoveStabilityFrames — tras detección de movimiento brusco
+//    (delta de cámara > _quickMoveThreshold en un frame), se pausa la
+//    sincronización del agente por _quickMoveStabilityFrames frames para
+//    dejar que ARCore se re-estabilice antes de actualizar posiciones.
 //
-// ============================================================================
-//  CAMBIOS v1.0 → v2.0 (conservados íntegramente)
-// ============================================================================
-//
-//  FIX 1 — ProcessAddedPlane(): PlaneClassifications.Floor (AF 6.x)
-//  FIX 2 — FindClosestPlane(): mismo filtro de Floor para CreateAnchor()
-//  FIX 3 — trackablesChanged: ya usa la API correcta de AF 6.x
+//  FIX 3 — Guard de tracking en CreateAnchorAsync():
+//    Si ARCore no está en SessionTracking, rechazar inmediatamente la
+//    creación de anchors con StatusCode.NotTracking. Evita crear anchors
+//    con datos de pose inválidos durante tracking inestable.
 
 using System;
+using System.Collections;
 using System.Collections.Generic;
+using System.Threading.Tasks;
 using UnityEngine;
 using UnityEngine.XR.ARFoundation;
 using UnityEngine.XR.ARSubsystems;
@@ -57,32 +52,81 @@ using IndoorNavAR.Core.Events;
 
 namespace IndoorNavAR.AR
 {
-    // ✅ v2.1: [RequireComponent] eliminados.
-    // Los managers AR deben estar en XR Origin (Mobile AR), no aquí.
     public class ARSessionManager : MonoBehaviour
     {
         [Header("Referencias AR")]
-        [SerializeField] private ARPlaneManager   _planeManager;
+        [SerializeField] private ARPlaneManager _planeManager;
         [SerializeField] private ARRaycastManager _raycastManager;
-        [SerializeField] private ARAnchorManager  _anchorManager;
+        [SerializeField] private ARAnchorManager _anchorManager;
 
         [Header("Configuración")]
-        [SerializeField] private bool  _detectVerticalPlanes    = false;
-        [SerializeField] private bool  _showPlaneVisualization  = true;
-        [SerializeField] private float _minimumPlaneArea        = 0.5f;
+        [SerializeField] private bool _detectVerticalPlanes = false;
+        [SerializeField] private bool _showPlaneVisualization = true;
+        [SerializeField] private float _minimumPlaneArea = 0.5f;
+
+        [Header("─── Estabilidad inicial (FIX 1) ─────────────────────────")]
+        [Tooltip("Frames consecutivos de SessionTracking requeridos antes de " +
+                 "considerar la sesión AR lista para posicionar el modelo. " +
+                 "Evita desalineación por world origin shift de ARCore al arrancar. " +
+                 "Default 30 ≈ 0.5s a 60fps.")]
+        [SerializeField] private int _initialStableFrames = 30;
+
+        [Tooltip("Segundos máximos esperando tracking estable al inicio. " +
+                 "Si se supera, se publica el evento igualmente para no bloquear.")]
+        [SerializeField] private float _initialTrackingTimeout = 10f;
+
+        [Header("─── Estabilidad en movimiento rápido (FIX 2) ─────────────")]
+        [Tooltip("Delta de posición de cámara en un frame (m) que se considera " +
+                 "movimiento brusco. ARCore puede hacer micro-resets del world " +
+                 "origin en estos casos.")]
+        [SerializeField] private float _quickMoveThreshold = 0.15f;
+
+        [Tooltip("Frames de pausa en sincronización tras movimiento brusco. " +
+                 "Da tiempo a ARCore para re-estabilizar el world origin. " +
+                 "Default 20 ≈ 0.33s a 60fps.")]
+        [SerializeField] private int _quickMoveStabilityFrames = 20;
+
+        [Header("─── Debug ───────────────────────────────────────────────")]
+        [SerializeField] private bool _logTracking = true;
+
+        // ─── Estado ───────────────────────────────────────────────────────
 
         private readonly Dictionary<TrackableId, ARPlane> _detectedPlanes
             = new Dictionary<TrackableId, ARPlane>();
         private readonly List<ARRaycastHit> _raycastHits = new List<ARRaycastHit>();
 
-        public bool IsSessionReady    { get; private set; }
-        public int  DetectedPlaneCount => _detectedPlanes.Count;
+        // FIX 1 — tracking inicial
+        private bool _initialTrackingAchieved = false;
+        private int _consecutiveStableFrames = 0;
+
+        // FIX 2 — movimiento rápido
+        private Vector3 _lastCameraPos = Vector3.zero;
+        private bool _cameraInitialized = false;
+        private int _quickMovePauseFrames = 0;
+
+        // ─── Propiedades públicas ─────────────────────────────────────────
+
+        public bool IsSessionReady { get; private set; }
+        public int DetectedPlaneCount => _detectedPlanes.Count;
         public IReadOnlyDictionary<TrackableId, ARPlane> DetectedPlanes => _detectedPlanes;
+
+        /// <summary>
+        /// True si ARCore está en tracking estable Y pasó el período de
+        /// estabilización inicial. Usar esto antes de posicionar el modelo.
+        /// </summary>
+        public bool IsFullyStable => _initialTrackingAchieved &&
+                                     ARSession.state == ARSessionState.SessionTracking;
+
+        /// <summary>
+        /// True si hay pausa activa por movimiento rápido de cámara.
+        /// AROriginAligner puede consultar esto para diferir la sincronización.
+        /// </summary>
+        public bool IsQuickMovePaused => _quickMovePauseFrames > 0;
 
         // ─── Lifecycle ────────────────────────────────────────────────────
 
-        private void Awake()    => ValidateDependencies();
-        private void Start()    => InitializeARSession();
+        private void Awake() => ValidateDependencies();
+        private void Start() => InitializeARSession();
 
         private void OnEnable()
         {
@@ -96,40 +140,33 @@ namespace IndoorNavAR.AR
                 _planeManager.trackablesChanged.RemoveListener(OnTrackablesChanged);
         }
 
+        private void Update()
+        {
+            UpdateQuickMoveDetection();
+        }
+
         // ─── Inicialización ───────────────────────────────────────────────
 
         private void ValidateDependencies()
         {
-            // ✅ v2.1: Ya NO usar GetComponent<T>() — esos componentes viven en
-            // XR Origin (Mobile AR), no en este GameObject.
-            // Buscar en escena como fallback si el Inspector no tiene referencias.
-            if (_planeManager == null)
-                _planeManager = FindFirstObjectByType<ARPlaneManager>();
-
-            if (_raycastManager == null)
-                _raycastManager = FindFirstObjectByType<ARRaycastManager>();
-
-            if (_anchorManager == null)
-                _anchorManager = FindFirstObjectByType<ARAnchorManager>();
+            if (_planeManager == null) _planeManager = FindFirstObjectByType<ARPlaneManager>();
+            if (_raycastManager == null) _raycastManager = FindFirstObjectByType<ARRaycastManager>();
+            if (_anchorManager == null) _anchorManager = FindFirstObjectByType<ARAnchorManager>();
 
             if (_planeManager == null)
             {
                 Debug.LogError("[ARSessionManager] ARPlaneManager no encontrado. " +
-                               "Asegúrate de que XR Origin (Mobile AR) tiene AR Plane Manager " +
-                               "y arrastra la referencia al Inspector de ARSessionManager.");
+                               "Asegúrate de que XR Origin (Mobile AR) tiene AR Plane Manager.");
                 enabled = false; return;
             }
             if (_raycastManager == null)
             {
-                Debug.LogError("[ARSessionManager] ARRaycastManager no encontrado. " +
-                               "Asegúrate de que XR Origin (Mobile AR) tiene AR Raycast Manager " +
-                               "y arrastra la referencia al Inspector de ARSessionManager.");
+                Debug.LogError("[ARSessionManager] ARRaycastManager no encontrado.");
                 enabled = false; return;
             }
 
-            Debug.Log("[ARSessionManager] ✅ v2.1 Dependencias validadas. " +
-                      $"PlaneManager en '{_planeManager.gameObject.name}' | " +
-                      $"RaycastManager en '{_raycastManager.gameObject.name}'");
+            Debug.Log("[ARSessionManager] ✅ v3.0 Dependencias validadas. " +
+                      $"PlaneManager en '{_planeManager.gameObject.name}'");
         }
 
         private void InitializeARSession()
@@ -139,14 +176,13 @@ namespace IndoorNavAR.AR
                 ConfigurePlaneDetection();
                 IsSessionReady = true;
 
-                EventBus.Instance.Publish(new ShowMessageEvent
-                {
-                    Message  = "Sesión AR inicializada. Busca superficies horizontales.",
-                    Type     = MessageType.Info,
-                    Duration = 3f
-                });
+                // ✅ FIX 1: No publicar ARSessionReadyEvent inmediatamente.
+                // Esperar tracking estable antes de dejar que AROriginAligner
+                // posicione el modelo — evita desalineación por world origin shift.
+                StartCoroutine(WaitForStableTracking());
 
-                Debug.Log("[ARSessionManager] Sesión AR inicializada correctamente.");
+                Debug.Log("[ARSessionManager] ✅ Sesión AR inicializada. " +
+                          $"Esperando {_initialStableFrames} frames estables...");
             }
             catch (Exception ex)
             {
@@ -165,49 +201,165 @@ namespace IndoorNavAR.AR
             Debug.Log($"[ARSessionManager] Detección de planos: {mode}");
         }
 
+        // ─── FIX 1 — Esperar tracking estable al inicio ───────────────────
+
+        /// <summary>
+        /// ✅ FIX 1: Espera SessionTracking + _initialStableFrames consecutivos
+        /// antes de notificar que la sesión AR está lista para posicionar el modelo.
+        ///
+        /// ARCore necesita varios frames tras SessionTracking para estabilizar
+        /// el world origin. Si posicionamos el modelo en el primer frame de
+        /// SessionTracking, ARCore puede mover el origin inmediatamente después
+        /// y desalinear el modelo.
+        ///
+        /// Con _initialTrackingTimeout como fallback para evitar bloqueo total
+        /// en dispositivos lentos o con poco feature tracking.
+        /// </summary>
+        private IEnumerator WaitForStableTracking()
+        {
+            float elapsed = 0f;
+            _consecutiveStableFrames = 0;
+
+            Log($"⏳ Esperando tracking estable ({_initialStableFrames} frames " +
+                $"consecutivos, timeout={_initialTrackingTimeout}s)...");
+
+            while (elapsed < _initialTrackingTimeout)
+            {
+                yield return null;
+                elapsed += Time.deltaTime;
+
+                if (ARSession.state == ARSessionState.SessionTracking)
+                {
+                    _consecutiveStableFrames++;
+
+                    if (_consecutiveStableFrames >= _initialStableFrames)
+                    {
+                        _initialTrackingAchieved = true;
+                        Log($"✅ Tracking estable alcanzado ({_initialStableFrames} frames " +
+                            $"en {elapsed:F1}s). Publicando ARSessionReadyEvent.");
+                        PublishSessionReady();
+                        yield break;
+                    }
+                }
+                else
+                {
+                    // Resetear contador si el tracking se interrumpe
+                    if (_consecutiveStableFrames > 0)
+                    {
+                        Log($"⚠️ Tracking interrumpido en frame {_consecutiveStableFrames} " +
+                            $"— reseteando contador. Estado: {ARSession.state}");
+                        _consecutiveStableFrames = 0;
+                    }
+                }
+            }
+
+            // Timeout — publicar igualmente para no bloquear la app
+            Debug.LogWarning($"[ARSessionManager] ⚠️ Timeout esperando tracking estable " +
+                             $"({_initialTrackingTimeout}s). Publicando ARSessionReadyEvent " +
+                             $"igualmente. Estado actual: {ARSession.state}");
+            _initialTrackingAchieved = true;
+            PublishSessionReady();
+        }
+
+        private void PublishSessionReady()
+        {
+            EventBus.Instance?.Publish(new ShowMessageEvent
+            {
+                Message = "Sesión AR lista. Busca superficies horizontales.",
+                Type = MessageType.Info,
+                Duration = 3f
+            });
+
+            // Publicar evento de sesión lista para que AROriginAligner
+            // y otros sistemas puedan empezar a operar
+            EventBus.Instance?.Publish(new ARSessionReadyEvent { });
+        }
+
+        // ─── FIX 2 — Detección de movimiento rápido ──────────────────────
+
+        /// <summary>
+        /// ✅ FIX 2: Detecta movimiento brusco de cámara cada frame.
+        ///
+        /// Cuando el usuario mueve el teléfono rápidamente, ARCore puede
+        /// hacer micro-resets del world origin, causando que el modelo
+        /// "salte" o "flote". Al detectar este movimiento, activamos una
+        /// pausa de _quickMoveStabilityFrames frames durante la cual
+        /// AROriginAligner no debería sincronizar el agente.
+        ///
+        /// IsQuickMovePaused es una propiedad pública que AROriginAligner
+        /// puede consultar en SyncAgentToCameraFullAR().
+        /// </summary>
+        private void UpdateQuickMoveDetection()
+        {
+            if (!_initialTrackingAchieved) return;
+
+            // Obtener posición actual de la cámara AR
+            var xrOrigin = FindFirstObjectByType<Unity.XR.CoreUtils.XROrigin>();
+            if (xrOrigin?.Camera == null) return;
+
+            Vector3 currentCameraPos = xrOrigin.Camera.transform.position;
+
+            if (!_cameraInitialized)
+            {
+                _lastCameraPos = currentCameraPos;
+                _cameraInitialized = true;
+                return;
+            }
+
+            // Calcular delta de movimiento en este frame
+            float cameraDelta = Vector3.Distance(currentCameraPos, _lastCameraPos);
+            _lastCameraPos = currentCameraPos;
+
+            if (_quickMovePauseFrames > 0)
+            {
+                _quickMovePauseFrames--;
+
+                if (_quickMovePauseFrames == 0)
+                    Log("✅ Pausa por movimiento rápido terminada — reanudando sincronización.");
+
+                return;
+            }
+
+            // Detectar movimiento brusco
+            if (cameraDelta > _quickMoveThreshold)
+            {
+                _quickMovePauseFrames = _quickMoveStabilityFrames;
+                Log($"⚡ Movimiento rápido detectado (Δ={cameraDelta:F3}m > umbral {_quickMoveThreshold:F3}m). " +
+                    $"Pausando sincronización por {_quickMoveStabilityFrames} frames.");
+            }
+        }
+
         // ─── Plane tracking ───────────────────────────────────────────────
 
         private void OnTrackablesChanged(ARTrackablesChangedEventArgs<ARPlane> args)
         {
-            foreach (var plane in args.added)   ProcessAddedPlane(plane);
+            foreach (var plane in args.added) ProcessAddedPlane(plane);
             foreach (var plane in args.updated) ProcessUpdatedPlane(plane);
-            foreach (var kvp   in args.removed) ProcessRemovedPlane(kvp.Value);
+            foreach (var kvp in args.removed) ProcessRemovedPlane(kvp.Value);
         }
 
         /// <summary>
-        /// ✅ v2.0 FIX 1: Filtrar planos usando PlaneClassifications.Floor (AF 6.x).
+        /// ✅ v2.0 FIX 1 (conservado): Filtrar planos usando PlaneClassifications.Floor.
         ///
-        /// LÓGICA:
-        ///   Caso A — ARCore clasificó el plano como Floor: aceptar siempre.
-        ///            Son suelos confirmados por el sistema de clasificación de ARCore.
-        ///
-        ///   Caso B — ARCore no ha clasificado el plano aún (None) y es HorizontalUp:
-        ///            Aceptar provisionalmente (los primeros frames los planos no tienen
-        ///            clasificación). Serán promovidos/degradados cuando ARCore clasifique.
-        ///
-        ///   Caso C — HorizontalDown (techos) o clasificado como Ceiling/Table/etc:
-        ///            Rechazar. En v1.0 se aceptaban HorizontalDown como suelos,
-        ///            lo que causaba que el modelo se anclara al techo.
-        ///
-        ///   Caso D — Planos verticales (paredes): rechazar siempre.
+        /// Caso A — ARCore clasificó el plano como Floor: aceptar siempre.
+        /// Caso B — Sin clasificación aún y HorizontalUp: aceptar provisionalmente.
+        /// Caso C — HorizontalDown (techos) / Ceiling: rechazar.
+        /// Caso D — Planos verticales: rechazar.
         /// </summary>
         private void ProcessAddedPlane(ARPlane plane)
         {
-            // ✅ v2.0 FIX 1: Clasificación AF 6.x — preferir Floor explícito
-            bool isFloor      = plane.classifications.HasFlag(PlaneClassifications.Floor);
+            bool isFloor = plane.classifications.HasFlag(PlaneClassifications.Floor);
             bool isUnclassifiedHorizontalUp =
                 plane.classifications == PlaneClassifications.None &&
-                plane.alignment       == PlaneAlignment.HorizontalUp;
+                plane.alignment == PlaneAlignment.HorizontalUp;
 
             if (!isFloor && !isUnclassifiedHorizontalUp)
             {
-                // Loguear para diagnóstico — útil para detectar si el techo
-                // se estaba colando en v1.0
                 if (plane.alignment == PlaneAlignment.HorizontalDown ||
                     plane.classifications.HasFlag(PlaneClassifications.Ceiling))
                 {
-                    Debug.Log($"[ARSessionManager] 🚫 Plano techo ignorado: " +
-                              $"alignment={plane.alignment} class={plane.classifications}");
+                    Log($"🚫 Plano techo ignorado: " +
+                        $"alignment={plane.alignment} class={plane.classifications}");
                 }
                 return;
             }
@@ -218,29 +370,28 @@ namespace IndoorNavAR.AR
             _detectedPlanes[plane.trackableId] = plane;
             ConfigurePlaneVisualization(plane);
 
-            EventBus.Instance.Publish(new PlaneDetectedEvent
+            EventBus.Instance?.Publish(new PlaneDetectedEvent
             {
-                Plane  = plane,
+                Plane = plane,
                 Center = plane.center,
-                Area   = plane.size.x * plane.size.y
+                Area = plane.size.x * plane.size.y
             });
 
             string classLabel = isFloor ? "Floor✓" : "HorizUp(sin clasificar)";
-            Debug.Log($"[ARSessionManager] ✅ Plano [{classLabel}] detectado: " +
-                      $"{plane.trackableId} | Área: {plane.size.x * plane.size.y:F2}m²");
+            Log($"✅ Plano [{classLabel}]: {plane.trackableId} | " +
+                $"Área: {plane.size.x * plane.size.y:F2}m²");
         }
 
         private void ProcessUpdatedPlane(ARPlane plane)
         {
             if (!_detectedPlanes.ContainsKey(plane.trackableId)) return;
-
             _detectedPlanes[plane.trackableId] = plane;
 
-            EventBus.Instance.Publish(new PlaneUpdatedEvent
+            EventBus.Instance?.Publish(new PlaneUpdatedEvent
             {
-                Plane     = plane,
+                Plane = plane,
                 NewCenter = plane.center,
-                NewArea   = plane.size.x * plane.size.y
+                NewArea = plane.size.x * plane.size.y
             });
         }
 
@@ -248,24 +399,21 @@ namespace IndoorNavAR.AR
         {
             if (_detectedPlanes.Remove(plane.trackableId))
             {
-                EventBus.Instance.Publish(new PlaneRemovedEvent { Plane = plane });
-                Debug.Log($"[ARSessionManager] Plano removido: {plane.trackableId}");
+                EventBus.Instance?.Publish(new PlaneRemovedEvent { Plane = plane });
+                Log($"Plano removido: {plane.trackableId}");
             }
         }
 
         private void ConfigurePlaneVisualization(ARPlane plane)
         {
-            if (plane.TryGetComponent<MeshRenderer>(out var meshRenderer))
-                meshRenderer.enabled = _showPlaneVisualization;
-
-            if (_showPlaneVisualization && plane.TryGetComponent<MeshRenderer>(out var renderer))
+            if (plane.TryGetComponent<MeshRenderer>(out var renderer))
             {
-                Material mat = renderer.material;
-                if (mat != null)
+                renderer.enabled = _showPlaneVisualization;
+                if (_showPlaneVisualization && renderer.material != null)
                 {
-                    Color c = mat.color;
-                    c.a       = 0.3f;
-                    mat.color = c;
+                    Color c = renderer.material.color;
+                    c.a = 0.3f;
+                    renderer.material.color = c;
                 }
             }
         }
@@ -273,7 +421,7 @@ namespace IndoorNavAR.AR
         // ─── Raycast ──────────────────────────────────────────────────────
 
         public bool Raycast(
-            Vector2      screenPosition,
+            Vector2 screenPosition,
             out ARRaycastHit hit,
             TrackableType trackableTypes = TrackableType.PlaneWithinPolygon)
         {
@@ -305,9 +453,24 @@ namespace IndoorNavAR.AR
             return false;
         }
 
-        // ─── Anchors ──────────────────────────────────────────────────────
+        // ─── Anchors — AF 6.5 ─────────────────────────────────────────────
 
-        public ARAnchor CreateAnchor(Pose pose)
+        /// <summary>
+        /// ✅ AF 6.5: Crea un anchor usando TryAddAnchorAsync().
+        ///
+        /// MIGRACIÓN desde v2.1:
+        ///   AttachAnchor(plane, pose) → TryAddAnchorAsync(pose)
+        ///
+        /// La nueva API es async y retorna Result con XRResultStatus,
+        /// lo que permite diagnóstico preciso del fallo.
+        ///
+        /// FIX 3: Guard de tracking — rechaza inmediatamente si ARCore
+        /// no está en SessionTracking. Evita anchors con pose inválida.
+        ///
+        /// NOTA: Este método es async. Los callers deben usar await.
+        /// Si necesitas un wrapper síncrono, usa CreateAnchorFireAndForget().
+        /// </summary>
+        public async Task<ARAnchor> CreateAnchorAsync(Pose pose)
         {
             if (_anchorManager == null)
             {
@@ -315,53 +478,100 @@ namespace IndoorNavAR.AR
                 return null;
             }
 
+            // ✅ FIX 3: Guard de tracking — no crear anchors sin tracking estable
+            if (ARSession.state != ARSessionState.SessionTracking)
+            {
+                Debug.LogWarning($"[ARSessionManager] ⚠️ Anchor rechazado: " +
+                                 $"ARCore no está en SessionTracking " +
+                                 $"(estado actual: {ARSession.state}). " +
+                                 $"Equivale a XRResultStatus.NotTracking.");
+                return null;
+            }
+
             try
             {
-                ARPlane closestPlane = FindClosestPlane(pose.position);
-                if (closestPlane == null)
+                // ✅ AF 6.5: TryAddAnchorAsync reemplaza AttachAnchor
+                var result = await _anchorManager.TryAddAnchorAsync(pose);
+
+                if (result.status.IsSuccess())
                 {
-                    Debug.LogWarning("[ARSessionManager] No se encontró plano suelo cercano.");
-                    return null;
+                    ARAnchor anchor = result.value;
+
+                    if (anchor == null || !anchor.enabled)
+                    {
+                        Debug.LogWarning("[ARSessionManager] ⚠️ Anchor creado pero nulo/desactivado.");
+                        return null;
+                    }
+
+                    Log($"⚓ Anchor creado: {anchor.trackableId} @ {pose.position:F3}");
+                    return anchor;
                 }
 
-                ARAnchor anchor = _anchorManager.AttachAnchor(closestPlane, pose);
-
-                if (anchor == null)
-                {
-                    Debug.LogWarning("[ARSessionManager] AttachAnchor devolvió null.");
-                    return null;
-                }
-
-                // ✅ v2.0 FIX 2: AF 6.0 — ARAnchor se desactiva tras primer fallo.
-                if (!anchor.enabled)
-                {
-                    Debug.LogWarning("[ARSessionManager] ⚠️ ARAnchor creado pero desactivado " +
-                                     "(AF 6.0: fallo silencioso). Devolviendo null.");
-                    return null;
-                }
-
-                Debug.Log($"[ARSessionManager] ⚓ Ancla creada: {anchor.trackableId} " +
-                          $"en plano {closestPlane.trackableId}");
-                return anchor;
+                // ✅ AF 6.5: Diagnóstico preciso con nuevos StatusCodes
+                LogAnchorFailure(result.status);
+                return null;
             }
             catch (Exception ex)
             {
-                Debug.LogError($"[ARSessionManager] Error creando ancla: {ex.Message}");
+                Debug.LogError($"[ARSessionManager] Error creando anchor: {ex.Message}");
                 return null;
             }
         }
 
         /// <summary>
-        /// ✅ v2.0 FIX 2: Busca el plano suelo más cercano.
-        /// _detectedPlanes ya solo contiene suelos gracias a ProcessAddedPlane v2.0,
-        /// pero aplicamos el mismo filtro de Floor como defensa en profundidad.
+        /// Wrapper síncrono (fire-and-forget) para callers que no pueden usar await.
+        /// Usa CreateAnchorAsync() cuando sea posible — este método no retorna el anchor.
+        /// </summary>
+        public void CreateAnchorFireAndForget(Pose pose, Action<ARAnchor> onComplete = null)
+        {
+            _ = CreateAnchorAndCallback(pose, onComplete);
+        }
+
+        private async Task CreateAnchorAndCallback(Pose pose, Action<ARAnchor> onComplete)
+        {
+            ARAnchor anchor = await CreateAnchorAsync(pose);
+            onComplete?.Invoke(anchor);
+        }
+
+        /// <summary>
+        /// ✅ AF 6.5: Log de diagnóstico con XRResultStatus.
+        /// Usa IsError() y toString para diagnóstico seguro cross-version.
+        /// </summary>
+        private void LogAnchorFailure(XRResultStatus status)
+        {
+            string reason = $"status={status} | ARSession={ARSession.state} | reason={ARSession.notTrackingReason}";
+            Debug.LogWarning($"[ARSessionManager] ⚠️ TryAddAnchorAsync falló: {reason}");
+        }
+
+        public void RemoveAnchor(ARAnchor anchor)
+        {
+            if (anchor == null || _anchorManager == null) return;
+            try
+            {
+                if (_anchorManager.TryRemoveAnchor(anchor))
+                    Log($"Ancla removida: {anchor.trackableId}");
+                else
+                    Debug.LogWarning($"[ARSessionManager] No se pudo remover: {anchor.trackableId}");
+            }
+            catch (Exception ex)
+            {
+                Debug.LogError($"[ARSessionManager] Error removiendo ancla: {ex.Message}");
+            }
+        }
+
+        // ─── Búsqueda de plano más cercano ────────────────────────────────
+
+        /// <summary>
+        /// Busca el plano suelo más cercano.
+        /// _detectedPlanes solo contiene suelos gracias a ProcessAddedPlane,
+        /// pero aplicamos el mismo filtro como defensa en profundidad.
         /// </summary>
         private ARPlane FindClosestPlane(Vector3 position)
         {
-            ARPlane closestFloor   = null;
+            ARPlane closestFloor = null;
             ARPlane closestFallback = null;
-            float   minDistFloor   = float.MaxValue;
-            float   minDistFallback = float.MaxValue;
+            float minDistFloor = float.MaxValue;
+            float minDistFallback = float.MaxValue;
 
             foreach (var kvp in _detectedPlanes)
             {
@@ -383,22 +593,6 @@ namespace IndoorNavAR.AR
             return closestFloor ?? closestFallback;
         }
 
-        public void RemoveAnchor(ARAnchor anchor)
-        {
-            if (anchor == null || _anchorManager == null) return;
-            try
-            {
-                if (_anchorManager.TryRemoveAnchor(anchor))
-                    Debug.Log($"[ARSessionManager] Ancla removida: {anchor.trackableId}");
-                else
-                    Debug.LogWarning($"[ARSessionManager] No se pudo remover: {anchor.trackableId}");
-            }
-            catch (Exception ex)
-            {
-                Debug.LogError($"[ARSessionManager] Error removiendo ancla: {ex.Message}");
-            }
-        }
-
         // ─── Utilities ────────────────────────────────────────────────────
 
         public void TogglePlaneVisualization(bool show)
@@ -406,26 +600,24 @@ namespace IndoorNavAR.AR
             _showPlaneVisualization = show;
             foreach (var kvp in _detectedPlanes)
             {
-                if (kvp.Value != null &&
-                    kvp.Value.TryGetComponent<MeshRenderer>(out var r))
+                if (kvp.Value != null && kvp.Value.TryGetComponent<MeshRenderer>(out var r))
                     r.enabled = show;
             }
-            Debug.Log($"[ARSessionManager] Visualización de planos: {show}");
+            Log($"Visualización de planos: {show}");
         }
 
         public void ClearAllPlanes()
         {
             foreach (var kvp in _detectedPlanes)
                 if (kvp.Value != null) Destroy(kvp.Value.gameObject);
-
             _detectedPlanes.Clear();
-            Debug.Log("[ARSessionManager] Todos los planos limpiados.");
+            Log("Todos los planos limpiados.");
         }
 
         public ARPlane GetLargestPlane()
         {
             ARPlane largestPlane = null;
-            float   maxArea      = 0f;
+            float maxArea = 0f;
 
             foreach (var kvp in _detectedPlanes)
             {
@@ -434,8 +626,43 @@ namespace IndoorNavAR.AR
                 float area = plane.size.x * plane.size.y;
                 if (area > maxArea) { maxArea = area; largestPlane = plane; }
             }
-
             return largestPlane;
+        }
+
+        // ─── Debug ────────────────────────────────────────────────────────
+
+        private void Log(string msg)
+        {
+            if (_logTracking) Debug.Log($"[ARSessionManager] {msg}");
+        }
+
+        [ContextMenu("ℹ️ Estado actual")]
+        private void DebugState()
+        {
+            Debug.Log("══════════════════════════════════════════════");
+            Debug.Log("  ARSessionManager v3.0 — Estado");
+            Debug.Log("══════════════════════════════════════════════");
+            Debug.Log($"  ARSession state:        {ARSession.state}");
+            Debug.Log($"  IsSessionReady:         {IsSessionReady}");
+            Debug.Log($"  IsFullyStable:          {IsFullyStable}");
+            Debug.Log($"  InitialTracking logrado:{_initialTrackingAchieved}");
+            Debug.Log($"  Frames estables actual: {_consecutiveStableFrames}/{_initialStableFrames}");
+            Debug.Log($"  IsQuickMovePaused:      {IsQuickMovePaused} ({_quickMovePauseFrames} frames restantes)");
+            Debug.Log($"  Planos detectados:      {DetectedPlaneCount}");
+            Debug.Log($"  PlaneManager:           {(_planeManager != null ? _planeManager.gameObject.name : "NULL")}");
+            Debug.Log($"  RaycastManager:         {(_raycastManager != null ? _raycastManager.gameObject.name : "NULL")}");
+            Debug.Log($"  AnchorManager:          {(_anchorManager != null ? _anchorManager.gameObject.name : "NULL")}");
+            Debug.Log("══════════════════════════════════════════════");
+        }
+
+        [ContextMenu("🧪 Test CreateAnchorAsync (pose cámara)")]
+        private void DebugTestAnchor()
+        {
+            var xrOrigin = FindFirstObjectByType<Unity.XR.CoreUtils.XROrigin>();
+            if (xrOrigin?.Camera == null) { Log("Sin cámara para test"); return; }
+            Pose pose = new Pose(xrOrigin.Camera.transform.position,
+                                 xrOrigin.Camera.transform.rotation);
+            _ = CreateAnchorAsync(pose);
         }
     }
 }

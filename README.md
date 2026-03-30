@@ -1,313 +1,183 @@
-# COMPAS AR, módulo IndoorNavAR
+# COMPAS Mobile (Flutter) — Asistente de navegación por voz accesible con IA híbrida
 
-Proyecto de grado de Ingeniería de Sistemas, Universidad de San Buenaventura Cali.
+> Aplicación móvil Flutter para asistencia de navegación y reconocimiento de entorno, diseñada con enfoque de accesibilidad para personas con discapacidad visual. Integra procesamiento de voz, inferencia local (offline), inferencia en la nube (Groq) y puente con Unity para navegación AR.  
 
-Este repositorio contiene el módulo Unity de navegación en interiores asistida por realidad aumentada de COMPAS. Su propósito es resolver la capa espacial de la solución: sesión AR, waypoints, NavMesh, cálculo de rutas, guía contextual y una interfaz móvil adaptada para uso accesible dentro de la experiencia AR.
-
-La aplicación host en Flutter queda a cargo de la conversación, accesibilidad, texto a voz, coordinación general de la experiencia y cualquier capa adicional de entrada de voz que se integre alrededor del módulo.
-
-Autores: Juan Jose Sanchez, Carlos Eduardo Rangel.
+Cliente multiplataforma centrado en Android/iOS para accesibilidad, autenticación por código de acceso y navegación asistida con integración Flutter ↔ Unity.
 
 ---
 
-## Tabla de contenidos
+## Tabla de contenido
 
-1. Propósito del repositorio  
-2. Resumen ejecutivo del sistema  
-3. Estado real del proyecto  
-4. Arquitectura actual  
-5. Voz, accesibilidad y responsabilidades entre Flutter y Unity  
-6. Contrato de integración implementado hoy  
-7. UI móvil y consideraciones de accesibilidad  
-8. Modelo de datos y conceptos clave  
-9. Algoritmo de cálculo de rutas  
-10. Uso de realidad aumentada en el módulo  
-11. Estructura del repositorio  
-12. Instalación, ejecución y validación  
-13. Limitaciones técnicas actuales  
-14. Requisitos de hardware y software  
-15. Guía para investigación y marco teórico  
-16. Hoja de ruta sugerida  
-
----
-
-## 1. Propósito del repositorio
-
-Este README está pensado para tres usos prácticos:
-
-- Servir como documentación técnica actualizada del módulo Unity IndoorNavAR.
-- Dejar claro qué partes viven en Unity y cuáles viven en Flutter o en la capa móvil anfitriona.
-- Ofrecer contexto consistente para redacción académica, mantenimiento del proyecto e interpretación por herramientas de IA.
+- [Resumen ejecutivo](#resumen-ejecutivo)
+- [Objetivo del sistema](#objetivo-del-sistema)
+- [Arquitectura general](#arquitectura-general)
+- [Arquitectura técnica](#arquitectura-técnica)
+- [Tecnologías y dependencias](#tecnologías-y-dependencias)
+- [Estructura del proyecto](#estructura-del-proyecto)
+- [Módulos funcionales](#módulos-funcionales)
+- [Lógica de negocio y flujos](#lógica-de-negocio-y-flujos)
+- [Configuración de entorno](#configuración-de-entorno)
+- [Instalación y ejecución](#instalación-y-ejecución)
+- [Pruebas y validación](#pruebas-y-validación)
+- [Seguridad, privacidad y accesibilidad](#seguridad-privacidad-y-accesibilidad)
+- [Integración con backend y Unity](#integración-con-backend-y-unity)
+- [Limitaciones actuales y mejoras recomendadas](#limitaciones-actuales-y-mejoras-recomendadas)
+- [Uso de este README como referencia de trabajo de grado](#uso-de-este-readme-como-referencia-de-trabajo-de-grado)
+- [Créditos y licencia](#créditos-y-licencia)
 
 ---
 
-## 2. Resumen ejecutivo del sistema
+## Resumen ejecutivo
 
-COMPAS aborda la orientación en espacios cerrados para personas con discapacidad visual, donde GPS no ofrece precisión suficiente. La solución se divide en dos capas complementarias.
+COMPAS Mobile es un cliente Flutter multiplataforma cuyo foco principal es Android/iOS para interacción en tiempo real mediante voz y asistencia de navegación.
 
-### Flutter / aplicación host
+### Funcionalidades activas
 
-Flutter gestiona la experiencia host de alto nivel:
+- Autenticación accesible: registro, login y recuperación por código de 6 dígitos.
+- Persistencia de sesión con `flutter_secure_storage`, validación local y refresh automático.
+- Pantalla principal AR tras autenticación.
+- Coordinación de voz: `NavigationCoordinator`, `speech_to_text` y `flutter_tts`.
+- Wake word basada en STT (`oye compas` y variantes).
+- Modos IA: `auto`, `online` y `offline`, con verificación de conectividad y Groq.
+- Integración Unity: cargar sesión, listar balizas, iniciar/detener navegación y recibir eventos de tracking/TTS.
+- Reconocimiento de entorno: demo orientado a UX/accesibilidad.
 
-- flujo conversacional  
-- texto a voz  
-- estados de interfaz centrados en accesibilidad  
-- coordinación de la integración con Unity  
-- cualquier capa externa de entrada de voz  
+### Funcionalidades heredadas / en transición
 
-### Unity / este repositorio
-
-Unity gestiona la capa espacial y operativa:
-
-- sesión AR  
-- detección de planos  
-- waypoints y persistencia  
-- NavMesh  
-- cálculo de rutas  
-- generación de instrucciones  
-- UI móvil en escena  
+- Dependencia de `google_generative_ai` (Gemini) — no usada actualmente.
+- Wake word Picovoice/Porcupine — assets presentes, flujo activo usa STT.
+- Reconocimiento de entorno: demo, sin inferencia visual real.
 
 ---
 
-## 3. Estado real del proyecto
+## Objetivo del sistema
 
-### 3.1 Implementado
+### Objetivo general
 
-- Gestión de sesión AR  
-- Alineación del origen AR  
-- Waypoints completos  
-- Navegación con NavMesh  
-- Persistencia  
-- Bridge Flutter ↔ Unity  
-- Guía contextual  
-- Canal TTS  
-- UI móvil completa  
+Proveer interfaz accesible para navegación asistida, combinando voz, retroalimentación auditiva/visual e integración AR (Unity).
 
-### 3.2 Alcance
+### Objetivos específicos
 
-- Navegación indoor  
-- Integración JSON  
-- UI en escena  
-- Comunicación con Flutter  
-
-### 3.3 En evolución
-
-- Versionado JSON  
-- Eventos enriquecidos  
-- Voz embebida  
-- Obstáculos dinámicos  
+- Reducir fricción mediante comandos de voz y activación por palabra clave.
+- Mantener funcionalidad degradada offline.
+- Exponer estados accesibles (semántica, háptica, mensajes claros).
+- Sincronizar intents de usuario con acciones de navegación en Unity.
 
 ---
 
-## 4. Arquitectura
+## Arquitectura general
 
-### Core
-- Managers  
-- Data  
-- Events  
+- Entrada: `main.dart` carga `.env`, fija orientación y monta `AuthGate`.
+- `AuthGate` decide entre `WelcomeScreen` o `ArNavigationScreen` según tokens.
 
-### AR
-- Inicialización  
-- Planos  
-- UI acoplada  
+### Capas principales
 
-### Navegación
-- Pathfinding  
-- Optimización  
-- Voice  
+1. **Presentación (UI Flutter):** pantallas de autenticación, AR y reconocimiento de entorno.
+2. **Orquestación de dominio:** `NavigationCoordinator`, `ConversationService`, `AIModeController`, `VoiceNavigationService`.
+3. **Servicios de infraestructura:** STT/TTS, wake word, cliente HTTP, almacenamiento de tokens, bridge Unity.
+4. **Integraciones externas:** Backend REST, API Groq, Porcupine, motor Unity.
 
-### Integración
-- FlutterBridge  
+### Patrones identificados
 
----
-
-## 5. Voz y accesibilidad
-
-### Flutter
-- Manejo de accesibilidad  
-- TTS  
-- Control de experiencia  
-
-### Unity
-- Genera instrucciones  
-- Envía `tts_request`  
-- Recibe `tts_status`  
+- Singleton services para voz/IA/Unity.
+- Coordinator pattern para centralizar eventos de voz.
+- State-driven UI con `StatefulWidget`, `ValueNotifier`, callbacks y streams.
+- Fallback progresivo: online → offline/manual según disponibilidad.
 
 ---
 
-## 6. Contrato de integración
+## Arquitectura técnica
 
-Acciones disponibles:
-
-- navigate_to  
-- stop_navigation  
-- nav_status  
-- list_waypoints  
-- create_waypoint  
-- remove_waypoint  
-- clear_waypoints  
-- save_session  
-- load_session  
-- tts_status  
+- `main.dart` carga `.env`, fuerza orientación vertical y monta `AuthGate`.
+- `AuthGate` determina flujo según tokens locales y refresh token.
+- Capas: UI → Coordinator → Servicios → Integraciones externas.
 
 ---
 
-## 7. UI móvil
+## Tecnologías y dependencias
 
-Incluye:
+### Flutter / Base
 
-- barra superior  
-- FABs  
-- bottom sheet  
-- favoritos  
-- rutas  
-- panel navegación  
-- menú lateral  
-- toasts  
+- Flutter `>=3.27.0`, Dart `>=3.8.0 <4.0.0`
+- `provider`, `logger`, `flutter_dotenv`
 
-### Accesibilidad
+### IA y voz
 
-- responsive  
-- safe areas  
-- alto contraste  
-- feedback multimodal  
+- `tflite_flutter`, `speech_to_text`, `flutter_tts`, `porcupine_flutter`, `google_generative_ai`
 
----
+### Audio
 
-## 8. Modelo de datos
+- `record`, `audioplayers`, `audio_session`
 
-### Waypoint
-Punto navegable con posición y metadatos.
+### Cámara y sensores
 
-### NavMesh
-Espacio navegable.
+- `camera`, `proximity` (simulado)
 
-### Ruta guiada
-Secuencia de destinos.
+### Networking y datos
 
-### Sesión
-Estado persistente.
+- `http`, `dio`, `connectivity_plus`
+- `flutter_secure_storage`, `shared_preferences`, `path_provider`
 
-### Instrucción
-Mensaje de navegación.
+### Integración AR
+
+- `flutter_unity_widget` (branch experimental Unity 6)
+
+### Permisos
+
+- `permission_handler`
 
 ---
 
-## 9. Algoritmo de cálculo de rutas
+## Estructura del proyecto
 
-El módulo calcula rutas utilizando el sistema NavMesh de Unity.
+```text
+lib/
+  app/
+  config/
+    api_config.dart
+  models/
+    api_models.dart
+    shared_models.dart
+  screens/
+    auth/
+      welcome_screen.dart
+      login_screen_integrated.dart
+      register_screen_integrated.dart
+      request_new_code_screen.dart
+    ar_navigation_screen.dart
+    environment_recognition_screen.dart
+    voice_navigation_screen.dart
+  services/
+    api_client.dart
+    auth_service.dart
+    token_service.dart
+    tts_service.dart
+    unity_bridge_service.dart
+    voice_navigation_service.dart
+    user_service.dart
+    proximity_service.dart
+    AI/
+      ai_mode_controller.dart
+      conversation_service.dart
+      groq_service.dart
+      integrated_voice_command_service.dart
+      navigation_coordinator.dart
+      portable_tokenizer.dart
+      robot_fsm.dart
+      stt_session_manager.dart
+      voice_command_classifier.dart
+      wake_word_service.dart
+      waypoint_context_service.dart
+  utils/
+    password_validator.dart
+  widgets/
+    accessible_camera_button.dart
 
-### Paso 1: cálculo de ruta base
+assets/
+  images/
+  models/
+  wake_words/
 
-Se ajustan el origen y el destino al NavMesh y se calcula la ruta mediante:
-
-Esta función utiliza internamente el sistema de navegación de Unity para encontrar una ruta válida dentro de la malla navegable.
-
-### Paso 2: refinamiento de trayectoria
-
-Una vez obtenida la ruta base, se aplican dos procesos de optimización propios del módulo:
-
-- **Center Pull**: mejora la holgura lateral del recorrido para evitar trayectorias demasiado pegadas a bordes.
-- **Funnel conservador**: elimina puntos casi colineales sin comprometer la seguridad ni cruzar bordes del NavMesh.
-
-### Pipeline completo
-
-1. Solicitud de ruta  
-2. Ajuste a NavMesh  
-3. Cálculo con `NavMesh.CalculatePath`  
-4. Refinamiento (Center Pull + Funnel)  
-5. Seguimiento  
-6. Monitoreo y recálculo  
-7. Generación de instrucciones  
-
----
-
-## 10. Realidad aumentada
-
-Basado en AR Foundation:
-
-- detección de planos  
-- raycast  
-- alineación  
-
-Factores críticos:
-
-- iluminación  
-- tracking  
-- dispositivo  
-
----
-
-## 11. Estructura
-
-- Assets/IndoorNavAR  
-- Scripts/AR  
-- Scripts/Core  
-- Scripts/Navigation  
-- Scripts/Navigation/Voice  
-- Scripts/Integration  
-- Scenes  
-- Packages  
-- ProjectSettings  
-
----
-
-## 12. Instalación
-
-### Requisitos
-
-- Unity 6000.2.14f1  
-- Android ARCore  
-
-### Ejecución
-
-1. Abrir proyecto  
-2. Verificar dependencias  
-3. Abrir escena  
-4. Ejecutar  
-5. Build Android  
-
----
-
-## 13. Limitaciones
-
-- Dependencia de AR  
-- Sin posicionamiento absoluto  
-- Precisión depende del entorno  
-- JSON no versionado  
-- Rendimiento variable  
-
----
-
-## 14. Requisitos
-
-### Hardware
-- Android ARCore  
-- Cámara  
-- Sensores  
-
-### Software
-- Unity  
-- Flutter host  
-
----
-
-## 15. Marco teórico
-
-- navegación indoor  
-- AR móvil  
-- NavMesh  
-- accesibilidad  
-- voz  
-- integración Unity  
-
----
-
-## 16. Hoja de ruta
-
-- Versionar JSON  
-- Eventos Unity → Flutter  
-- Arquitectura de voz  
-- Pruebas integración  
-- Obstáculos dinámicos  
-- Evaluación experimental  
+test/
+  groq_api_test.dart
+  test_server_connection.dart
