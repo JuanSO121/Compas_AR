@@ -1,28 +1,30 @@
 // File: VoiceCommandAPI.cs
-// ✅ v8.4 — Fix mensajes TTS repetidos 3 veces
+// ✅ v8.5 — Añade SendFrameToFlutter() para segmentación sin segunda cámara
 //
 // ════════════════════════════════════════════════════════════════════════════
-// CAMBIOS v8.3 → v8.4
+// CAMBIOS v8.4 → v8.5
 // ════════════════════════════════════════════════════════════════════════════
 //
-//  FIX — SpeakArbitraryText(): publicar en EventBus causaba loop de repetición.
+//  ÚNICO CAMBIO: nuevo método público SendFrameToFlutter(string frameJson).
 //
-//  PROBLEMA EN v8.3:
-//    SpeakArbitraryText() publicaba TTSRequestEvent en EventBus.
-//    OnTTSRequest() (suscrito al mismo EventBus) lo capturaba y enviaba
-//    tts_request a Flutter. PERO Flutter ya había enviado el texto
-//    directamente via speakArbitraryText() en el bridge.
-//    Resultado: Flutter recibía el mismo texto DOS veces por dos canales
-//    distintos y lo hablaba DOS veces.
-//    Sumado al canal legacy guide_announcement → hasta 3 repeticiones.
+//  CONTEXTO:
+//    ARCore/ARKit toma control exclusivo de la cámara trasera. Flutter no
+//    puede abrir un CameraController independiente mientras Unity está activo.
+//    La solución es que Unity capture los frames (ya los tiene vía
+//    ARCameraManager) y los reenvíe a Flutter por el bridge existente.
 //
-//  FIX EN v8.4:
-//    SpeakArbitraryText() envía tts_request DIRECTAMENTE a Flutter via
-//    Reply(), sin publicar en EventBus. Así corta el loop:
-//      ❌ ANTES: Flutter → Unity EventBus → OnTTSRequest → tts_request → Flutter
-//      ✅ AHORA: Flutter → Reply(tts_request) → Flutter (una sola vez)
+//  FLUJO:
+//    CameraFrameSender.cs → SendFrameToFlutter() → Reply() →
+//    UnityBridgeService.dart (intercepta action="frame_data") →
+//    ObstacleDetectionService (TFLite, sin CameraController)
 //
-//  TODO LO DEMÁS ES IDÉNTICO A v8.3.
+//  DISEÑO DEL MÉTODO:
+//    • Sin log por defecto — el volumen es 10 mensajes/s, logear cada uno
+//      saturaría la consola. Activar _logFrames para debug puntual.
+//    • Sin throttle propio — CameraFrameSender ya lo gestiona a nivel de fps.
+//    • Sin EventBus — envío directo igual que SpeakArbitraryText (v8.4 FIX).
+//
+//  TODO LO DEMÁS ES IDÉNTICO A v8.4.
 
 using System;
 using System.Text;
@@ -61,6 +63,11 @@ namespace IndoorNavAR.Integration
         [Header("─── TTS Speak throttle (v8.3) ─────────────────────────────")]
         [Tooltip("Tiempo mínimo (s) entre llamadas a SpeakArbitraryText desde Flutter.")]
         [SerializeField] private float _ttsRequestThrottle = 3.0f;
+
+        [Header("─── Frame sender (v8.5) ──────────────────────────────────")]
+        [Tooltip("Log de cada frame enviado. Desactivar en producción — " +
+                 "a 10 fps satura la consola.")]
+        [SerializeField] private bool _logFrames = false;
 
         private bool _waypointCacheDirty = true;
         private string _waypointListCache = "[]";
@@ -279,16 +286,11 @@ namespace IndoorNavAR.Integration
         /// <summary>
         /// ✅ v8.4 FIX — Habla texto libre generado por Flutter (COMPAS).
         ///
-        /// CAMBIO RESPECTO A v8.3:
-        ///   Antes publicaba TTSRequestEvent en EventBus, lo que causaba que
-        ///   OnTTSRequest() lo capturara y enviara tts_request a Flutter de nuevo.
-        ///   Flutter ya había enviado el texto → se escuchaba DOS VECES.
+        /// Envía tts_request DIRECTAMENTE a Flutter via Reply(),
+        /// sin pasar por EventBus. Evita el loop de repetición que
+        /// existía en v8.3 (EventBus → OnTTSRequest → Reply → 2 veces).
         ///
-        ///   Ahora envía tts_request DIRECTAMENTE a Flutter via Reply(),
-        ///   sin pasar por EventBus. Evita el loop y el mensaje se escucha
-        ///   una sola vez.
-        ///
-        /// Restricciones de prioridad aplicadas:
+        /// Restricciones de prioridad:
         ///   • priority clamp: 0-2 (p=3 reservado para urgencias de Unity)
         ///   • throttle: mínimo _ttsRequestThrottle segundos entre llamadas
         ///   • interrupt=true solo si priority=2 Y el caller lo pidió
@@ -312,10 +314,6 @@ namespace IndoorNavAR.Integration
 
             _lastArbitraryTTSTime = Time.unscaledTime;
 
-            // ✅ v8.4 FIX: Reply() directo sin EventBus.
-            // En v8.3 se usaba EventBus.Publish(TTSRequestEvent) lo que
-            // disparaba OnTTSRequest() que enviaba tts_request a Flutter.
-            // Sumado al canal directo de Flutter = mensaje 2 veces.
             _ttsSb.Clear();
             _ttsSb.Append("{\"action\":\"tts_request\",\"text\":\"");
             _ttsSb.Append(EscapeJson(text));
@@ -330,6 +328,41 @@ namespace IndoorNavAR.Integration
             if (_logTTSSync)
                 Debug.Log($"[VoiceAPI] 💬 tts_speak directo (COMPAS): " +
                           $"p={clampedPriority} interrupt={clampedInterrupt} \"{text}\"");
+        }
+
+        #endregion
+
+        // =====================================================================
+        //  ✅ v8.5 NUEVO — Envío de frames de cámara a Flutter
+        // =====================================================================
+
+        #region Frame sender (v8.5)
+
+        /// <summary>
+        /// ✅ v8.5 — Envía un frame de cámara AR a Flutter para segmentación.
+        ///
+        /// Llamado por CameraFrameSender.cs a ~10 fps con un JSON pre-serializado:
+        ///   { "action": "frame_data", "data": "<base64 JPEG>", "w": 224, "h": 224 }
+        ///
+        /// Flutter intercepta action="frame_data" en UnityBridgeService ANTES
+        /// de pasarlo a onResponse — no contamina el canal de comandos existente.
+        ///
+        /// DISEÑO:
+        ///   • Sin log por defecto (_logFrames) — 10 mensajes/s saturan la consola.
+        ///   • Sin throttle propio — CameraFrameSender ya lo gestiona.
+        ///   • Sin EventBus — envío directo via Reply() (igual que SpeakArbitraryText).
+        ///   • frameJson ya está serializado por CameraFrameSender para evitar
+        ///     asignaciones extra de StringBuilder en el hot path.
+        /// </summary>
+        public void SendFrameToFlutter(string frameJson)
+        {
+            if (string.IsNullOrEmpty(frameJson)) return;
+
+            // Envío directo sin log en el hot path
+            SendUnityMessageToFlutter(_flutterGameObject, _responseMethod, frameJson);
+
+            if (_logFrames)
+                Debug.Log($"[VoiceAPI] 📸 frame_data → Flutter ({frameJson.Length} chars)");
         }
 
         #endregion
@@ -738,6 +771,9 @@ namespace IndoorNavAR.Integration
         [ContextMenu("Test: COMPAS tts_speak (p=1)")]
         private void DbgCompasSpeak()
             => SpeakArbitraryText("Claro, ¿en qué puedo ayudarte?", 1, false);
+
+        [ContextMenu("Test: Frame sender — log toggle")]
+        private void DbgToggleFrameLog() => _logFrames = !_logFrames;
 
         #endregion
     }
