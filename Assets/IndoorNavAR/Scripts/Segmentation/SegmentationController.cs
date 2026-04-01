@@ -1,27 +1,29 @@
 // File: SegmentationController.cs
-// ✅ v9.1 — FIX #4: EvaluateAlerts() suprimido cuando ObstacleRerouteMediator está activo
+// ✅ v9.2 — Push automático de segmentation_ratio a Flutter + SetOverlayVisible público
 //
 // ============================================================================
-//  CAMBIOS v9 → v9.1
+//  CAMBIOS v9.1 → v9.2
 // ============================================================================
 //
-//  FIX #4 — Doble TTS de obstáculo eliminado
-//    Cuando ObstacleRerouteMediator.IsActive == true (hay navegación activa),
-//    EvaluateAlerts() retorna inmediatamente sin generar TTS propio.
+//  FIX #5 — Push automático de ratios a Flutter (barras del panel)
+//    PROBLEMA: Las barras de segmentación en Flutter nunca se actualizaban
+//    porque el flujo era PULL (Flutter pide → Unity responde). Nadie en
+//    Flutter pedía "segmentation_ratio" periódicamente, así que el callback
+//    onSegmentationRatioReceived nunca se disparaba.
 //
-//    RAZÓN: El VoiceGuide ya maneja el aviso de obstáculo con prioridad 3
-//    (interrupt=true) y cooldown de 60s via OnObstacleDetected(). Permitir
-//    que SegmentationController también hable con p=2 y cooldown de 3.5s
-//    causa que el usuario escuche dos mensajes casi simultáneos, el segundo
-//    cortando al primero.
+//    SOLUCIÓN: Cuando resultReady == true (inferencia completada), llamar
+//    directamente a VoiceCommandAPI.Instance?.SendSegmentationRatio()
+//    con los tres ratios (obstacle, floor, wall). Esto es un PUSH automático
+//    a la misma frecuencia que ocurre la inferencia (~cada 18 frames).
 //
-//    COMPORTAMIENTO RESULTANTE:
-//      - Con navegación activa: Solo NavigationVoiceGuide habla ("Obstáculo
-//        detectado. Buscando ruta alternativa.", p=3, interrupt=true).
-//      - Sin navegación activa: SegmentationController habla normalmente
-//        ("Obstáculo detectado al frente", p=2) — útil como alerta standalone.
+//  NUEVO — OverlayVisible + SetOverlayVisible(bool)
+//    FlutterUnityBridge necesita poder activar/desactivar la máscara de
+//    segmentación desde el botón "Mask" del panel de Flutter.
+//    Se expone la propiedad pública OverlayVisible y el método
+//    SetOverlayVisible(bool visible) para que FlutterUnityBridge lo llame
+//    via case "toggle_seg_mask".
 //
-//  TODOS LOS CAMBIOS DE v9 SE CONSERVAN ÍNTEGRAMENTE.
+//  TODOS LOS CAMBIOS DE v9.1 SE CONSERVAN ÍNTEGRAMENTE.
 
 using System;
 using System.Collections;
@@ -32,7 +34,7 @@ using UnityEngine.XR.ARSubsystems;
 using Unity.Collections;
 using Unity.Sentis;
 using IndoorNavAR.Integration;
-using IndoorNavAR.Navigation; // ✅ FIX #4: para acceder a ObstacleRerouteMediator.IsActive
+using IndoorNavAR.Navigation; // para ObstacleRerouteMediator.IsActive
 
 namespace IndoorNavAR.Segmentation
 {
@@ -103,6 +105,10 @@ namespace IndoorNavAR.Segmentation
         private int     _totalFramesReceived = 0;
         private Camera  _arCamera;
 
+        // ✅ v9.2 — Propiedad pública para que FlutterUnityBridge pueda
+        // leer el estado actual del overlay antes de togglearlo.
+        public bool OverlayVisible => _showOverlay;
+
         // ─────────────────────────────────────────────────────────────────
 
         private void Start()
@@ -163,7 +169,7 @@ namespace IndoorNavAR.Segmentation
 
             StartCoroutine(DiagnoseARFrames());
 
-            Debug.Log($"[SegCtrl] ✅ v9.1 inicializado. rotation={_tensorRotation}° " +
+            Debug.Log($"[SegCtrl] ✅ v9.2 inicializado. rotation={_tensorRotation}° " +
                       $"flipY={_flipInputY} flipX={_flipInputX} " +
                       $"MODEL_SIZE={MODEL_SIZE} ROI={_roiTopSkip:P0}");
         }
@@ -332,9 +338,20 @@ namespace IndoorNavAR.Segmentation
                 _overlayRenderer?.UpdateMask(_worker.MaskData);
                 EvaluateAlerts();
 
+                // ✅ v9.2 FIX #5 — Push automático de ratios a Flutter.
+                // Se llama en cada inferencia completada (~cada 18 frames).
+                // VoiceCommandAPI construye el JSON y llama Reply() internamente,
+                // por lo que no hay acceso a métodos privados desde aquí.
+                VoiceCommandAPI.Instance?.SendSegmentationRatio(
+                    _worker.ObstacleRatio,
+                    _worker.FloorRatio,
+                    _worker.WallRatio
+                );
+
                 if (_logStats)
                     Debug.Log($"[SegCtrl] 🎯 Obstacle={_worker.ObstacleRatio:P1} " +
-                              $"Floor={_worker.FloorRatio:P1} interval={_currentInterval}f");
+                              $"Floor={_worker.FloorRatio:P1} Wall={_worker.WallRatio:P1} " +
+                              $"interval={_currentInterval}f");
             }
         }
 
@@ -382,8 +399,7 @@ namespace IndoorNavAR.Segmentation
 
         private void EvaluateAlerts()
         {
-            // ✅ FIX #4: Si el mediador está activo, él maneja el TTS de obstáculo
-            //   con prioridad 3 + interrupt. No generar alerta duplicada aquí.
+            // FIX #4 (v9.1): Si el mediador está activo, él maneja el TTS de obstáculo.
             if (ObstacleRerouteMediator.IsActive)
             {
                 if (_logStats)
@@ -401,6 +417,19 @@ namespace IndoorNavAR.Segmentation
 
             VoiceCommandAPI.Instance?.SpeakArbitraryText(msg, priority: 2, interrupt: false);
             Debug.Log($"[SegCtrl] 🚧 Alerta standalone: {msg} ({_worker.ObstacleRatio:P1})");
+        }
+
+        // ── Toggle overlay (v9.2) — llamado por FlutterUnityBridge ────────
+
+        /// <summary>
+        /// ✅ v9.2 — Activa o desactiva la máscara de segmentación visual.
+        /// Llamado por FlutterUnityBridge case "toggle_seg_mask".
+        /// </summary>
+        public void SetOverlayVisible(bool visible)
+        {
+            _showOverlay = visible;
+            _overlayRenderer?.SetVisible(visible);
+            Debug.Log($"[SegCtrl] 🎭 Overlay → {(visible ? "VISIBLE" : "OCULTO")}");
         }
 
         // ── Debug ─────────────────────────────────────────────────────────
@@ -429,16 +458,21 @@ namespace IndoorNavAR.Segmentation
                                      Debug.Log("[SegCtrl] FlipX=OFF"); }
 
         [ContextMenu("Toggle Overlay")]
-        private void DbgToggleOverlay() { _showOverlay = !_showOverlay; _overlayRenderer?.SetVisible(_showOverlay); }
+        private void DbgToggleOverlay()
+        {
+            SetOverlayVisible(!_showOverlay); // ✅ v9.2: usa el método público
+        }
 
         [ContextMenu("Log Stats")]
         private void DbgStats()
         {
             Debug.Log($"[SegCtrl] Obstacle={_worker?.ObstacleRatio:P1} Floor={_worker?.FloorRatio:P1} " +
+                      $"Wall={_worker?.WallRatio:P1} " +
                       $"Busy={_worker?.IsBusy} Frames={_totalFramesReceived} Rot={_tensorRotation}° " +
                       $"FlipY={_flipInputY} FlipX={_flipInputX} Interval={_currentInterval}f " +
                       $"MODEL_SIZE={MODEL_SIZE} CPU={_cpuFallbackActive} " +
-                      $"MediatorActive={ObstacleRerouteMediator.IsActive}"); // ✅ FIX #4: visible en debug
+                      $"Overlay={_showOverlay} " +
+                      $"MediatorActive={ObstacleRerouteMediator.IsActive}");
         }
 
         public void SetROITopSkip(float ratio)

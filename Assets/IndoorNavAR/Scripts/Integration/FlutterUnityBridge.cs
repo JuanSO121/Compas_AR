@@ -1,31 +1,29 @@
 // File: FlutterUnityBridge.cs
 // Carpeta: Assets/IndoorNavAR/Scripts/Integration/
-// ✅ v4.1 — Fix errores de compilación en case "segmentation_ratio"
+// ✅ v4.2 — Añade case "toggle_seg_mask" para botón Mask del panel Flutter
 //
 // ════════════════════════════════════════════════════════════════════════════
-// CAMBIOS v4 → v4.1
+// CAMBIOS v4.1 → v4.2
 // ════════════════════════════════════════════════════════════════════════════
 //
-//  CORRECCIONES en case "segmentation_ratio":
+//  ÚNICO CAMBIO: nuevo case "toggle_seg_mask".
 //
-//  FIX 1 — CS0311: ObstacleSegmentationWorker no hereda de UnityEngine.Object
-//    ANTES: FindFirstObjectByType<ObstacleSegmentationWorker>()
-//    AHORA: ObstacleSegmentationWorker.Instance
-//    (el worker ya expone un singleton estático Instance)
+//  CONTEXTO:
+//    ArNavigationScreen v8.5 añade un botón "Mask" en el panel de testing
+//    que envía { "action": "toggle_seg_mask" } a Unity.
+//    SegmentationController.cs v9.2 expone el método público
+//    SetOverlayVisible(bool) y la propiedad OverlayVisible para que este
+//    case pueda leer el estado actual y alternarlo correctamente.
 //
-//  FIX 2 — CS0136: variable local 'json' colisiona con parámetro del método
-//    ANTES: string json = $"{{...}}"
-//    AHORA: string segJson = $"{{...}}"
+//  DISEÑO:
+//    FindFirstObjectByType<SegmentationController>() es correcto aquí porque
+//    SegmentationController SÍ hereda de MonoBehaviour (a diferencia de
+//    ObstacleSegmentationWorker que no hereda de UnityEngine.Object).
 //
-//  FIX 3 — CS0122: VoiceCommandAPI.Reply() es private
-//    ANTES: VoiceCommandAPI.Instance?.Reply(json)
-//    AHORA: VoiceCommandAPI.Instance?.SendSegmentationRatio(obstacle, floor)
-//    Se añade el método público SendSegmentationRatio() en VoiceCommandAPI
-//    (ver VoiceCommandAPI.cs v8.6).
-//
-//  TODOS LOS COMPORTAMIENTOS DE v4 SE CONSERVAN ÍNTEGRAMENTE.
+//  TODOS LOS COMPORTAMIENTOS DE v4.1 SE CONSERVAN ÍNTEGRAMENTE.
 
 using UnityEngine;
+using IndoorNavAR.Segmentation;
 
 namespace IndoorNavAR.Integration
 {
@@ -49,13 +47,16 @@ namespace IndoorNavAR.Integration
         //  TTS canal de vuelta (v3):
         //  { "action": "tts_status", "isSpeaking": false, "priority": 0 }
         //
-        //  ✅ v4 NUEVOS — Control de guía de voz desde Flutter:
+        //  v4 — Control de guía de voz desde Flutter:
         //  { "action": "repeat_instruction" }
         //  { "action": "stop_voice" }
         //  { "action": "voice_status" }
         //  { "action": "tts_speak", "text": "...", "priority": 1, "interrupt": false }
         //  { "action": "reroute_obstacle" }
         //  { "action": "segmentation_ratio" }
+        //
+        //  ✅ v4.2 NUEVO:
+        //  { "action": "toggle_seg_mask" }
 
         [System.Serializable]
         private class Cmd
@@ -111,9 +112,6 @@ namespace IndoorNavAR.Integration
 
                 // ── Control de guía de voz (v4) ────────────────────────────────
 
-                // Repite la última instrucción. Diseñado para el comando
-                // de voz "repetir" / "¿qué dijiste?" del usuario.
-                // COMPAS classifier → label=REPEAT → action="repeat_instruction"
                 case "repeat_instruction":
                     var guide = IndoorNavAR.Navigation.Voice.NavigationVoiceGuide.Instance;
                     if (guide != null)
@@ -122,9 +120,6 @@ namespace IndoorNavAR.Integration
                         Debug.LogWarning("[Bridge] repeat_instruction: NavigationVoiceGuide no disponible.");
                     break;
 
-                // Detiene la guía de voz sin cancelar la navegación física.
-                // Útil si el usuario quiere silencio temporal.
-                // COMPAS classifier → label=STOP con intent=voice_only → action="stop_voice"
                 case "stop_voice":
                     var guideStop = IndoorNavAR.Navigation.Voice.NavigationVoiceGuide.Instance;
                     if (guideStop != null)
@@ -133,17 +128,10 @@ namespace IndoorNavAR.Integration
                         Debug.LogWarning("[Bridge] stop_voice: NavigationVoiceGuide no disponible.");
                     break;
 
-                // Solicita el estado de la guía de voz. La respuesta se envía
-                // de vuelta a Flutter via VoiceCommandAPI.Reply().
-                // COMPAS classifier → label=STATUS → action="voice_status"
                 case "voice_status":
                     api.GetVoiceStatus();
                     break;
 
-                // Habla texto libre generado por Flutter (respuesta COMPAS).
-                // Permite que el clasificador conversacional envíe mensajes
-                // empáticos sin pasar por el bus de eventos de Unity.
-                // COMPAS classifier → label=HELP/conversacional → action="tts_speak"
                 case "tts_speak":
                     if (!string.IsNullOrWhiteSpace(cmd.text))
                         api.SpeakArbitraryText(cmd.text, cmd.priority, cmd.interrupt);
@@ -151,7 +139,6 @@ namespace IndoorNavAR.Integration
                         Debug.LogWarning("[Bridge] tts_speak: campo 'text' vacío.");
                     break;
 
-                // Simula un obstáculo desde Flutter para forzar recálculo de ruta.
                 case "reroute_obstacle":
                     var mediator = FindFirstObjectByType<IndoorNavAR.Navigation.ObstacleRerouteMediator>();
                     if (mediator != null)
@@ -160,30 +147,38 @@ namespace IndoorNavAR.Integration
                         Debug.LogWarning("[Bridge] reroute_obstacle: ObstacleRerouteMediator no disponible.");
                     break;
 
-                // ── Segmentación (v4.1 FIX) ───────────────────────────────────
+                // ── Segmentación — consulta puntual (v4.1) ────────────────────
                 //
-                // FIX 1: ObstacleSegmentationWorker no hereda de UnityEngine.Object,
-                //        por lo que FindFirstObjectByType<T> no compila.
-                //        Usamos el singleton estático Instance que ya expone el worker.
-                //
-                // FIX 2: renombramos la variable local de 'json' a 'segJson'
-                //        para evitar la colisión con el parámetro del método.
-                //
-                // FIX 3: Reply() es private en VoiceCommandAPI. Se delega al
-                //        nuevo método público SendSegmentationRatio() (v8.6).
+                // Nota: desde v9.2 el push es automático desde SegmentationController.
+                // Este case mantiene compatibilidad para consultas manuales.
                 case "segmentation_ratio":
                 {
                     var worker = IndoorNavAR.Segmentation.ObstacleSegmentationWorker.Instance;
                     if (worker != null)
-                    {
-                        // FIX 3: delegamos al método público — VoiceCommandAPI
-                        //        construye el JSON internamente y llama Reply().
                         api.SendSegmentationRatio(worker.ObstacleRatio, worker.FloorRatio);
+                    else
+                        Debug.LogWarning("[Bridge] segmentation_ratio: ObstacleSegmentationWorker.Instance es null.");
+                    break;
+                }
+
+                // ── Toggle máscara de segmentación (v4.2) ─────────────────────
+                //
+                // Flutter envía { "action": "toggle_seg_mask" } cuando el usuario
+                // pulsa el botón "Mask" / "Sin máscara" del panel de testing.
+                // SegmentationController hereda de MonoBehaviour → FindFirstObjectByType es válido.
+                // Se lee OverlayVisible para alternar el estado actual.
+                case "toggle_seg_mask":
+                {
+                    var segCtrl = FindFirstObjectByType<SegmentationController>();
+                    if (segCtrl != null)
+                    {
+                        bool newState = !segCtrl.OverlayVisible;
+                        segCtrl.SetOverlayVisible(newState);
+                        Debug.Log($"[Bridge] toggle_seg_mask → overlay={newState}");
                     }
                     else
                     {
-                        Debug.LogWarning("[Bridge] segmentation_ratio: ObstacleSegmentationWorker.Instance es null. " +
-                                         "¿SegmentationController ya inicializó el worker?");
+                        Debug.LogWarning("[Bridge] toggle_seg_mask: SegmentationController no encontrado.");
                     }
                     break;
                 }

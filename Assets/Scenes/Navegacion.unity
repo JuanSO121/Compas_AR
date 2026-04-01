@@ -172,7 +172,7 @@ MonoBehaviour:
     m_PersistentCalls:
       m_Calls: []
   m_PlanePrefab: {fileID: 8676529844797969459, guid: 7970d03a6c969e842aa480fed25d7f44, type: 3}
-  m_DetectionMode: -1
+  m_DetectionMode: 2
 --- !u!114 &2694461
 MonoBehaviour:
   m_ObjectHideFlags: 0
@@ -462,7 +462,7 @@ MonoBehaviour:
   _waypointManager: {fileID: 186852594}
   _modelLoadManager: {fileID: 1492072617}
   _navMeshGenerator: {fileID: 976973327}
-  _logOperations: 1
+  _logOperations: 0
 --- !u!114 &626949938 stripped
 MonoBehaviour:
   m_CorrespondingSourceObject: {fileID: 8311457197044558507, guid: d0f916b92dcfab540a9ea711aba44a9b, type: 3}
@@ -902,9 +902,9 @@ MonoBehaviour:
   _voxelSize: 0.06
   _minRegionArea: 1
   _agentTypeID: 0
-  _showDebugVisualization: 1
-  _logDetailedAnalysis: 1
-  _enableRuntimeDiagnostics: 1
+  _showDebugVisualization: 0
+  _logDetailedAnalysis: 0
+  _enableRuntimeDiagnostics: 0
   _renderOnlyMode: 1
 --- !u!1 &999373694
 GameObject:
@@ -950,7 +950,7 @@ MonoBehaviour:
   m_Script: {fileID: 11500000, guid: 5e428cc1defb70549acd3cc444f140fa, type: 3}
   m_Name: 
   m_EditorClassIdentifier: Assembly-CSharp::IndoorNavAR.AR.ARCapabilityDetector
-  _planeManager: {fileID: 0}
+  _planeManager: {fileID: 2694460}
   _verbose: 1
   _forceLevel: -1
   _sessionStartTimeout: 8
@@ -1012,7 +1012,7 @@ MonoBehaviour:
   _navMeshCoordinator: {fileID: 837302032}
   _autoInitialize: 1
   _autoLoadModel: 1
-  _logDetailedEvents: 1
+  _logDetailedEvents: 0
 --- !u!195 &1001452946
 NavMeshAgent:
   m_ObjectHideFlags: 0
@@ -1061,7 +1061,7 @@ MonoBehaviour:
   _searchRadius: 1.5
   _delayFrames: 3
   _waypointManager: {fileID: 186852594}
-  _logSeeding: 1
+  _logSeeding: 0
 --- !u!1 &1107925286
 GameObject:
   m_ObjectHideFlags: 0
@@ -1213,7 +1213,7 @@ MonoBehaviour:
   m_PrefabInstance: {fileID: 0}
   m_PrefabAsset: {fileID: 0}
   m_GameObject: {fileID: 1113019003}
-  m_Enabled: 1
+  m_Enabled: 0
   m_EditorHideFlags: 0
   m_Script: {fileID: 11500000, guid: 3e2a0dff5c9a4154f878ef3fb97e3d7c, type: 3}
   m_Name: 
@@ -1579,192 +1579,6 @@ MonoBehaviour:
   m_Script: {fileID: 11500000, guid: 405175fd853267c48906c65c579cf208, type: 3}
   m_Name: 
   m_EditorClassIdentifier: Assembly-CSharp::IndoorNavAR.Diagnostics.SegmentationDiagnostic
-  _rawCameraView: {fileID: 1767928041}
-  _showDiagnosticUI: 1
-  _controller: {fileID: 0}
-  _overlay: {fileID: 0}
-  _btnStyle:
-    m_Name: 
-    m_Normal: {m_Background: {fileID: 0}, m_ScaledBackgrounds: []
-, m_TextColor:
-        r: 0
-        g: 0
-        b: 0
-        a: 1
-}
-    m_Hover: {m_Background: {fileID: 0}, m_ScaledBackgrounds: []
-, m_TextColor:
-        r: 0
-        g: 0
-        b: 0
-        a: 1
-}
-    m_Active: {m_Background: {fileID: 0}, m_ScaledBackgrounds: []
-, m_TextColor:
-        r: 0
-        g: 0
-        b: 0
-        a: 1
-}
-    m_Focused: {m_Background: {fileID: 0}, m_ScaledBackgrounds: []
-, m_TextColor:
-        r: 0
-        g: 0
-        b: 0
-        a: 1
-}
-    m_OnNormal: {m_Background: {fileID: 0}, m_ScaledBackgrounds: []
-, m_TextColor:
-        r: 0
-        g: 0
-        b: 0
-        a: 1
-}
-    m_OnHover: {m_Background: {fileID: 0}, m_ScaledBackgrounds: []
-, m_TextColor:
-        r: 0
-        g: 0
-        b: 0
-        a: 1
-}
-    m_OnActive: {m_Background: {fileID: 0}, m_ScaledBackgrounds: []
-, m_TextColor:
-        r: 0
-        g: 0
-        b: 0
-        a: 1
-}
-    m_OnFocused: {m_Background: {fileID: 0}, m_ScaledBackgrounds: []
-, m_TextColor:
-        r: 0
-        g: 0
-        b: 0
-        a: 1
-}
-    m_Border:
-      m_Left: 0
-      m_Right: 0
-      m_Top: 0
-      m_Bottom: 0
-    m_Margin:
-      m_Left: 0
-      m_Right: 0
-      m_Top: 0
-      m_Bottom: 0
-    m_Padding:
-      m_Left: 0
-      m_Right: 0
-      m_Top: 0
-      m_Bottom: 0
-    m_Overflow:
-      m_Left: 0
-      m_Right: 0
-      m_Top: 0
-      m_Bottom: 0
-    m_Font: {fileID: 0}
-    m_FontSize: 0
-    m_FontStyle: 0
-    m_Alignment: 0
-    m_WordWrap: 0
-    m_RichText: 1
-    m_TextClipping: 0
-    m_ImagePosition: 0
-    m_ContentOffset: {x: 0, y: 0}
-    m_FixedWidth: 0
-    m_FixedHeight: 0
-    m_StretchWidth: 1
-    m_StretchHeight: 0
-  _labelStyle:
-    m_Name: 
-    m_Normal: {m_Background: {fileID: 0}, m_ScaledBackgrounds: []
-, m_TextColor:
-        r: 0
-        g: 0
-        b: 0
-        a: 1
-}
-    m_Hover: {m_Background: {fileID: 0}, m_ScaledBackgrounds: []
-, m_TextColor:
-        r: 0
-        g: 0
-        b: 0
-        a: 1
-}
-    m_Active: {m_Background: {fileID: 0}, m_ScaledBackgrounds: []
-, m_TextColor:
-        r: 0
-        g: 0
-        b: 0
-        a: 1
-}
-    m_Focused: {m_Background: {fileID: 0}, m_ScaledBackgrounds: []
-, m_TextColor:
-        r: 0
-        g: 0
-        b: 0
-        a: 1
-}
-    m_OnNormal: {m_Background: {fileID: 0}, m_ScaledBackgrounds: []
-, m_TextColor:
-        r: 0
-        g: 0
-        b: 0
-        a: 1
-}
-    m_OnHover: {m_Background: {fileID: 0}, m_ScaledBackgrounds: []
-, m_TextColor:
-        r: 0
-        g: 0
-        b: 0
-        a: 1
-}
-    m_OnActive: {m_Background: {fileID: 0}, m_ScaledBackgrounds: []
-, m_TextColor:
-        r: 0
-        g: 0
-        b: 0
-        a: 1
-}
-    m_OnFocused: {m_Background: {fileID: 0}, m_ScaledBackgrounds: []
-, m_TextColor:
-        r: 0
-        g: 0
-        b: 0
-        a: 1
-}
-    m_Border:
-      m_Left: 0
-      m_Right: 0
-      m_Top: 0
-      m_Bottom: 0
-    m_Margin:
-      m_Left: 0
-      m_Right: 0
-      m_Top: 0
-      m_Bottom: 0
-    m_Padding:
-      m_Left: 0
-      m_Right: 0
-      m_Top: 0
-      m_Bottom: 0
-    m_Overflow:
-      m_Left: 0
-      m_Right: 0
-      m_Top: 0
-      m_Bottom: 0
-    m_Font: {fileID: 0}
-    m_FontSize: 0
-    m_FontStyle: 0
-    m_Alignment: 0
-    m_WordWrap: 0
-    m_RichText: 1
-    m_TextClipping: 0
-    m_ImagePosition: 0
-    m_ContentOffset: {x: 0, y: 0}
-    m_FixedWidth: 0
-    m_FixedHeight: 0
-    m_StretchWidth: 1
-    m_StretchHeight: 0
 --- !u!1 &1375737368
 GameObject:
   m_ObjectHideFlags: 0
