@@ -58,6 +58,21 @@ namespace IndoorNavAR.Navigation
         [SerializeField, Range(0.20f, 2f)]
         private float _destinationArrivalRadius = 0.50f;
 
+        [Header("─── Recálculo Autónomo (FullAR) ──────────────────────────────────")]
+        [SerializeField] private float _autoRerouteDeviationThreshold = 2.5f;
+        [SerializeField] private float _autoRerouteCooldown           = 8.0f;
+        [SerializeField] private float _stallCheckInterval            = 1.0f;
+        [SerializeField] private float _stallMinMovement              = 0.3f;
+        [SerializeField] private float _stallTimeout                  = 5.0f;
+
+        private float _lastAutoRerouteTime   = -999f;
+        private float _stallAccumTime        = 0f;
+        private float _stallCheckTimer       = 0f;
+        private Vector3 _stallRefPos         = Vector3.zero;
+        private bool  _stallRefInitialized   = false;
+        private UserPositionBridge _userBridge;  // ← inyectar en Start/Awake
+
+
         // ─── Inspector — Movimiento ───────────────────────────────────────────
 
         [Header("Movimiento")]
@@ -76,6 +91,8 @@ namespace IndoorNavAR.Navigation
         [SerializeField, Range(0.1f, 0.8f)]
         private float _minBrakingFactor = 0.3f;
 
+        [SerializeField] private float _stairHeightThreshold = 0.3f;
+
         // ─── Inspector — Escaleras ────────────────────────────────────────────
 
         [Header("Escaleras / Rampas")]
@@ -89,15 +106,6 @@ namespace IndoorNavAR.Navigation
         private float _stairWaypointRadius = 0.50f;
 
         // ─── Inspector — Anti-Stuck ───────────────────────────────────────────
-
-        [Header("Anti-Stuck")]
-        [Tooltip("Tiempo (s) sin movimiento antes de considerar atasco.")]
-        [SerializeField, Range(2f, 15f)]
-        private float _stallTimeoutSeconds = 4.0f;
-
-        [Tooltip("Desplazamiento mínimo por ciclo de stall check (m).")]
-        [SerializeField, Range(0.02f, 0.3f)]
-        private float _stallMinMovement = 0.08f;
 
         [Tooltip("Intentos de recálculo antes de declarar NavigationFailed.")]
         [SerializeField, Range(1, 5)]
@@ -237,12 +245,17 @@ namespace IndoorNavAR.Navigation
         {
             _agentReady = true;
             TrySetAgentStopped(true);
+
+            _userBridge = FindFirstObjectByType<UserPositionBridge>(FindObjectsInactive.Include);
+            EventBus.Instance?.Subscribe<RouteDeviatedEvent>(OnRouteDeviated);  // ✅ FIX P3
         }
 
         private void OnDestroy()
         {
+            EventBus.Instance?.Unsubscribe<RouteDeviatedEvent>(OnRouteDeviated);  // ✅ FIX P3
             EventBus.Instance?.Unsubscribe<NavMeshGeneratedEvent>(OnNavMeshRegenerated);
         }
+
 
         private void OnEnable()  { if (_agentReady && _isNavigating) TrySetAgentStopped(false); }
         private void OnDisable() { if (_agentReady && _isNavigating) TrySetAgentStopped(true);  }
@@ -254,6 +267,23 @@ namespace IndoorNavAR.Navigation
         }
 
         private void OnValidate() => SyncOptimizerParams();
+
+
+        private void OnRouteDeviated(RouteDeviatedEvent evt)
+        {
+            if (!IsNavigating) return;
+            if (Time.time - _lastAutoRerouteTime < _autoRerouteCooldown)
+            {
+                Debug.Log("[PathController] ⏳ Recálculo por desviación ignorado (cooldown activo).");
+                return;
+            }
+
+            _lastAutoRerouteTime = Time.time;
+            Debug.Log($"[PathController] 🔄 Recálculo por desviación {evt.DeviationDistance:F2}m → {evt.Destination:F2}");
+
+            NavigateTo(evt.Destination, forceRecalculate: true);
+        }
+
 
         // ─────────────────────────────────────────────────────────────────────
         //  API PÚBLICA
@@ -563,10 +593,12 @@ namespace IndoorNavAR.Navigation
             // Evita llamadas continuas a NavMesh.SamplePosition en cada frame.
             if (IsFullARMode)
             {
-                if (_continuousAgentSync)
-                    SyncAgentToUserPosition();
+                SyncAgentToUserPosition();
+                CheckDeviationInFullAR();    // ✅ FIX P3: nueva llamada
+                HandleStall(Time.deltaTime); // ✅ FIX P3: ahora también corre en FullAR
                 return;
             }
+
 
             // ── Modo NoAR: movimiento autónomo del agente ──────────────────────
 
@@ -581,18 +613,19 @@ namespace IndoorNavAR.Navigation
             }
 
             _stallTimer += Time.deltaTime;
-            if (_stallTimer >= _stallTimeoutSeconds)
+            if (_stallTimer >= _stallTimeout)
             {
                 float moved = Vector3.Distance(transform.position, _lastStallCheckPos);
                 if (moved < _stallMinMovement)
                 {
-                    HandleStall(finalDest);
+                    HandleStall(Time.deltaTime);   // ✅ ahora se pasa dt (float)
                     return;
                 }
                 _lastStallCheckPos = transform.position;
-                _stallTimer        = 0f;
-                _stallRetryCount   = 0;
+                _stallTimer = 0f;
+                _stallRetryCount = 0;
             }
+
 
             bool nextIsStair = IsStairSegment(waypoints, _currentWaypointIndex);
             _isOnStairs = nextIsStair;
@@ -620,6 +653,45 @@ namespace IndoorNavAR.Navigation
 
             MoveTowardsTarget(target, nextIsStair, finalDest);
         }
+
+        private void CheckDeviationInFullAR()
+        {
+            if (_currentPath == null || !_currentPath.IsValid) return;
+            if (Time.time - _lastAutoRerouteTime < _autoRerouteCooldown) return;
+
+            Vector3 userPos = _userBridge != null
+                ? _userBridge.UserPosition
+                : (Camera.main != null ? Camera.main.transform.position : transform.position);
+
+            float lateral = ComputeLateralDeviationXZ(userPos, _currentPath.Waypoints);
+            if (lateral < _autoRerouteDeviationThreshold) return;
+
+            _lastAutoRerouteTime = Time.time;
+            Debug.Log($"[PathController] ⚠️ FullAR: Desviación detectada {lateral:F2}m — recalculando.");
+            NavigateTo(_currentDestination, forceRecalculate: true);
+
+        }
+
+        private static float ComputeLateralDeviationXZ(
+            Vector3 pos, IReadOnlyList<Vector3> waypoints)
+        {
+            if (waypoints == null || waypoints.Count < 2) return 0f;
+            float min = float.MaxValue;
+            for (int i = 0; i < waypoints.Count - 1; i++)
+            {
+                Vector2 p  = new(pos.x, pos.z);
+                Vector2 a  = new(waypoints[i].x, waypoints[i].z);
+                Vector2 b  = new(waypoints[i + 1].x, waypoints[i + 1].z);
+                Vector2 ab = b - a;
+                float lenSq = ab.sqrMagnitude;
+                float t  = lenSq > 0.0001f
+                    ? Mathf.Clamp01(Vector2.Dot(p - a, ab) / lenSq) : 0f;
+                float d  = Vector2.Distance(p, a + t * ab);
+                if (d < min) min = d;
+            }
+            return min < float.MaxValue ? min : 0f;
+        }
+
 
         /// <summary>
         /// ✅ v5.1 FIX 2 — Sincroniza el agente virtual a la posición real del usuario.
@@ -730,67 +802,123 @@ namespace IndoorNavAR.Navigation
         //  ANTI-STALL (solo NoAR)
         // ─────────────────────────────────────────────────────────────────────
 
-        private void HandleStall(Vector3 finalDest)
+        private void HandleStall(float dt)
         {
-            _stallRetryCount++;
-            _stallTimer        = 0f;
-            _lastStallCheckPos = transform.position;
+            if (!IsNavigating || _currentPath == null) return;
 
-            if (_logVerbose)
-                Debug.LogWarning($"[PathController] ⚠️ Stall #{_stallRetryCount}/{_maxStallRetries}, " +
-                                 $"dist.destino={Vector3.Distance(transform.position, finalDest):F2}m");
+            _stallCheckTimer += dt;
+            if (_stallCheckTimer < _stallCheckInterval) return;
+            _stallCheckTimer = 0f;
 
-            if (_stallRetryCount > _maxStallRetries)
+            bool isFullAR = _userBridge != null && !_userBridge.IsNoArMode;
+            Vector3 checkPos = isFullAR ? _userBridge.UserPosition : transform.position;
+
+            if (!_stallRefInitialized)
             {
-                Debug.LogError($"[PathController] ❌ Destino inalcanzable tras {_maxStallRetries} intentos.");
-                StopNavigation();
-                OnPathFailed?.Invoke(NavMeshPathStatus.PathPartial);
+                _stallRefPos         = checkPos;
+                _stallRefInitialized = true;
+                _stallAccumTime      = 0f;
                 return;
             }
 
-            _optimizer.InvalidateCache();
-
-            // ✅ v5.1: En FullAR, GetRouteOriginForFullAR() warpea el agente
-            // a la posición actual del usuario antes de recalcular.
-            // Esto garantiza que el recálculo por stall parte desde donde
-            // el usuario está parado ahora, no desde donde estaba al inicio.
-            OptimizedPath newPath = _optimizer.ComputeOptimized(
-                GetRouteOriginForFullAR(),
-                _currentDestination);
-
-            if (!newPath.IsValid)
+            float moved = Vector3.Distance(checkPos, _stallRefPos);
+            if (moved >= _stallMinMovement)
             {
-                Debug.LogError("[PathController] ❌ Recálculo de emergencia inválido.");
-                StopNavigation();
-                OnPathFailed?.Invoke(NavMeshPathStatus.PathInvalid);
+                _stallRefPos    = checkPos;
+                _stallAccumTime = 0f;
                 return;
             }
 
-            _currentPath          = newPath;
-            _currentWaypointIndex = 1;
-            _confirmedMinIndex    = 1;
-            _currentSpeed         = 0f;
-            _smoothDampVel        = Vector3.zero;
-            _isOnStairs           = false;
+            _stallAccumTime += _stallCheckInterval;
 
-            if (_logVerbose)
-                Debug.Log($"[PathController] 🔄 Ruta recalculada: {newPath.Waypoints.Count} wp, " +
-                          $"clearance={newPath.MinClearance:F3}m");
+            if (_stallAccumTime >= _stallTimeout)
+            {
+                _stallAccumTime      = 0f;
+                _stallRefInitialized = false;
 
-            OnPathRecalculated?.Invoke(newPath);
+                if (Time.time - _lastAutoRerouteTime < _autoRerouteCooldown) return;
+
+                _lastAutoRerouteTime = Time.time;
+                Debug.Log($"[PathController] ⏱ Stall detectado en FullAR={isFullAR} pos={checkPos:F2} — recalculando.");
+                NavigateTo(_currentDestination, forceRecalculate: true);
+
+            }
         }
+
 
         // ─────────────────────────────────────────────────────────────────────
         //  HELPERS
         // ─────────────────────────────────────────────────────────────────────
 
+        private int   _lastPublishedFloor = 0;
+        private float _floorTransitionCooldown = 0f;
+
         private void AdvanceWaypoint(IReadOnlyList<Vector3> waypoints)
         {
-            OnWaypointReached?.Invoke(_currentWaypointIndex, waypoints[_currentWaypointIndex]);
+            if (_currentWaypointIndex >= waypoints.Count - 1)
+                return;
+
+            Vector3 currentWp = waypoints[_currentWaypointIndex];
+
+            OnWaypointReached?.Invoke(_currentWaypointIndex, currentWp);
+
             _currentWaypointIndex++;
             _confirmedMinIndex = _currentWaypointIndex;
+
+            Vector3 nextWp = waypoints[_currentWaypointIndex];
+
+            // ── DETECCIÓN TRANSICIÓN DE PISO ─────────────────────
+            float yDelta = Mathf.Abs(nextWp.y - currentWp.y);
+
+            if (yDelta >= _stairHeightThreshold)
+            {
+                _floorTransitionCooldown -= Time.deltaTime;
+
+                if (_floorTransitionCooldown <= 0f)
+                {
+                    int fromLevel = ResolveFloorForY(currentWp.y);
+                    int toLevel   = ResolveFloorForY(nextWp.y);
+
+                    if (fromLevel != toLevel && toLevel != _lastPublishedFloor)
+                    {
+                        _lastPublishedFloor      = toLevel;
+                        _floorTransitionCooldown = 2.0f;
+
+                        EventBus.Instance?.Publish(new FloorTransitionEvent
+                        {
+                            FromLevel     = fromLevel,
+                            ToLevel       = toLevel,
+                            AgentPosition = transform.position
+                        });
+
+                        Debug.Log($"[PathController] 🏢 FloorTransitionEvent: {fromLevel} → {toLevel}");
+                    }
+                }
+            }
+
             _stallTimer        = 0f;
             _lastStallCheckPos = transform.position;
+        }
+
+        private int ResolveFloorForY(float worldY)
+        {
+            var pts = NavigationStartPointManager.GetAllStartPoints();
+            if (pts == null || pts.Count == 0) return 0;
+
+            int bestLevel = 0;
+            float bestDist = float.MaxValue;
+
+            foreach (var pt in pts)
+            {
+                float d = Mathf.Abs(worldY - pt.FloorHeight);
+                if (d < bestDist)
+                {
+                    bestDist = d;
+                    bestLevel = pt.Level;
+                }
+            }
+
+            return bestLevel;
         }
 
         private void Arrive()

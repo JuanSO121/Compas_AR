@@ -249,6 +249,24 @@ namespace IndoorNavAR.Core.Events
         public Vector3 AgentPosition;
     }
 
+    public struct RouteDeviatedEvent
+    {
+        /// <summary>
+        /// Posición real del usuario en el momento de detectar desviación.
+        /// </summary>
+        public Vector3 UserPosition { get; set; }
+
+        /// <summary>
+        /// Distancia lateral al path en metros.
+        /// </summary>
+        public float DeviationDistance { get; set; }
+
+        /// <summary>
+        /// Destino al que recalcular (copiado del path activo).
+        /// </summary>
+        public Vector3 Destination { get; set; }
+    }
+
     public struct NavigationArrivedEvent
     {
         public string  WaypointName;

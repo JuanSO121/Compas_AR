@@ -53,7 +53,9 @@ namespace IndoorNavAR.Navigation.Voice
     {
         StartNavigation, GoStraight, TurnLeft, TurnRight,
         SlightLeft, SlightRight, UTurn,
-        StairsWarning, StairsClimb, StairsDescent, StairsComplete,
+        StairsWarning,
+        StairsSafetyWarning,   // ✅ FIX P2: nuevo — a ~2m, mensaje de seguridad
+        StairsClimb, StairsDescent, StairsComplete,
         Arrived, UserStopped, UserDeviated, ObstacleWarning,
         ProgressUpdate, ResumeAfterSeparation,
     }
@@ -66,16 +68,19 @@ namespace IndoorNavAR.Navigation.Voice
         public string InstructionText { get; }
         public bool HasFired { get; internal set; }
         public int CornerIndex { get; }
+        public int Floor { get; }
 
         public NavigationInstructionEvent(
             Vector3 worldPosition, VoiceInstructionType type,
-            float triggerDistance, string instructionText, int cornerIndex)
+            float triggerDistance, string instructionText, int cornerIndex,
+            int floor = 0)   // ← nuevo parámetro con default para compatibilidad
         {
-            WorldPosition = worldPosition;
-            Type = type;
+            WorldPosition  = worldPosition;
+            Type           = type;
             TriggerDistance = triggerDistance;
             InstructionText = instructionText;
-            CornerIndex = cornerIndex;
+            CornerIndex    = cornerIndex;
+            Floor          = floor;
         }
     }
 
@@ -309,11 +314,6 @@ namespace IndoorNavAR.Navigation.Voice
         {
             if (_nextIdx >= _events.Count) return;
 
-            // ✅ v6.3: _ttsBusy solo bloquea instrucciones de priority < 3.
-            // Las de priority 3 (ObstacleWarning, UTurn) siguen pasando.
-            // Esto permite que un obstáculo real interrumpa siempre,
-            // pero las escaleras (priority 2) esperan educadamente en cola.
-
             Vector3 evalPos = EvalPos;
             Vector3 userPos = UserPos;
 
@@ -322,7 +322,35 @@ namespace IndoorNavAR.Navigation.Voice
                 var evt = _events[i];
                 if (evt.HasFired) { _nextIdx = i + 1; continue; }
 
-                // Si TTS ocupado, solo dejamos pasar urgencias (p=3)
+                // ✅ FIX P1: saltar eventos generados para un piso distinto al actual.
+                // Excepción: StairsWarning / StairsSafetyWarning se generan en el piso
+                // de origen pero deben dispararse cuando el usuario sigue en ese piso,
+                // así que los permitimos siempre que el evento sea de un piso adyacente.
+                bool isStairTransitionEvent =
+                    evt.Type == VoiceInstructionType.StairsWarning    ||
+                    evt.Type == VoiceInstructionType.StairsSafetyWarning ||
+                    evt.Type == VoiceInstructionType.StairsClimb      ||
+                    evt.Type == VoiceInstructionType.StairsDescent     ||
+                    evt.Type == VoiceInstructionType.StairsComplete;
+
+                if (!isStairTransitionEvent && evt.Floor != _currentFloor)
+                {
+                    // El evento es de otro piso. Si el usuario ya lo superó en Y, marcarlo
+                    // como disparado para no bloquear el índice.
+                    float yDist = Mathf.Abs(UserPos.y - evt.WorldPosition.y);
+                    if (yDist > 1.5f)
+                    {
+                        evt.HasFired = true;
+                        _nextIdx = i + 1;
+                        if (_logInstructions)
+                            Debug.Log($"[VoiceGuide] ⏭ Evento [{evt.Type}] floor={evt.Floor} " +
+                                    $"saltado (usuario en floor={_currentFloor}).");
+                    }
+                    // Si no está superado en Y, simplemente no disparar y romper el loop
+                    else break;
+                    continue;
+                }
+
                 if (_ttsBusy && GetPriority(evt.Type) < 3) break;
 
                 Vector3 checkPos = evt.Type == VoiceInstructionType.Arrived ? userPos : evalPos;
@@ -331,9 +359,6 @@ namespace IndoorNavAR.Navigation.Voice
                 FireEvent(evt);
                 evt.HasFired = true;
                 _nextIdx = i + 1;
-                // Solo hacer return anticipado para prioridad >= 3
-                // Prioridad 2 (giros, escaleras) deja que el loop continúe
-                // para marcar eventos ya superados como fired.
                 if (GetPriority(evt.Type) >= 3) return;
             }
 
@@ -433,6 +458,14 @@ namespace IndoorNavAR.Navigation.Voice
                         ? "Te desviaste. Detente y gira hacia la ruta."
                         : "Te desviaste. Busca al guía.";
                     Speak(VoiceInstructionType.UserDeviated, msg, 2);
+
+                    // ✅ FIX P3: publicar evento para que PathController recalcule
+                    EventBus.Instance?.Publish(new RouteDeviatedEvent
+                    {
+                        UserPosition      = UserPos,
+                        DeviationDistance = lateral,
+                        Destination       = _destPos,
+                    });
                 }
             }
             else
@@ -441,6 +474,7 @@ namespace IndoorNavAR.Navigation.Voice
                 _deviationTimer = 0f;
             }
         }
+
 
         private float LateralDeviationFromRoute()
         {
@@ -553,16 +587,28 @@ namespace IndoorNavAR.Navigation.Voice
         {
             _currentFloor = e.ToLevel;
             _obstacleFired = false;
-            _isStopped = false;
+            _isStopped     = false;
             _stopAccumTime = 0f;
 
             ResetTypeCooldown(VoiceInstructionType.StairsWarning);
+            ResetTypeCooldown(VoiceInstructionType.StairsSafetyWarning);  // ✅ FIX P2
             ResetTypeCooldown(VoiceInstructionType.StairsClimb);
             ResetTypeCooldown(VoiceInstructionType.StairsDescent);
             ResetTypeCooldown(VoiceInstructionType.StairsComplete);
 
-            _misalignTimer = 0f;
+            _misalignTimer    = 0f;
             _lastMisalignTime = -999f;
+
+            // ✅ FIX P1: Regenerar instrucciones desde la posición actual del usuario
+            // para no heredar giros calculados con la geometría del piso anterior.
+            var currentPath = _pathController?.CurrentPath;
+            if (currentPath != null && currentPath.IsValid && currentPath.Waypoints.Count >= 2)
+            {
+                Debug.Log($"[VoiceGuide] 🔄 FloorTransition → Nivel {e.ToLevel}: " +
+                        "Resync de instrucciones.");
+                // Resync sin fullSummary: el VoiceGuide ya habrá dicho "Escaleras terminadas."
+                Resync(currentPath.Waypoints, fullSummary: false);
+            }
         }
 
         private void OnObstacleDetected(ObstacleDetectedEvent evt)
@@ -832,59 +878,90 @@ namespace IndoorNavAR.Navigation.Voice
             {
                 _events.Add(new NavigationInstructionEvent(
                     wp[0], VoiceInstructionType.StartNavigation, 0.5f,
-                    $"Listo, vamos a {_destName}.", 0));
+                    $"Listo, vamos a {_destName}.", 0,
+                    floor: ResolveFloorForY(wp[0].y)));  // ✅ FIX P1
             }
 
             for (int i = 1; i < count - 1; i++)
             {
-                Vector3 prev = wp[i - 1], current = wp[i], next = wp[i + 1];
-                float deltaY = next.y - current.y;
+                Vector3 prev    = wp[i - 1];
+                Vector3 current = wp[i];
+                Vector3 next    = wp[i + 1];
+                float   deltaY  = next.y - current.y;
+
+                // ✅ FIX P1: resolver nivel una sola vez por waypoint
+                int waypointFloor = ResolveFloorForY(current.y);
 
                 if (Mathf.Abs(deltaY) >= _stairHeightThreshold)
                 {
-                    // ✅ v6.3: mensajes de escaleras cortos y en cola (p=2, interrupt=false).
-                    // — StairsWarning: "Escaleras en X pasos." (sin texto extra)
-                    // — StairsClimb/Descent: una sola palabra + punto
-                    // — StairsComplete: frase corta
                     float pathDist = AccumDistAlongPath(wp, 0, i);
-                    int wSteps = Mathf.Max(1, Mathf.RoundToInt(pathDist / _stepLength));
+                    int   wSteps   = Mathf.Max(1, Mathf.RoundToInt(pathDist / _stepLength));
                     string warnText = wSteps > 5
                         ? $"Escaleras en {wSteps} pasos."
                         : "Escaleras cerca.";
-                    _events.Add(new NavigationInstructionEvent(current, VoiceInstructionType.StairsWarning,
-                        _stairTriggerDist, warnText, i));
 
-                    bool up = deltaY > 0f;
+                    _events.Add(new NavigationInstructionEvent(
+                        current, VoiceInstructionType.StairsWarning,
+                        _stairTriggerDist, warnText, i,
+                        floor: waypointFloor));  // ✅ FIX P1
+
+                    // ── FIX P2: StairsSafetyWarning (ver Problema 2) ─────────────
+                    const float safetyTriggerDist = 2.0f;
+                    bool   up          = deltaY > 0f;
+                    string safetyText  = up ? "Reduce el paso. Escaleras inmediatas, sube con cuidado."
+                                            : "Reduce el paso. Escaleras inmediatas, baja con cuidado.";
+                    _events.Add(new NavigationInstructionEvent(
+                        current, VoiceInstructionType.StairsSafetyWarning,
+                        safetyTriggerDist, safetyText, i,
+                        floor: waypointFloor));  // ✅ FIX P1 + P2
+
                     string actionText = up ? "Sube." : "Baja.";
-                    _events.Add(new NavigationInstructionEvent(current,
+                    _events.Add(new NavigationInstructionEvent(
+                        current,
                         up ? VoiceInstructionType.StairsClimb : VoiceInstructionType.StairsDescent,
-                        1.0f, actionText, i));
+                        1.0f, actionText, i,
+                        floor: waypointFloor));  // ✅ FIX P1
 
-                    _events.Add(new NavigationInstructionEvent(next, VoiceInstructionType.StairsComplete,
-                        0.8f, "Escaleras terminadas.", i));
+                    // El waypoint de StairsComplete es el de destino (next), ya en el nuevo piso
+                    int nextFloor = ResolveFloorForY(next.y);
+                    _events.Add(new NavigationInstructionEvent(
+                        next, VoiceInstructionType.StairsComplete,
+                        0.8f, "Escaleras terminadas.", i,
+                        floor: nextFloor));  // ✅ FIX P1 — piso destino
+
                     continue;
                 }
 
-                Vector3 dirIn = current - prev; dirIn.y = 0f;
-                Vector3 dirOut = next - current; dirOut.y = 0f;
+                Vector3 dirIn  = current - prev;  dirIn.y  = 0f;
+                Vector3 dirOut = next - current;  dirOut.y = 0f;
                 if (dirIn.sqrMagnitude < 0.001f || dirOut.sqrMagnitude < 0.001f) continue;
                 dirIn.Normalize(); dirOut.Normalize();
 
                 var (ttype, angle) = ClassifyTurnRelativeToUser(dirIn, dirOut, false);
                 if (ttype == VoiceInstructionType.GoStraight) continue;
 
-                int stepsToTurn = Mathf.Max(1, Mathf.RoundToInt(AccumDistAlongPath(wp, 0, i) / _stepLength));
-                string turnText = BuildTurnTextWithContext(ttype, angle, stepsToTurn, wp, i, dirIn, dirOut);
-                _events.Add(new NavigationInstructionEvent(current, ttype, TriggerDist(ttype), turnText, i));
+                int stepsToTurn = Mathf.Max(1,
+                    Mathf.RoundToInt(AccumDistAlongPath(wp, 0, i) / _stepLength));
+                string turnText = BuildTurnTextWithContext(
+                    ttype, angle, stepsToTurn, wp, i, dirIn, dirOut);
+
+                _events.Add(new NavigationInstructionEvent(
+                    current, ttype, TriggerDist(ttype), turnText, i,
+                    floor: waypointFloor));  // ✅ FIX P1
 
                 if (_logInstructions)
-                    Debug.Log($"[VoiceGuide] 📍 wp[{i}]: {ttype} {angle:F1}° pasos={stepsToTurn}");
+                    Debug.Log($"[VoiceGuide] 📍 wp[{i}] floor={waypointFloor}: " +
+                            $"{ttype} {angle:F1}° pasos={stepsToTurn}");
             }
 
-            _events.Add(new NavigationInstructionEvent(wp[count - 1], VoiceInstructionType.Arrived,
+            // Arrived siempre en el piso del destino
+            int destFloor = ResolveFloorForY(wp[count - 1].y);
+            _events.Add(new NavigationInstructionEvent(
+                wp[count - 1], VoiceInstructionType.Arrived,
                 _arrivalTriggerDist,
                 string.IsNullOrEmpty(_destName) ? "Llegaste." : $"Llegaste a {_destName}.",
-                count - 1));
+                count - 1,
+                floor: destFloor));  // ✅ FIX P1
         }
 
         // ─────────────────────────────────────────────────────────────────────
@@ -1081,8 +1158,9 @@ namespace IndoorNavAR.Navigation.Voice
 
         private static GuideAnnouncementType MapToAnnouncementType(VoiceInstructionType type) => type switch
         {
-            VoiceInstructionType.StairsWarning => GuideAnnouncementType.ApproachingStairs,
-            VoiceInstructionType.StairsClimb => GuideAnnouncementType.StartingClimb,
+            VoiceInstructionType.StairsWarning        => GuideAnnouncementType.ApproachingStairs,
+            VoiceInstructionType.StairsSafetyWarning  => GuideAnnouncementType.ApproachingStairs, 
+            VoiceInstructionType.StairsClimb          => GuideAnnouncementType.StartingClimb,
             VoiceInstructionType.StairsDescent => GuideAnnouncementType.StartingDescent,
             VoiceInstructionType.StairsComplete => GuideAnnouncementType.StairsComplete,
             VoiceInstructionType.ResumeAfterSeparation => GuideAnnouncementType.ResumeAfterSeparation,
@@ -1143,29 +1221,29 @@ namespace IndoorNavAR.Navigation.Voice
 
         private float TriggerDist(VoiceInstructionType t) => t switch
         {
-            VoiceInstructionType.UTurn => _turnTriggerDist * 1.5f,
-            VoiceInstructionType.SlightLeft => _turnTriggerDist * 0.7f,
-            VoiceInstructionType.SlightRight => _turnTriggerDist * 0.7f,
+            VoiceInstructionType.UTurn               => _turnTriggerDist * 1.5f,
+            VoiceInstructionType.SlightLeft          => _turnTriggerDist * 0.7f,
+            VoiceInstructionType.SlightRight         => _turnTriggerDist * 0.7f,
+            VoiceInstructionType.StairsSafetyWarning => 2.0f,   // ✅ FIX P2: siempre 2m
             _ => _turnTriggerDist,
         };
 
         private static int GetPriority(VoiceInstructionType t) => t switch
         {
-            // ✅ v6.3: ObstacleWarning y UTurn son los únicos con p=3 (interrupt=true).
-            //          Escaleras bajadas a p=2 — se encolan sin cortar.
-            VoiceInstructionType.ObstacleWarning => 3,
-            VoiceInstructionType.UTurn => 3,
-            VoiceInstructionType.TurnLeft => 2,
-            VoiceInstructionType.TurnRight => 2,
-            VoiceInstructionType.SlightLeft => 2,
-            VoiceInstructionType.SlightRight => 2,
-            VoiceInstructionType.UserDeviated => 2,
-            VoiceInstructionType.StairsWarning => 2,
-            VoiceInstructionType.StairsClimb => 2,
-            VoiceInstructionType.StairsDescent => 2,
-            VoiceInstructionType.StartNavigation => 1,
-            VoiceInstructionType.Arrived => 1,
-            VoiceInstructionType.StairsComplete => 1,
+            VoiceInstructionType.ObstacleWarning     => 3,
+            VoiceInstructionType.UTurn               => 3,
+            VoiceInstructionType.TurnLeft            => 2,
+            VoiceInstructionType.TurnRight           => 2,
+            VoiceInstructionType.SlightLeft          => 2,
+            VoiceInstructionType.SlightRight         => 2,
+            VoiceInstructionType.UserDeviated        => 2,
+            VoiceInstructionType.StairsWarning       => 2,
+            VoiceInstructionType.StairsSafetyWarning => 2,
+            VoiceInstructionType.StairsClimb         => 2,
+            VoiceInstructionType.StairsDescent       => 2,
+            VoiceInstructionType.StartNavigation     => 1,
+            VoiceInstructionType.Arrived             => 1,
+            VoiceInstructionType.StairsComplete      => 1,
             VoiceInstructionType.ResumeAfterSeparation => 1,
             _ => 0,
         };
@@ -1323,6 +1401,33 @@ namespace IndoorNavAR.Navigation.Voice
 
         private static Vector3 FlatFwd(Vector3 v) { v.y = 0f; return v.sqrMagnitude > 0.001f ? v.normalized : Vector3.forward; }
 
+        // ─── Helper: nivel de un waypoint por su Y ────────────────────────────────
+        // Añadir como método privado en NavigationVoiceGuide
+
+        /// <summary>
+        /// Devuelve el nivel (floor) más cercano al valor Y dado,
+        /// usando los StartPoints registrados en NavigationStartPointManager.
+        /// Si no hay StartPoints, retorna 0 (fallback seguro).
+        /// </summary>
+        private int ResolveFloorForY(float worldY)
+        {
+            var pts = NavigationStartPointManager.GetAllStartPoints();
+            if (pts == null || pts.Count == 0) return 0;
+
+            int   bestLevel = 0;
+            float bestDist  = float.MaxValue;
+
+            foreach (var pt in pts)
+            {
+                float dist = Mathf.Abs(worldY - pt.FloorHeight);
+                if (dist < bestDist)
+                {
+                    bestDist  = dist;
+                    bestLevel = pt.Level;
+                }
+            }
+            return bestLevel;
+        }
         // ─────────────────────────────────────────────────────────────────────
         //  GIZMOS
         // ─────────────────────────────────────────────────────────────────────

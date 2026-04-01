@@ -1,5 +1,6 @@
 // File: NavigationStartPoint.cs
 
+
 using System.Collections;
 using UnityEngine;
 using UnityEngine.AI;
