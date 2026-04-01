@@ -1,10 +1,24 @@
 // File: NavigationManager.cs
-// ✅ FIX #10 — FullAR: ForceSnapAgentToCamera() antes de calcular ruta.
+// ✅ FIX #11 — Añade RerouteToWaypoint() para ObstacleRerouteMediator
 //
 // ============================================================================
-//  PROBLEMA CORREGIDO (FIX #9 → FIX #10)
+//  CAMBIOS FIX #10 → FIX #11
 // ============================================================================
-
+//
+//  NUEVO MÉTODO: RerouteToWaypoint(WaypointData waypoint)
+//
+//    Diferencia vs NavigateToWaypoint():
+//      • NO llama NavigationVoiceGuide.TriggerFromWaypoint()
+//        → evita el doble TTS "Listo, vamos a X." en rerouteos mid-ruta
+//      • Pasa forceRecalculate=true internamente al NavigationAgent
+//        → NavigationPathController dispara OnPathRecalculated
+//        → NavigationVoiceGuide.Resync() genera "Ruta actualizada. N pasos."
+//      • SÍ llama ForceSnapAgentToCamera() en FullAR (igual que NavigateToWaypoint)
+//      • NO publica NavigationStartedEvent extra — el agente ya está navegando.
+//
+//    Llamado por: ObstacleRerouteMediator.RerouteAfterNavMeshUpdate()
+//
+//  TODOS LOS CAMBIOS DE FIX #10 SE CONSERVAN ÍNTEGRAMENTE.
 
 using System;
 using System.Threading.Tasks;
@@ -44,7 +58,6 @@ namespace IndoorNavAR.Core
         private AppMode _currentState = AppMode.Initialization;
         private bool    _isInitialized;
 
-        // Cache del PathController para SetFullARMode
         private NavigationPathController _pathController;
 
         #region Properties
@@ -97,7 +110,6 @@ namespace IndoorNavAR.Core
             _navMeshCoordinator       ??= FindFirstObjectByType<NavMeshAgentCoordinator>();
             _arOriginAligner          ??= FindFirstObjectByType<AROriginAligner>();
 
-            // Cache del PathController para SetFullARMode
             if (_navigationAgent != null)
                 _pathController = _navigationAgent.GetComponent<NavigationPathController>();
 
@@ -286,8 +298,7 @@ namespace IndoorNavAR.Core
                 }
                 else
                 {
-                    Debug.LogWarning("[NavManager] ⚠️ AROriginAligner no disponible — " +
-                                     "alineación de cámara omitida.");
+                    Debug.LogWarning("[NavManager] ⚠️ AROriginAligner no disponible.");
                 }
 
                 ChangeState(AppMode.Navigation);
@@ -357,20 +368,9 @@ namespace IndoorNavAR.Core
         #region Navigation
 
         /// <summary>
-        /// ✅ FIX #10 — En FullAR:
-        ///   0. (NUEVO) ForceSnapAgentToCamera() para warpear el agente a la posición
-        ///      de la cámara XR en este frame exacto. Elimina la race condition donde
-        ///      NavigationStartPoint Level 1 (autoTeleportOnStart=true) deja al agente
-        ///      en Y≈3.36 (piso 1) y AROriginAligner aún no lo corrigió, causando
-        ///      que PathController compute una ruta de 0m (agente ya está en el destino).
-        ///   1. Activa SetFullARMode(true) en PathController ANTES de navegar.
-        ///      Esto garantiza que FollowPath() no mueva el transform.
-        ///   2. NO llama TeleportTo(userPos) — AROriginAligner (+ ForceSnap) ya
-        ///      posicionó el agente en la posición del usuario.
-        ///   3. Llama NavigateToWaypoint() para calcular el path.
-        ///      PathController genera CurrentPath válido desde agentPos (= userPos).
-        ///   4. VoiceGuide evalúa la ruta y genera instrucciones TTS.
-        ///   5. El agente no se mueve — AROriginAligner sigue sincronizando.
+        /// Navegación completa desde cero.
+        /// Llama TriggerFromWaypoint() → VoiceGuide genera "Listo, vamos a X."
+        /// Usar para navegaciones nuevas iniciadas por el usuario.
         /// </summary>
         public bool NavigateToWaypoint(WaypointData waypoint)
         {
@@ -385,76 +385,40 @@ namespace IndoorNavAR.Core
 
             if (isFullAR)
             {
-                // ✅ FIX #10 — Paso 0 (NUEVO): Warp inmediato del agente a la cámara XR.
-                // CRÍTICO: debe hacerse ANTES de SetFullARMode y NavigateToWaypoint.
-                // Elimina la race condition donde el agente está en piso incorrecto
-                // porque NavigationStartPoint Level 1 lo teleportó ahí.
                 if (_arOriginAligner != null)
                 {
                     _arOriginAligner.ForceSnapAgentToCamera();
-                    Debug.Log("[NavManager] 📍 [FullAR] ForceSnapAgentToCamera() — " +
-                              "agente sincronizado con cámara XR antes de calcular ruta.");
-                }
-                else
-                {
-                    Debug.LogWarning("[NavManager] ⚠️ [FullAR] AROriginAligner no disponible. " +
-                                     "El agente puede estar en posición incorrecta. " +
-                                     "Verificar que AROriginAligner está en la escena.");
+                    Debug.Log("[NavManager] 📍 [FullAR] ForceSnapAgentToCamera().");
                 }
 
-                // ✅ FIX #9 — Paso 1: Activar modo FullAR en PathController.
-                // CRÍTICO: debe hacerse ANTES de NavigateToWaypoint() para que
-                // FollowPath() no mueva el transform cuando se active _isNavigating.
                 if (_pathController != null)
                 {
                     _pathController.SetFullARMode(true);
-                    Debug.Log("[NavManager] 📡 [FullAR] PathController.SetFullARMode(true) — " +
-                              "el agente no se moverá.");
-                }
-                else
-                {
-                    Debug.LogWarning("[NavManager] ⚠️ [FullAR] PathController no encontrado. " +
-                                     "El agente PODRÍA moverse. Verificar que VirtualAssistant " +
-                                     "tiene NavigationPathController.");
+                    Debug.Log("[NavManager] 📡 [FullAR] PathController.SetFullARMode(true).");
                 }
 
-                // ✅ FIX #9 — Paso 2: Navegar desde la posición actual del agente.
-                // ForceSnapAgentToCamera() garantizó que el agente está en la posición
-                // del usuario (cámara XR). La ruta se calculará correctamente.
                 Vector3 agentPos = _navigationAgent.transform.position;
                 Debug.Log($"[NavManager] 🧭 [FullAR] → {waypoint.WaypointName} | " +
-                          $"agentPos={agentPos:F2} | dest={waypoint.Position:F2} | " +
-                          $"dist={Vector3.Distance(agentPos, waypoint.Position):F2}m");
+                          $"agentPos={agentPos:F2} | dist={Vector3.Distance(agentPos, waypoint.Position):F2}m");
 
                 bool ok = _navigationAgent.NavigateToWaypoint(waypoint);
                 if (ok)
                 {
-                    Debug.Log($"[NavManager] ✅ [FullAR] Ruta calculada a '{waypoint.WaypointName}'. " +
-                              "Agente estático — VoiceGuide generará instrucciones.");
-                    // ✅ FIX #7 conservado
+                    Debug.Log($"[NavManager] ✅ [FullAR] Ruta calculada a '{waypoint.WaypointName}'.");
                     NavigationVoiceGuide.Instance?.TriggerFromWaypoint(waypoint);
                 }
                 else
                 {
-                    Debug.LogError($"[NavManager] ❌ [FullAR] Sin ruta a '{waypoint.WaypointName}' " +
-                                   $"desde {agentPos:F2}. " +
-                                   "¿El NavMesh cubre la posición del usuario? " +
-                                   "ForceSnapAgentToCamera ya intentó posicionar el agente. " +
-                                   "Verificar: (1) NavMesh bakeado cubre piso 0, " +
-                                   "(2) XR tracking estable, " +
-                                   "(3) AROriginAligner no está en deadlock de piso.");
+                    Debug.LogError($"[NavManager] ❌ [FullAR] Sin ruta a '{waypoint.WaypointName}'.");
                 }
                 return ok;
             }
 
-            // ── Modo NoAR: el agente navega físicamente (sin cambios) ──────────
-            // En NoAR, PathController.IsFullARMode es false → FollowPath() activo.
+            // NoAR
             if (_pathController != null && _pathController.IsFullARMode)
             {
-                // Seguridad: si por algún motivo quedó en FullAR, revertir.
                 _pathController.SetFullARMode(false);
-                Debug.Log("[NavManager] 📵 [NoAR] PathController.SetFullARMode(false) — " +
-                          "movimiento del agente habilitado.");
+                Debug.Log("[NavManager] 📵 [NoAR] PathController.SetFullARMode(false).");
             }
 
             bool okNoAR = _navigationAgent.NavigateToWaypoint(waypoint);
@@ -464,6 +428,47 @@ namespace IndoorNavAR.Core
                 NavigationVoiceGuide.Instance?.TriggerFromWaypoint(waypoint);
             }
             return okNoAR;
+        }
+
+        /// <summary>
+        /// ✅ FIX #11 — Recálculo silencioso de ruta para ObstacleRerouteMediator.
+        ///
+        /// DIFERENCIAS vs NavigateToWaypoint():
+        ///   • NO llama TriggerFromWaypoint() → evita "Listo, vamos a X." duplicado.
+        ///   • Pasa forceRecalculate=true → NavigationPathController dispara OnPathRecalculated
+        ///     → NavigationVoiceGuide.Resync() genera "Ruta actualizada. N pasos."
+        ///   • SÍ llama ForceSnapAgentToCamera() en FullAR (mismo que NavigateToWaypoint).
+        ///   • NO publica NavigationStartedEvent adicional.
+        ///
+        /// Llamado por: ObstacleRerouteMediator.RerouteAfterNavMeshUpdate()
+        /// </summary>
+        public bool RerouteToWaypoint(WaypointData waypoint)
+        {
+            if (waypoint == null) return false;
+            if (_navigationAgent == null)
+            {
+                Debug.LogError("[NavManager] ❌ [Reroute] NavigationAgent no disponible");
+                return false;
+            }
+
+            bool isFullAR = _arOriginAligner == null || _arOriginAligner.IsFullARMode;
+
+            if (isFullAR && _arOriginAligner != null)
+            {
+                _arOriginAligner.ForceSnapAgentToCamera();
+                Debug.Log("[NavManager] 📍 [Reroute/FullAR] ForceSnapAgentToCamera().");
+            }
+
+            // forceRecalculate=true → PathController invalida caché y dispara OnPathRecalculated
+            bool ok = _navigationAgent.NavigateToWaypointForced(waypoint);
+
+            if (ok)
+                Debug.Log($"[NavManager] 🔄 [Reroute] Ruta recalculada a '{waypoint.WaypointName}'. " +
+                          "VoiceGuide hará Resync via OnPathRecalculated.");
+            else
+                Debug.LogError($"[NavManager] ❌ [Reroute] Sin ruta a '{waypoint.WaypointName}'.");
+
+            return ok;
         }
 
         public void StopNavigation()
@@ -519,16 +524,11 @@ namespace IndoorNavAR.Core
         {
             bool isFullAR = _arOriginAligner == null || _arOriginAligner.IsFullARMode;
             Debug.Log($"[NavManager] Estado: {_currentState} | Init: {_isInitialized} | " +
-                      $"AR: {_arSessionManager?.IsSessionReady ?? false} | " +
                       $"Modo: {(isFullAR ? "FullAR" : "NoAR")} | " +
-                      $"Modelo: {_modelLoadManager?.CurrentModelName ?? "None"} | " +
                       $"Waypoints: {_waypointManager?.WaypointCount ?? 0}");
             if (_pathController != null)
                 Debug.Log($"[NavManager] PathController: IsFullARMode={_pathController.IsFullARMode} | " +
                           $"IsNavigating={_pathController.IsNavigating}");
-            if (_navigationAgent != null)
-                Debug.Log($"[NavManager] AgentPos: {_navigationAgent.transform.position:F2} | " +
-                          $"FullARMode: {_navigationAgent.IsFullARMode}");
         }
 
         [ContextMenu("📦 Load Model")]       private void DebugLoadModel()  => _ = LoadModelOnLargestPlane();

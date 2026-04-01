@@ -255,6 +255,15 @@ namespace IndoorNavAR.Core.Events
         public Vector3 Position;
     }
 
+    public struct ObstacleDetectedEvent
+    {
+        /// <summary>Posición mundial donde se colocó el obstáculo virtual.</summary>
+        public Vector3 ObstaclePosition;
+
+        /// <summary>Ratio de obstáculos detectado por el modelo ML (0..1).</summary>
+        public float DetectedRatio;
+    }
+
     // ── Guía NPC ─────────────────────────────────────────────────────────────
 
     /// <summary>

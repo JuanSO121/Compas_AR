@@ -1,59 +1,48 @@
 // File: NavigationPathController.cs
-// ✅ v5 — FIX: Correcciones preventivas sobre v4
+// ✅ v5.1 — FIX CRÍTICO FullAR: ruta calculada siempre desde posición real del usuario
 //
-// ============================================================================
-//  CAMBIOS v4 → v5
-// ============================================================================
+// ════════════════════════════════════════════════════════════════════════════
+// CAMBIOS v5 → v5.1
+// ════════════════════════════════════════════════════════════════════════════
 //
-//  FIX A — Bug de log en NavigateTo() (cosmético pero confuso):
-//    v4 leía transform.position DESPUÉS del warp para el mensaje "era X",
-//    por lo que siempre imprimía routeOrigin en lugar de la posición anterior.
-//    Se guarda _prevAgentPos antes del warp y se usa en el log.
+//  PROBLEMA:
+//    En FullAR, el agente virtual (transform.position) solo se sincronizaba
+//    a la posición del usuario UNA vez: al llamar NavigateTo() por primera vez.
+//    Después, el usuario se mueve físicamente pero el agente permanece fijo.
+//    Consecuencia:
+//      • Recálculos por obstáculo → ruta parte desde posición vieja del agente.
+//      • Recálculos por NavMesh regenerado → mismo problema.
+//      • HandleStall → recalcula desde donde el agente quedó parado.
+//      • VoiceGuide evalúa EvalPos = UserPos ✓ (correcto), pero el PathController
+//        usa transform.position para calcular la ruta ✗ (incorrecto).
+//    El usuario puede "perderse" porque la ruta no parte desde donde él está.
 //
-//  FIX B — Comparación Vector3 con != para el warp (frágil):
-//    v4 usaba `routeOrigin != transform.position` para decidir si hacer warp.
-//    Vector3.operator!= usa epsilon ~0.00001 — puede fallar con posiciones
-//    casi idénticas que difieren por floating point noise después de SamplePosition.
-//    Se reemplaza por `Vector3.Distance(...) > 0.01f` (umbral pragmático 1cm).
+//  FIX 1 — GetRouteOriginForFullAR() siempre sincroniza el agente:
+//    Antes de devolver el origen de la ruta, warpea el agente a esa posición.
+//    Esto garantiza que NavigateTo() y todos sus recálculos internos usen
+//    la posición actual del usuario, no la posición antigua del agente.
+//    Aplica a: NavigateTo(), HandleStall(), OnNavMeshRegenerated().
 //
-//  FIX C — GetRouteOriginForFullAR() con filtro de piso multi-nivel:
-//    v4 siempre buscaba NavMesh en `userPos.y - 2m`. Esto falla en el piso 1
-//    (Y≈3.48m): busca en Y≈1.48m y puede aterrizar en el NavMesh del piso 0.
-//    
-//    NUEVO ENFOQUE:
-//      1. Consulta NavigationStartPointManager para obtener la lista de pisos
-//         y sus FloorHeight conocidos.
-//      2. Identifica el piso más cercano al Y actual del usuario.
-//      3. Usa ese FloorHeight como Y de búsqueda en lugar de `userPos.y - 2m`.
-//      4. Fallback escalonado si StartPointManager no tiene datos.
+//  FIX 2 — FollowPath() actualiza continuamente el agente en FullAR:
+//    En FullAR, FollowPath() antes hacía "return" inmediatamente.
+//    Ahora también sincroniza transform.position al NavMesh más cercano
+//    a UserPosition cada frame. Esto mantiene el agente "pegado" al usuario
+//    real, lo que hace que RemainingDistance y CurrentTarget sean correctos
+//    en todo momento, incluso sin recálculo explícito.
 //
-//    Esto es resistente a edificios de N pisos sin hardcodear offsets de altura.
+//  FIX 3 — _agentSyncThreshold: evita warp por micromovimientos:
+//    Solo se warpea el agente si la distancia entre su posición actual y
+//    UserPosition es mayor que _agentSyncThreshold (default 0.15m).
+//    Evita llamadas excesivas a NavMesh.SamplePosition cada frame.
 //
-//  FIX D — Cache del optimizer se invalida cuando cambia el origen FullAR:
-//    v4 no invalidaba la caché del optimizer al hacer warp del agente.
-//    Si UserPosition cambia entre llamadas a NavigateTo() pero cae en la misma
-//    celda de hash (0.5m), se devuelve la ruta antigua desde el origen anterior.
-//    Se llama InvalidateCache() siempre en FullAR antes de ComputeOptimized().
-//
-//  FIX E — OnNavMeshRegenerated() recalcula ruta en FullAR también:
-//    v4 tenía `!IsFullARMode` como guardia, ignorando recálculos de NavMesh
-//    en modo AR. En FullAR la ruta debe recalcularse igual que en NoAR —
-//    la diferencia es solo que FollowPath() no mueve el transform.
-//
-//  FIX F — GetOrFindAROriginAligner() se busca cada 5s si no se encontró:
-//    v4 solo buscaba AROriginAligner una vez (_arOriginAlignerSearched=true).
-//    Si el objeto aún no existía en ese frame (race condition al arrancar),
-//    nunca se encontraba. Ahora reintenta cada 5s hasta encontrarlo.
-//
-// ============================================================================
-//  TODOS LOS FIXES DE v4 SE CONSERVAN ÍNTEGRAMENTE.
-// ============================================================================
+//  TODO LO DEMÁS ES IDÉNTICO A v5.
 
 using System;
 using System.Collections.Generic;
 using UnityEngine;
 using UnityEngine.AI;
 using IndoorNavAR.Core.Events;
+using IndoorNavAR.Core.Data;
 
 namespace IndoorNavAR.Navigation
 {
@@ -138,18 +127,29 @@ namespace IndoorNavAR.Navigation
         // ─── Inspector — FullAR ───────────────────────────────────────────────
 
         [Header("FullAR — Origen de ruta")]
-        [Tooltip("Radio máximo para buscar el NavMesh más cercano al usuario en FullAR.\n" +
-                 "La cámara XR está a ~1.6m de altura; el NavMesh está en el piso (~0m o ~3.48m).\n" +
-                 "Default 3m cubre la distancia vertical típica.")]
+        [Tooltip("Radio máximo para buscar el NavMesh más cercano al usuario en FullAR.")]
         [SerializeField, Range(1f, 5f)]
         private float _fullAROriginSnapRadius = 3.0f;
 
-        [Tooltip("✅ v5 FIX C: Tolerancia vertical (m) para el filtro de piso al buscar el origen.\n" +
-                 "Se usa SOLO si NavigationStartPointManager no tiene datos de piso.\n" +
-                 "Debe ser menor que la mitad de la separación entre pisos (~1.74m).\n" +
-                 "Default 1.2m.")]
+        [Tooltip("Tolerancia vertical (m) para el filtro de piso al buscar el origen.")]
         [SerializeField, Range(0.5f, 2f)]
         private float _fullAROriginFloorTolerance = 1.2f;
+
+        // ─── Inspector — FullAR sincronización continua (v5.1) ───────────────
+
+        [Header("FullAR — Sincronización continua del agente (v5.1)")]
+        [Tooltip("✅ v5.1 — Distancia mínima (m) entre la posición del agente y UserPosition\n" +
+                 "para que FollowPath() warpee el agente al NavMesh bajo el usuario.\n" +
+                 "Evita warp innecesario por micromovimientos del tracking ARCore.\n" +
+                 "Default 0.15m (15cm). Bajar si el usuario nota lag en la ruta.")]
+        [SerializeField, Range(0.05f, 0.5f)]
+        private float _agentSyncThreshold = 0.15f;
+
+        [Tooltip("✅ v5.1 — Si true, FollowPath() sincroniza el agente a UserPosition\n" +
+                 "cada frame en FullAR (con threshold). Si false, solo se sincroniza\n" +
+                 "al llamar NavigateTo(). Dejar true en producción.")]
+        [SerializeField]
+        private bool _continuousAgentSync = true;
 
         // ─── Inspector — Debug ────────────────────────────────────────────────
 
@@ -173,12 +173,7 @@ namespace IndoorNavAR.Navigation
 
         public bool          IsNavigating => _isNavigating;
         public OptimizedPath CurrentPath  => _currentPath;
-
-        /// <summary>
-        /// En FullAR, FollowPath() no mueve el transform.
-        /// El path se calcula y CurrentPath queda válido para VoiceGuide y ARGuideController.
-        /// </summary>
-        public bool IsFullARMode { get; private set; } = false;
+        public bool          IsFullARMode { get; private set; } = false;
 
         public Vector3 CurrentTarget => (_isNavigating && _currentPath != null
                                          && _currentWaypointIndex < _currentPath.Waypoints.Count)
@@ -218,7 +213,7 @@ namespace IndoorNavAR.Navigation
         // Progreso garantizado
         private int _confirmedMinIndex = 1;
 
-        // ✅ v5 FIX F — Cache de AROriginAligner con reintento temporal
+        // Cache AROriginAligner con reintento temporal
         private IndoorNavAR.AR.AROriginAligner _arOriginAlignerCache    = null;
         private bool                           _arOriginAlignerSearched = false;
         private float                          _arAlignerNextRetryTime  = 0f;
@@ -264,11 +259,6 @@ namespace IndoorNavAR.Navigation
         //  API PÚBLICA
         // ─────────────────────────────────────────────────────────────────────
 
-        /// <summary>
-        /// Activa/desactiva el modo FullAR.
-        /// En FullAR FollowPath() calcula posición de waypoints pero
-        /// NO mueve el transform (el XR Origin = cámara = usuario real).
-        /// </summary>
         public void SetFullARMode(bool isFullAR)
         {
             if (IsFullARMode == isFullAR) return;
@@ -280,40 +270,31 @@ namespace IndoorNavAR.Navigation
                 _smoothDampVel = Vector3.zero;
                 TrySetAgentStopped(true);
                 if (_logVerbose)
-                    Debug.Log("[PathController] ✅ Modo FullAR activado — " +
-                              "FollowPath() no moverá el transform.");
+                    Debug.Log("[PathController] ✅ Modo FullAR activado.");
             }
             else
             {
                 if (_logVerbose)
-                    Debug.Log("[PathController] ✅ Modo NoAR activado — " +
-                              "movimiento del agente habilitado.");
+                    Debug.Log("[PathController] ✅ Modo NoAR activado.");
             }
         }
 
-        /// <summary>
-        /// Calcula la ruta hacia el destino y comienza la navegación.
-        ///
-        /// ✅ v4: En FullAR usa UserPositionBridge como origen de la ruta.
-        /// ✅ v5 FIX A: Log correcto del warp (guarda posición anterior ANTES de warpar).
-        /// ✅ v5 FIX B: Condición de warp con distancia (no con !=) para evitar
-        ///             problemas de floating-point epsilon.
-        /// ✅ v5 FIX D: Cache del optimizer se invalida siempre en FullAR para
-        ///             garantizar que UserPosition actualizado genere ruta fresca.
-        /// </summary>
         public void NavigateTo(Vector3 destination, bool forceRecalculate = false)
         {
+            bool wasNavigating = _isNavigating;
+
             if (forceRecalculate)
                 _optimizer.InvalidateCache();
 
             _currentDestination = destination;
 
-            // ✅ v4+v5: En FullAR, calcular origen desde la posición real del usuario
+            // ✅ v5.1 FIX 1: GetRouteOriginForFullAR() ahora warpea el agente
+            // a la posición actual del usuario ANTES de calcular la ruta.
+            // Esto garantiza que tanto el primer cálculo como todos los
+            // recálculos (stall, obstáculo, NavMesh regenerado) partan
+            // desde donde el usuario está parado en ese momento.
             Vector3 routeOrigin = GetRouteOriginForFullAR();
 
-            // ✅ v5 FIX D: En FullAR, siempre invalidar caché antes de calcular.
-            //   UserPosition puede cambiar entre llamadas aunque caiga en la misma
-            //   celda de hash del optimizer (0.5m), lo que devolvería la ruta antigua.
             if (IsFullARMode)
                 _optimizer.InvalidateCache();
 
@@ -326,20 +307,6 @@ namespace IndoorNavAR.Navigation
                                  $"(FullAR={IsFullARMode})");
                 OnPathFailed?.Invoke(path.Status);
                 return;
-            }
-
-            // ✅ v5 FIX A + FIX B: Guardar posición anterior ANTES del warp,
-            //   y usar distancia en lugar de != para comparar vectores.
-            if (IsFullARMode && Vector3.Distance(routeOrigin, transform.position) > 0.01f)
-            {
-                Vector3 prevPos = transform.position; // ← FIX A: guardado antes del warp
-
-                transform.position = routeOrigin;
-                if (_agent != null && _agent.isOnNavMesh)
-                    _agent.Warp(routeOrigin);
-
-                Debug.Log($"[PathController] 📍 [FullAR] Agente sincronizado al origen de ruta: " +
-                          $"{routeOrigin:F2} (era {prevPos:F2})"); // ← FIX A: usa prevPos
             }
 
             _currentPath          = path;
@@ -361,7 +328,17 @@ namespace IndoorNavAR.Navigation
                       $"clearance mín={path.MinClearance:F3}m" +
                       (IsFullARMode ? $" [FullAR — origen={routeOrigin:F2}]" : ""));
 
-            OnPathStarted?.Invoke(destination);
+            if (forceRecalculate && wasNavigating)
+                OnPathRecalculated?.Invoke(_currentPath);
+            else
+                OnPathStarted?.Invoke(destination);
+        }
+
+        public bool NavigateToWaypointForced(WaypointData waypoint)
+        {
+            if (waypoint == null) return false;
+            NavigateTo(waypoint.Position, forceRecalculate: true);
+            return _currentPath != null && _currentPath.IsValid;
         }
 
         public void StopNavigation()
@@ -379,28 +356,26 @@ namespace IndoorNavAR.Navigation
         public void InvalidatePathCache() => _optimizer?.InvalidateCache();
 
         // ─────────────────────────────────────────────────────────────────────
-        //  v5 FIX C — ORIGEN DE RUTA EN FULLAR (con piso multi-nivel)
+        //  ORIGEN DE RUTA EN FULLAR
         // ─────────────────────────────────────────────────────────────────────
 
         /// <summary>
-        /// Devuelve el punto del NavMesh más adecuado como origen de la ruta.
+        /// ✅ v5.1 FIX 1 — Devuelve el punto NavMesh bajo el usuario Y warpea el agente.
         ///
-        /// En NoAR: devuelve transform.position (sin cambios respecto a v3).
+        /// CAMBIO vs v5:
+        ///   Antes: buscaba el NavMesh bajo el usuario, devolvía la posición, pero
+        ///          el warp solo ocurría en NavigateTo() si había diferencia con
+        ///          transform.position — lo que fallaba en recálculos porque
+        ///          transform.position podía haberse actualizado solo a la primera
+        ///          posición del usuario.
         ///
-        /// En FullAR (v5 FIX C):
-        ///   ESTRATEGIA PRINCIPAL — Usar FloorHeight del StartPointManager:
-        ///     1. Obtiene la lista de pisos conocidos de NavigationStartPointManager.
-        ///     2. Identifica el piso cuyo FloorHeight es más cercano a userPos.y
-        ///        (con margen de _fullAROriginFloorTolerance para el Y de los ojos).
-        ///     3. Busca NavMesh proyectando horizontalmente al FloorHeight del piso
-        ///        correcto, no a "userPos.y - 2m" (que era frágil y asumía piso 0).
+        ///   Ahora: siempre warpea el agente a routeOrigin aquí mismo, ANTES de
+        ///          que NavigateTo() llame a ComputeOptimized(). De esta forma,
+        ///          tanto el optimizador como cualquier código que lea
+        ///          transform.position inmediatamente después tienen la posición
+        ///          correcta del usuario.
         ///
-        ///   ESTRATEGIA FALLBACK (si StartPointManager no tiene datos):
-        ///     Mismo comportamiento que v4: buscar en groundPos = userPos - 2m.
-        ///
-        ///   Ventaja vs v4:
-        ///     Funciona correctamente en edificios multi-planta sin hardcodear offsets.
-        ///     Piso 0 (Y≈0m) y piso 1 (Y≈3.48m) se identifican automáticamente.
+        /// En NoAR: devuelve transform.position sin cambios.
         /// </summary>
         private Vector3 GetRouteOriginForFullAR()
         {
@@ -410,38 +385,80 @@ namespace IndoorNavAR.Navigation
             var userBridge = UserPositionBridge.Instance;
             if (userBridge == null)
             {
-                Debug.LogWarning("[PathController] ⚠️ [FullAR] UserPositionBridge no disponible. " +
-                                 "Usando transform.position (puede ser incorrecto en FullAR).");
+                Debug.LogWarning("[PathController] ⚠️ [FullAR] UserPositionBridge no disponible.");
                 return transform.position;
             }
 
-            Vector3 userPos = userBridge.UserPosition;
+            Vector3 userPos    = userBridge.UserPosition;
+            Vector3 routeOrigin;
 
-            // ── ESTRATEGIA PRINCIPAL: usar FloorHeight del StartPointManager ──────
-            Vector3 floorOrigin;
-            if (TryGetFloorProjection(userPos, out floorOrigin))
+            // Estrategia principal: FloorHeight del StartPointManager
+            if (TryGetFloorProjection(userPos, out Vector3 floorOrigin))
             {
-                // Buscar NavMesh desde la proyección al piso correcto
                 float[] radii = { 0.3f, 0.8f, 1.5f, _fullAROriginSnapRadius };
+                bool found = false;
+                routeOrigin = floorOrigin;
+
                 foreach (float radius in radii)
                 {
                     if (NavMesh.SamplePosition(floorOrigin, out NavMeshHit hit, radius, NavMesh.AllAreas))
                     {
+                        routeOrigin = hit.position;
+                        found = true;
+
                         if (_logVerbose)
                             Debug.Log($"[PathController] ✅ [FullAR] Origen (StartPoint): " +
                                       $"userPos={userPos:F2} → floor={floorOrigin:F2} " +
                                       $"→ navMesh={hit.position:F2} (r={radius}m)");
-                        return hit.position;
+                        break;
                     }
                 }
 
-                Debug.LogWarning($"[PathController] ⚠️ [FullAR] StartPoint floor={floorOrigin:F2} " +
-                                 "no tiene NavMesh cercano. Usando estrategia fallback.");
+                if (!found)
+                {
+                    Debug.LogWarning($"[PathController] ⚠️ [FullAR] StartPoint floor={floorOrigin:F2} " +
+                                     "sin NavMesh cercano. Usando fallback.");
+                    routeOrigin = GetFallbackOrigin(userPos);
+                }
+            }
+            else
+            {
+                routeOrigin = GetFallbackOrigin(userPos);
             }
 
-            // ── ESTRATEGIA FALLBACK: proyección vertical heurística ──────────────
-            // Misma lógica que v4 (userPos.y - 2m), funciona para piso 0.
-            Vector3 groundPos = new Vector3(userPos.x, userPos.y - 2f, userPos.z);
+            // ✅ v5.1 FIX 1: Warp explícito del agente a la posición del usuario.
+            // Se hace aquí (no en NavigateTo) para que aplique a TODOS los
+            // recálculos, incluyendo HandleStall y OnNavMeshRegenerated.
+            WarpAgentToOrigin(routeOrigin);
+
+            return routeOrigin;
+        }
+
+        /// <summary>
+        /// ✅ v5.1 — Warpea el agente a la posición de origen de la ruta.
+        /// Solo warpea si la diferencia supera _agentSyncThreshold para evitar
+        /// llamadas innecesarias a Warp() por micromovimientos de ARCore.
+        /// </summary>
+        private void WarpAgentToOrigin(Vector3 origin)
+        {
+            if (Vector3.Distance(transform.position, origin) < _agentSyncThreshold)
+                return;
+
+            Vector3 prev = transform.position;
+            transform.position = origin;
+
+            if (_agent != null && _agent.isOnNavMesh)
+                _agent.Warp(origin);
+
+            if (_logVerbose)
+                Debug.Log($"[PathController] 📍 [FullAR] Agente warpeado: {prev:F2} → {origin:F2} " +
+                          $"(Δ={Vector3.Distance(prev, origin):F2}m)");
+        }
+
+        private Vector3 GetFallbackOrigin(Vector3 userPos)
+        {
+            // Proyección vertical heurística: userPos.y - 2m (funciona para piso 0)
+            Vector3 groundPos     = new Vector3(userPos.x, userPos.y - 2f, userPos.z);
             float[] fallbackRadii = { 0.5f, 1.0f, 2.0f, _fullAROriginSnapRadius };
 
             foreach (float radius in fallbackRadii)
@@ -454,7 +471,7 @@ namespace IndoorNavAR.Navigation
                 }
             }
 
-            // ── FALLBACK FINAL: búsqueda directa desde userPos ───────────────────
+            // Last resort: búsqueda directa desde userPos
             if (NavMesh.SamplePosition(userPos, out NavMeshHit lastResort,
                 _fullAROriginSnapRadius * 2f, NavMesh.AllAreas))
             {
@@ -463,26 +480,11 @@ namespace IndoorNavAR.Navigation
                 return lastResort.position;
             }
 
-            Debug.LogError($"[PathController] ❌ [FullAR] Sin NavMesh cerca del usuario " +
-                           $"({userPos:F2}). Usando transform.position={transform.position:F2}. " +
+            Debug.LogError($"[PathController] ❌ [FullAR] Sin NavMesh cerca de {userPos:F2}. " +
                            "Verificar que el NavMesh cubre el área del usuario.");
             return transform.position;
         }
 
-        /// <summary>
-        /// ✅ v5 FIX C: Identifica el piso correcto usando NavigationStartPointManager
-        /// y proyecta userPos a ese FloorHeight para usarlo como origen de búsqueda NavMesh.
-        ///
-        /// LÓGICA:
-        ///   La cámara XR está a ~1.6m de altura (Y de los ojos).
-        ///   Los FloorHeight de los StartPoints están a Y≈0.03m (piso 0) o Y≈3.48m (piso 1).
-        ///   La diferencia entre userPos.y (ojos) y FloorHeight (suelo) es ~1.57m.
-        ///   Con _fullAROriginFloorTolerance=1.2m esto se acercaría al límite,
-        ///   por eso usamos la distancia total (no solo Y) para identificar el piso más cercano.
-        ///
-        /// RETORNA: true si encontró un piso conocido y proyectó correctamente.
-        ///          false si StartPointManager no tiene datos de piso.
-        /// </summary>
         private bool TryGetFloorProjection(Vector3 userPos, out Vector3 floorProjection)
         {
             floorProjection = userPos;
@@ -491,16 +493,7 @@ namespace IndoorNavAR.Navigation
             if (startPoints == null || startPoints.Count == 0)
                 return false;
 
-            // Encontrar el piso cuyo FloorHeight es más cercano a (userPos.y - eyeHeight)
-            // eyeHeight ≈ 1.6m. Usamos la distancia Y entre userPos y cada FloorHeight.
-            // El piso correcto es el que minimiza |userPos.y - FloorHeight - ~1.6m|,
-            // pero como no sabemos exactamente la eyeHeight, buscamos el FloorHeight
-            // más cercano a userPos.y con la premisa de que el usuario está DE PIE encima.
-            //
-            // Mejor heurística: el piso es correcto cuando |userPos.y - floorY| < 3m
-            // (umbral generoso que no confundiría pisos separados por >3m).
-
-            const float kMaxEyeToFloor = 3.0f; // máxima altura ojo-suelo esperada
+            const float kMaxEyeToFloor = 3.0f;
             NavigationStartPoint bestFloor = null;
             float                bestDelta = float.MaxValue;
 
@@ -509,8 +502,6 @@ namespace IndoorNavAR.Navigation
                 if (!sp.DefinesFloorHeight) continue;
 
                 float deltaY = userPos.y - sp.FloorHeight;
-
-                // El usuario está encima del piso: deltaY debe ser positivo y < kMaxEyeToFloor
                 if (deltaY < 0f || deltaY > kMaxEyeToFloor) continue;
 
                 if (deltaY < bestDelta)
@@ -522,22 +513,17 @@ namespace IndoorNavAR.Navigation
 
             if (bestFloor == null)
             {
-                // Ningún piso dentro del rango esperado — quizás no hay datos aún
                 if (_logVerbose)
-                    Debug.LogWarning($"[PathController] ⚠️ [FullAR] TryGetFloorProjection: " +
-                                     $"ningún StartPoint con FloorHeight dentro de [{userPos.y - kMaxEyeToFloor:F2}, " +
-                                     $"{userPos.y:F2}]. Fallback a proyección heurística.");
+                    Debug.LogWarning($"[PathController] ⚠️ [FullAR] Sin StartPoint en rango " +
+                                     $"Y=[{userPos.y - kMaxEyeToFloor:F2}, {userPos.y:F2}].");
                 return false;
             }
 
-            // Proyectar userPos al FloorHeight del piso identificado
             floorProjection = new Vector3(userPos.x, bestFloor.FloorHeight, userPos.z);
 
             if (_logVerbose)
-                Debug.Log($"[PathController] 🏢 [FullAR] Piso identificado: Level {bestFloor.Level} " +
-                          $"(FloorHeight={bestFloor.FloorHeight:F3}m, " +
-                          $"deltaY={bestDelta:F3}m desde userPos.y={userPos.y:F3}m). " +
-                          $"Proyección: {floorProjection:F2}");
+                Debug.Log($"[PathController] 🏢 [FullAR] Piso: Level {bestFloor.Level} " +
+                          $"(FloorHeight={bestFloor.FloorHeight:F3}m, deltaY={bestDelta:F3}m)");
 
             return true;
         }
@@ -548,9 +534,7 @@ namespace IndoorNavAR.Navigation
 
         private void FollowPath()
         {
-            // ✅ v_PATCH + v5 FIX F: Auto-detección FullAR con reintento temporal.
-            //   Si el aligner aún no existía cuando se buscó por primera vez,
-            //   reintentamos cada _arAlignerRetryInterval segundos.
+            // Auto-detección FullAR con reintento temporal
             if (!IsFullARMode)
             {
                 var aligner = GetOrFindAROriginAligner();
@@ -560,7 +544,31 @@ namespace IndoorNavAR.Navigation
                     Debug.Log("[PathController] ⚡ Auto-corrección FullAR en FollowPath().");
                 }
             }
-            if (IsFullARMode) return;
+
+            // ✅ v5.1 FIX 2 — En FullAR: sincronizar el agente al usuario cada frame.
+            //
+            // En v5, este bloque hacía "if (IsFullARMode) return;" inmediatamente.
+            // Ahora sincronizamos transform.position antes de retornar.
+            //
+            // PROPÓSITO:
+            //   • RemainingDistance usa transform.position para calcular la
+            //     distancia recorrida. Si el agente no se mueve con el usuario,
+            //     RemainingDistance no cambia aunque el usuario camine.
+            //   • VoiceGuide usa EvalPos = UserPos (correcto), pero el PathController
+            //     internamente usa transform.position para stall detection.
+            //   • Con sync continuo, _lastStallCheckPos se actualiza correctamente
+            //     reflejando el movimiento real del usuario.
+            //
+            // THRESHOLD: solo warp si el usuario se movió > _agentSyncThreshold (0.15m).
+            // Evita llamadas continuas a NavMesh.SamplePosition en cada frame.
+            if (IsFullARMode)
+            {
+                if (_continuousAgentSync)
+                    SyncAgentToUserPosition();
+                return;
+            }
+
+            // ── Modo NoAR: movimiento autónomo del agente ──────────────────────
 
             IReadOnlyList<Vector3> waypoints = _currentPath.Waypoints;
             Vector3 finalDest = waypoints[waypoints.Count - 1];
@@ -611,6 +619,48 @@ namespace IndoorNavAR.Navigation
             }
 
             MoveTowardsTarget(target, nextIsStair, finalDest);
+        }
+
+        /// <summary>
+        /// ✅ v5.1 FIX 2 — Sincroniza el agente virtual a la posición real del usuario.
+        ///
+        /// Se llama cada frame en FollowPath() cuando IsFullARMode == true.
+        /// Usa _agentSyncThreshold para evitar warp innecesario en cada frame.
+        ///
+        /// Después del warp, actualiza _lastStallCheckPos para que la detección
+        /// de stall refleje el movimiento real del usuario (el usuario real nunca
+        /// está "atascado" mientras camina, aunque el agente virtual no se moviera).
+        /// </summary>
+        private void SyncAgentToUserPosition()
+        {
+            var userBridge = UserPositionBridge.Instance;
+            if (userBridge == null) return;
+
+            Vector3 userPos = userBridge.UserPosition;
+
+            // Solo sincronizar si el usuario se movió lo suficiente
+            if (Vector3.Distance(transform.position, userPos) < _agentSyncThreshold)
+                return;
+
+            // Buscar el punto NavMesh más cercano al usuario
+            // Usar radio pequeño para que sea rápido (hot path)
+            if (!NavMesh.SamplePosition(userPos, out NavMeshHit hit,
+                _fullAROriginSnapRadius, NavMesh.AllAreas))
+                return;
+
+            Vector3 newPos = hit.position;
+            transform.position = newPos;
+
+            if (_agent != null && _agent.isOnNavMesh)
+                _agent.Warp(newPos);
+
+            // Actualizar referencia de stall para que el detector de atasco
+            // sepa que el usuario se está moviendo
+            _lastStallCheckPos = newPos;
+
+            if (_logVerbose)
+                Debug.Log($"[PathController] 🔄 [FullAR] Sync agente: {newPos:F2} " +
+                          $"(userPos={userPos:F2})");
         }
 
         // ─────────────────────────────────────────────────────────────────────
@@ -699,7 +749,14 @@ namespace IndoorNavAR.Navigation
             }
 
             _optimizer.InvalidateCache();
-            OptimizedPath newPath = _optimizer.ComputeOptimized(transform.position, _currentDestination);
+
+            // ✅ v5.1: En FullAR, GetRouteOriginForFullAR() warpea el agente
+            // a la posición actual del usuario antes de recalcular.
+            // Esto garantiza que el recálculo por stall parte desde donde
+            // el usuario está parado ahora, no desde donde estaba al inicio.
+            OptimizedPath newPath = _optimizer.ComputeOptimized(
+                GetRouteOriginForFullAR(),
+                _currentDestination);
 
             if (!newPath.IsValid)
             {
@@ -774,19 +831,15 @@ namespace IndoorNavAR.Navigation
             { Debug.LogWarning($"[PathController] TrySetAgentStopped ignorado: {e.Message}"); }
         }
 
-        /// <summary>
-        /// ✅ v5 FIX E: En v4 este método tenía !IsFullARMode como guardia,
-        /// ignorando recálculos de NavMesh durante navegación AR.
-        /// En FullAR la ruta debe recalcularse igual — FollowPath() no moverá
-        /// el transform de todas formas, pero CurrentPath debe estar actualizado
-        /// para VoiceGuide y ARGuideController.
-        /// </summary>
         private void OnNavMeshRegenerated(NavMeshGeneratedEvent evt)
         {
             if (!evt.Success) return;
             _optimizer.InvalidateCache();
 
-            // ✅ v5 FIX E: recalcular en AMBOS modos (NoAR y FullAR)
+            // ✅ v5.1: recalcular en AMBOS modos.
+            // En FullAR, GetRouteOriginForFullAR() warpea el agente a la
+            // posición actual del usuario antes de recalcular — garantizando
+            // que el nuevo NavMesh se explota desde donde el usuario está.
             if (_isNavigating && !_isOnStairs)
                 NavigateTo(_currentDestination, forceRecalculate: true);
         }
@@ -808,40 +861,20 @@ namespace IndoorNavAR.Navigation
             _optimizer.LookAheadMaxSkip     = _lookAheadMaxSkip;
         }
 
-        // ─────────────────────────────────────────────────────────────────────
-        //  v5 FIX F — CACHE DE ARORIGINALIGNER CON REINTENTO TEMPORAL
-        // ─────────────────────────────────────────────────────────────────────
-
-        /// <summary>
-        /// ✅ v5 FIX F: v4 marcaba _arOriginAlignerSearched=true en el primer intento
-        /// y nunca reintentaba si el objeto no existía aún (race condition al arrancar).
-        ///
-        /// Ahora: si no se encontró, reintenta cada _arAlignerRetryInterval segundos
-        /// hasta encontrarlo. Una vez encontrado, el caché es permanente.
-        /// </summary>
+        // Cache de AROriginAligner con reintento temporal
         private IndoorNavAR.AR.AROriginAligner GetOrFindAROriginAligner()
         {
-            // Si ya lo tenemos en caché, devolverlo directamente
             if (_arOriginAlignerCache != null)
                 return _arOriginAlignerCache;
 
-            // Si encontramos en caché pero el objeto fue destruido (null check de Unity)
-            // o si aún no hemos intentado / ha pasado suficiente tiempo para reintentar
             if (_arOriginAlignerSearched && Time.realtimeSinceStartup < _arAlignerNextRetryTime)
                 return null;
 
-            // Intentar encontrarlo
             _arOriginAlignerSearched  = true;
             _arAlignerNextRetryTime   = Time.realtimeSinceStartup + _arAlignerRetryInterval;
 
             _arOriginAlignerCache = FindFirstObjectByType<IndoorNavAR.AR.AROriginAligner>(
                 FindObjectsInactive.Include);
-
-            if (_arOriginAlignerCache != null && _logVerbose)
-                Debug.Log("[PathController] ✅ AROriginAligner encontrado y cacheado.");
-            else if (_logVerbose)
-                Debug.Log($"[PathController] ⏳ AROriginAligner no encontrado, " +
-                          $"reintentando en {_arAlignerRetryInterval}s.");
 
             return _arOriginAlignerCache;
         }
@@ -877,7 +910,46 @@ namespace IndoorNavAR.Navigation
             {
                 Gizmos.color = new Color(1f, 0f, 1f, 0.5f);
                 Gizmos.DrawWireSphere(transform.position, 0.2f);
+
+                // ✅ v5.1: Mostrar la posición real del usuario en gizmos
+                var bridge = UserPositionBridge.Instance;
+                if (bridge != null)
+                {
+                    Gizmos.color = new Color(0f, 1f, 1f, 0.7f);
+                    Gizmos.DrawWireSphere(bridge.UserPosition, 0.3f);
+                    Gizmos.DrawLine(transform.position, bridge.UserPosition);
+                }
             }
+        }
+
+        // ─────────────────────────────────────────────────────────────────────
+        //  CONTEXT MENU DEBUG
+        // ─────────────────────────────────────────────────────────────────────
+
+        [ContextMenu("📍 Log posición agente vs usuario")]
+        private void DbgLogPositions()
+        {
+            var bridge = UserPositionBridge.Instance;
+            Debug.Log($"[PathController v5.1] Agente: {transform.position:F3} | " +
+                      $"Usuario: {(bridge != null ? bridge.UserPosition.ToString("F3") : "N/A")} | " +
+                      $"Δ: {(bridge != null ? Vector3.Distance(transform.position, bridge.UserPosition).ToString("F3") : "N/A")}m | " +
+                      $"FullAR: {IsFullARMode} | ContinuousSync: {_continuousAgentSync}");
+        }
+
+        [ContextMenu("🔄 Forzar sync agente a usuario")]
+        private void DbgForceSync()
+        {
+            if (!IsFullARMode) { Debug.Log("[PathController] Solo aplica en FullAR."); return; }
+            var before = transform.position;
+            _ = GetRouteOriginForFullAR();
+            Debug.Log($"[PathController] Sync: {before:F3} → {transform.position:F3}");
+        }
+
+        [ContextMenu("🔄 Recalcular ruta desde posición actual")]
+        private void DbgRecalculate()
+        {
+            if (!_isNavigating) { Debug.Log("[PathController] Sin navegación activa."); return; }
+            NavigateTo(_currentDestination, forceRecalculate: true);
         }
     }
 }

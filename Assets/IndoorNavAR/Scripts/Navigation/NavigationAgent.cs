@@ -1,26 +1,23 @@
 // File: NavigationAgent.cs
-//
-// ✅ v3 — Debounce en FloorTransition + guard doble-disparo
+// ✅ v3.1 — Añade NavigateToWaypointForced() para ObstacleRerouteMediator
 //
 // ============================================================================
-//  CAMBIOS v2 → v3
+//  CAMBIOS v3 → v3.1
 // ============================================================================
 //
-//  FIX A — Debounce en UpdateCurrentLevel():
-//    El nivel solo cambia si el agente lleva >= _floorTransitionMinTime (0.8s)
-//    en el nivel candidato. Evita disparos falsos cuando SamplePosition "salta"
-//    verticalmente al procesar el NavMesh de escaleras antes de que el usuario
-//    físico complete el tramo.
+//  ÚNICO CAMBIO: nuevo método público NavigateToWaypointForced(WaypointData)
 //
-//  FIX B — Guard _floorTransitionFired:
-//    Una vez disparado FloorTransitionEvent para un nivel destino, no se vuelve
-//    a disparar hasta que el nivel candidato cambie. Elimina el doble envío de
-//    FloorReached + StairsComplete que aparecía en el log.
+//    Llamado por NavigationManager.RerouteToWaypoint() cuando el mediador
+//    de obstáculos necesita recalcular la ruta sin reiniciar el VoiceGuide.
 //
-//  FIX C — HandlePathCompleted ya no llama UpdateCurrentLevel():
-//    Era la segunda fuente de duplicación. El nivel se actualiza solo desde Update().
+//    DIFERENCIA vs NavigateToWaypoint():
+//      • Llama _pathController.NavigateTo(dest, forceRecalculate: true)
+//        → PathController invalida caché Y dispara OnPathRecalculated
+//        → VoiceGuide.Resync() → "Ruta actualizada. N pasos."
+//      • NO publica HandlePathStarted → no hay NavigationStartedEvent extra
+//        → No hay doble TTS "Listo, vamos a X."
 //
-//  TODOS LOS COMPORTAMIENTOS DE v2 SE CONSERVAN ÍNTEGRAMENTE.
+//  TODOS LOS COMPORTAMIENTOS DE v3 SE CONSERVAN ÍNTEGRAMENTE.
 
 using System;
 using UnityEngine;
@@ -43,16 +40,10 @@ namespace IndoorNavAR.Navigation
         [SerializeField] private bool _publishEvents = true;
 
         [Header("FullAR — Verificación al navegar")]
-        [Tooltip("En FullAR, verifica que el agente esté sobre el NavMesh antes de calcular la ruta.\n" +
-                 "AROriginAligner es quien lo posiciona; aquí solo hacemos la comprobación.")]
         [SerializeField] private bool _verifyNavMeshOnFullAR = true;
-
-        [Tooltip("Radio de verificación NavMesh en FullAR (m).")]
         [SerializeField] private float _fullARVerifyRadius = 3.0f;
 
         [Header("Transición de Piso — Debounce")]
-        [Tooltip("Segundos que el agente debe permanecer en el nivel candidato antes de " +
-                 "confirmar la transición. Evita disparos falsos en escaleras.")]
         [SerializeField] private float _floorTransitionMinTime = 0.8f;
 
         [Header("Debug")]
@@ -96,7 +87,7 @@ namespace IndoorNavAR.Navigation
 
         private string _lastDestinationName = string.Empty;
 
-        // ✅ FIX A/B: Debounce y guard de transición de piso
+        // v3 FIX A/B: Debounce y guard de transición de piso
         private int   _candidateLevel         = -1;
         private float _candidateLevelTime     = 0f;
         private bool  _floorTransitionFired   = false;
@@ -220,6 +211,54 @@ namespace IndoorNavAR.Navigation
             return ok;
         }
 
+        /// <summary>
+        /// ✅ v3.1 — Recálculo silencioso de ruta para ObstacleRerouteMediator.
+        ///
+        /// DIFERENCIA vs NavigateToWaypoint():
+        ///   • Usa forceRecalculate=true → PathController invalida caché y dispara
+        ///     OnPathRecalculated (en lugar de OnPathStarted).
+        ///   • OnPathRecalculated → NavigationVoiceGuide.Resync() →
+        ///     "Ruta actualizada. N pasos." (en lugar de "Listo, vamos a X.")
+        ///   • NO actualiza _lastDestinationName → HandlePathStarted NO se dispara
+        ///     porque PathController usa OnPathRecalculated con forceRecalculate.
+        ///
+        /// Llamado por: NavigationManager.RerouteToWaypoint()
+        /// </summary>
+        public bool NavigateToWaypointForced(WaypointData waypoint)
+        {
+            if (waypoint == null)
+            {
+                Debug.LogWarning("[NavigationAgent] NavigateToWaypointForced: waypoint es null.");
+                return false;
+            }
+
+            EnsureNavMeshAgentEnabled();
+
+            // Actualizar LastDestination pero NO _lastDestinationName
+            // para que HandlePathStarted no publique NavigationStartedEvent si se dispara
+            LastDestination = waypoint.Position;
+
+            if (IsFullARMode) PrepareForFullARNavigation();
+
+            if (_logVerbose)
+                Debug.Log($"[NavigationAgent] NavigateToWaypointForced → {waypoint.WaypointName} " +
+                          $"@ {waypoint.Position:F2} | forceRecalculate=true");
+
+            // forceRecalculate=true → PathController dispara OnPathRecalculated
+            // → NavigationVoiceGuide.Resync() → "Ruta actualizada. N pasos."
+            _pathController.NavigateTo(waypoint.Position, forceRecalculate: true);
+
+            bool ok = _pathController.CurrentPath?.IsValid ?? false;
+
+            if (!ok)
+                Debug.LogWarning($"[NavigationAgent] ⚠️ [Forced] Ruta inválida a '{waypoint.WaypointName}' " +
+                                 $"desde {transform.position:F2}.");
+
+            if (IsFullARMode) EnsureAgentStoppedInFullAR();
+
+            return ok;
+        }
+
         public void SetDestination(Vector3 newDestination)
         {
             LastDestination      = newDestination;
@@ -284,9 +323,7 @@ namespace IndoorNavAR.Navigation
                     _fullARVerifyRadius, NavMesh.AllAreas))
             {
                 Debug.LogWarning($"[NavigationAgent] ⚠️ FullAR: agente en {transform.position:F2} " +
-                                 $"no está sobre el NavMesh (radio {_fullARVerifyRadius}m). " +
-                                 "AROriginAligner debería haberlo posicionado. " +
-                                 "Verificar que el NavMesh está cargado.");
+                                 $"no está sobre el NavMesh (radio {_fullARVerifyRadius}m).");
                 return;
             }
 
@@ -298,12 +335,6 @@ namespace IndoorNavAR.Navigation
 
                 if (_logVerbose)
                     Debug.Log($"[NavigationAgent] FullAR: corrección menor al NavMesh → {hit.position:F2}");
-            }
-            else
-            {
-                if (_logVerbose)
-                    Debug.Log($"[NavigationAgent] FullAR: agente en {transform.position:F2}, " +
-                              "posición válida para calcular ruta.");
             }
         }
 
@@ -320,8 +351,7 @@ namespace IndoorNavAR.Navigation
             {
                 _navAgent.isStopped = true;
                 if (_logVerbose)
-                    Debug.Log("[NavigationAgent] FullAR: NavMeshAgent detenido " +
-                              "(ruta calculada pero agente no camina).");
+                    Debug.Log("[NavigationAgent] FullAR: NavMeshAgent detenido.");
             }
         }
 
@@ -336,7 +366,7 @@ namespace IndoorNavAR.Navigation
                 }
                 else
                 {
-                    Debug.LogWarning("[NavigationAgent] ⚠️ NavMesh aún no disponible. La ruta puede fallar.");
+                    Debug.LogWarning("[NavigationAgent] ⚠️ NavMesh aún no disponible.");
                     _navAgent.enabled = true;
                 }
             }
@@ -345,10 +375,7 @@ namespace IndoorNavAR.Navigation
         // ─── Detección de nivel ───────────────────────────────────────────────
 
         /// <summary>
-        /// ✅ v3 FIX A/B: Debounce + guard contra doble disparo.
-        /// El nivel solo cambia si el agente lleva >= _floorTransitionMinTime
-        /// en el nivel candidato. Una vez disparado el evento para ese nivel,
-        /// no se vuelve a disparar hasta que el candidato cambie.
+        /// v3 FIX A/B: Debounce + guard contra doble disparo.
         /// </summary>
         private void UpdateCurrentLevel()
         {
@@ -367,20 +394,17 @@ namespace IndoorNavAR.Navigation
 
             if (bestLevel != CurrentLevel)
             {
-                // Acumular tiempo en el nivel candidato
                 if (bestLevel == _candidateLevel)
                 {
                     _candidateLevelTime += Time.deltaTime;
                 }
                 else
                 {
-                    // Nuevo candidato distinto → reiniciar contador
                     _candidateLevel       = bestLevel;
                     _candidateLevelTime   = 0f;
                     _floorTransitionFired = false;
                 }
 
-                // Confirmar transición solo si llevamos suficiente tiempo
                 if (_candidateLevelTime >= _floorTransitionMinTime && !_floorTransitionFired)
                 {
                     int prev = CurrentLevel;
@@ -402,7 +426,6 @@ namespace IndoorNavAR.Navigation
             }
             else
             {
-                // Estamos en el nivel actual → resetear candidato si era diferente
                 if (_candidateLevel != CurrentLevel)
                 {
                     _candidateLevel       = CurrentLevel;
@@ -429,8 +452,7 @@ namespace IndoorNavAR.Navigation
         }
 
         /// <summary>
-        /// ✅ v3 FIX C: HandlePathCompleted ya NO llama UpdateCurrentLevel().
-        /// El nivel se actualiza solo desde Update() con el debounce correcto.
+        /// v3 FIX C: HandlePathCompleted ya NO llama UpdateCurrentLevel().
         /// </summary>
         private void HandlePathCompleted()
         {

@@ -2,28 +2,6 @@
 // ============================================================================
 //  SISTEMA DE OPTIMIZACIÓN DE RUTAS — IndoorNavAR  v2
 // ============================================================================
-//
-//  CAMBIOS RESPECTO A v1:
-//
-//  PROBLEMA RAÍZ ELIMINADO:
-//    v1 usaba ClearanceField con raycasts radiales, y luego SamplePosition
-//    durante el movimiento revertía ese desplazamiento. Ciclo de corrección
-//    que se anulaba a sí mismo → agente pegado a paredes → atasco.
-//
-//  NUEVO ENFOQUE:
-//    1. Clearance con NavMesh.FindClosestEdge() — distancia REAL al borde
-//       del NavMesh, O(1) por punto, sin raycasts ni estimaciones.
-//    2. Center Pull predictivo — busca el punto con mayor clearance en
-//       perpendicular y tira el waypoint hacia allí ANTES de entregar la ruta.
-//    3. Funnel conservador — solo elimina waypoints casi colineales cuyo
-//       reemplazo tiene clearance equivalente. No destruye giros necesarios.
-//    4. MinClearance expuesto en OptimizedPath para que el controller
-//       tome decisiones antes de que el agente entre en una zona problemática.
-//
-//  COMPLEJIDAD:
-//    ComputeOptimized: O(W * S) donde W = waypoints, S = CenterSamples (8)
-//    FindClosestEdge: O(1) interno de Unity
-//    Costo móvil estimado: ~0.3ms por cálculo de ruta
 
 using System.Collections.Generic;
 using UnityEngine;

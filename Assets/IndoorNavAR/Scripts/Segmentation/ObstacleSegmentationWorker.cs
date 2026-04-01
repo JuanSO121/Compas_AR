@@ -59,6 +59,7 @@ namespace IndoorNavAR.Segmentation
         public int    MaskHeight    => IMAGE_SIZE;
         public float  ObstacleRatio { get; private set; }
         public float  FloorRatio    { get; private set; }
+        public float  WallRatio     { get; private set; }
 
         public event Action OnInferenceComplete;
 
@@ -319,16 +320,18 @@ namespace IndoorNavAR.Segmentation
 
         private void ComputeStats(int[] data)
         {
-            int countObs = 0, countFloor = 0, total = data.Length;
+            int countObs = 0, countFloor = 0, countWall = 0, total = data.Length;
             for (int i = 0; i < total; i++)
             {
                 int cls = data[i];
                 MaskData[i] = cls >= 0 && cls < 4 ? cls : 0;
                 if (cls == CLASS_OBSTACLE) countObs++;
                 if (cls == CLASS_FLOOR)    countFloor++;
+                if (cls == CLASS_WALL)     countWall++;          
             }
             ObstacleRatio = (float)countObs   / total;
             FloorRatio    = (float)countFloor / total;
+            WallRatio     = (float)countWall  / total;  
         }
 
         private void LogShapeOnce(int length, string shape)

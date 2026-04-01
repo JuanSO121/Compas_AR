@@ -262,6 +262,7 @@ namespace IndoorNavAR.Navigation.Voice
             bus.Subscribe<NavigationCompletedEvent>(OnNavCompleted);
             bus.Subscribe<NavigationCancelledEvent>(OnNavCancelled);
             bus.Subscribe<FloorTransitionEvent>(OnFloorTransition);
+            bus.Subscribe<ObstacleDetectedEvent>(OnObstacleDetected);
         }
 
         private void UnsubscribeEvents()
@@ -272,6 +273,7 @@ namespace IndoorNavAR.Navigation.Voice
             bus.Unsubscribe<NavigationCompletedEvent>(OnNavCompleted);
             bus.Unsubscribe<NavigationCancelledEvent>(OnNavCancelled);
             bus.Unsubscribe<FloorTransitionEvent>(OnFloorTransition);
+            bus.Unsubscribe<ObstacleDetectedEvent>(OnObstacleDetected);
         }
 
         private void OnDestroy()
@@ -561,6 +563,19 @@ namespace IndoorNavAR.Navigation.Voice
 
             _misalignTimer = 0f;
             _lastMisalignTime = -999f;
+        }
+
+        private void OnObstacleDetected(ObstacleDetectedEvent evt)
+        {
+            if (!_isGuiding) return;
+            if (Time.time - _lastObstacleWarningTime < _obstacleWarningCooldown) return;
+
+            _lastObstacleWarningTime = Time.time;
+            _obstacleFired           = true;   // ← evita que EvaluateObstacle() lo dispare también
+            _obstacleTimer           = 0f;     // ← resetea el timer interno
+
+            Speak(VoiceInstructionType.ObstacleWarning,
+                "Obstáculo detectado. Buscando ruta alternativa.", priority: 3);
         }
 
         // ─────────────────────────────────────────────────────────────────────

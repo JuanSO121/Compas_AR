@@ -1,23 +1,27 @@
 // File: SegmentationController.cs
-// ✅ v9 — FlipX independiente + forzar Canvas Scaler a Expand en runtime
+// ✅ v9.1 — FIX #4: EvaluateAlerts() suprimido cuando ObstacleRerouteMediator está activo
 //
 // ============================================================================
-//  CAMBIOS v8 → v9
+//  CAMBIOS v9 → v9.1
 // ============================================================================
 //
-//  FIX 1 — _flipInputX añadido
-//    Expone el flip horizontal del input como campo serializado y
-//    como ContextMenu "Flip X ON/OFF" para calibrar en runtime sin rebuild.
+//  FIX #4 — Doble TTS de obstáculo eliminado
+//    Cuando ObstacleRerouteMediator.IsActive == true (hay navegación activa),
+//    EvaluateAlerts() retorna inmediatamente sin generar TTS propio.
 //
-//  FIX 2 — ForceCanvasExpand() en Start()
-//    El CanvasScaler con Match=0.5 en dispositivos con aspect ratio distinto
-//    a 1080×1920 (ej. Pixel 5 = 1080×2340) produce un canvas de 978px.
-//    ForceCanvasExpand() cambia el ScreenMatchMode a Expand en runtime,
-//    garantizando que el canvas siempre tenga el ancho correcto.
-//    Esto es un seguro adicional: lo ideal es cambiarlo también en el Inspector.
+//    RAZÓN: El VoiceGuide ya maneja el aviso de obstáculo con prioridad 3
+//    (interrupt=true) y cooldown de 60s via OnObstacleDetected(). Permitir
+//    que SegmentationController también hable con p=2 y cooldown de 3.5s
+//    causa que el usuario escuche dos mensajes casi simultáneos, el segundo
+//    cortando al primero.
 //
-//  SIN CAMBIOS — IMAGE_SIZE=312, letterbox, fallback CPU, TTS,
-//    frecuencia adaptativa, DiagnoseARFrames, AlignToROI eliminado.
+//    COMPORTAMIENTO RESULTANTE:
+//      - Con navegación activa: Solo NavigationVoiceGuide habla ("Obstáculo
+//        detectado. Buscando ruta alternativa.", p=3, interrupt=true).
+//      - Sin navegación activa: SegmentationController habla normalmente
+//        ("Obstáculo detectado al frente", p=2) — útil como alerta standalone.
+//
+//  TODOS LOS CAMBIOS DE v9 SE CONSERVAN ÍNTEGRAMENTE.
 
 using System;
 using System.Collections;
@@ -28,6 +32,7 @@ using UnityEngine.XR.ARSubsystems;
 using Unity.Collections;
 using Unity.Sentis;
 using IndoorNavAR.Integration;
+using IndoorNavAR.Navigation; // ✅ FIX #4: para acceder a ObstacleRerouteMediator.IsActive
 
 namespace IndoorNavAR.Segmentation
 {
@@ -56,8 +61,7 @@ namespace IndoorNavAR.Segmentation
         [SerializeField] private bool _showOverlay = true;
 
         [Header("ROI — Región de Interés")]
-        [Tooltip("Fracción desde arriba que se OMITE al capturar el frame. " +
-                 "NO afecta el tamaño del overlay (siempre full screen).")]
+        [Tooltip("Fracción desde arriba que se OMITE al capturar el frame.")]
         [SerializeField, Range(0f, 0.7f)]
         private float _roiTopSkip = 0.4f;
 
@@ -77,7 +81,7 @@ namespace IndoorNavAR.Segmentation
         [SerializeField] private bool _logFrameCapture = true;
 
         // ── Privado ────────────────────────────────────────────────────────
-        private const int MODEL_SIZE = ObstacleSegmentationWorker.IMAGE_SIZE; // 312
+        private const int MODEL_SIZE = ObstacleSegmentationWorker.IMAGE_SIZE;
 
         private ObstacleSegmentationWorker _worker;
         private RenderTexture _cameraRT;
@@ -103,8 +107,6 @@ namespace IndoorNavAR.Segmentation
 
         private void Start()
         {
-            // ✅ FIX 2: Forzar CanvasScaler a Expand para garantizar ancho correcto
-            // en dispositivos con aspect ratio distinto a la referencia 1080×1920.
             ForceCanvasExpand();
 
             if (_modelAsset == null)
@@ -140,7 +142,6 @@ namespace IndoorNavAR.Segmentation
             _frameBufferFallback = new Texture2D(MODEL_SIZE, MODEL_SIZE,
                                                   TextureFormat.RGB24, false);
 
-            // ✅ FIX 1: flipX pasado al constructor
             _worker = new ObstacleSegmentationWorker(
                 _modelAsset, _backend, _tensorRotation, _flipInputY, _flipInputX);
 
@@ -162,14 +163,11 @@ namespace IndoorNavAR.Segmentation
 
             StartCoroutine(DiagnoseARFrames());
 
-            Debug.Log($"[SegCtrl] ✅ Inicializado. rotation={_tensorRotation}° " +
+            Debug.Log($"[SegCtrl] ✅ v9.1 inicializado. rotation={_tensorRotation}° " +
                       $"flipY={_flipInputY} flipX={_flipInputX} " +
                       $"MODEL_SIZE={MODEL_SIZE} ROI={_roiTopSkip:P0}");
         }
 
-        // ✅ FIX 2: Fuerza ScreenMatchMode.Expand en el CanvasScaler del overlay.
-        // Garantiza que el canvas lógico tenga el ancho de pantalla completo
-        // independientemente del aspect ratio del dispositivo.
         private void ForceCanvasExpand()
         {
             var scaler = GetComponentInChildren<CanvasScaler>(true);
@@ -181,7 +179,7 @@ namespace IndoorNavAR.Segmentation
                 scaler.screenMatchMode != CanvasScaler.ScreenMatchMode.Expand)
             {
                 scaler.screenMatchMode = CanvasScaler.ScreenMatchMode.Expand;
-                Debug.Log("[SegCtrl] ✅ CanvasScaler → Expand (forzado en runtime).");
+                Debug.Log("[SegCtrl] ✅ CanvasScaler → Expand.");
             }
         }
 
@@ -384,14 +382,25 @@ namespace IndoorNavAR.Segmentation
 
         private void EvaluateAlerts()
         {
+            // ✅ FIX #4: Si el mediador está activo, él maneja el TTS de obstáculo
+            //   con prioridad 3 + interrupt. No generar alerta duplicada aquí.
+            if (ObstacleRerouteMediator.IsActive)
+            {
+                if (_logStats)
+                    Debug.Log("[SegCtrl] 🔇 EvaluateAlerts suprimido — ObstacleRerouteMediator activo.");
+                return;
+            }
+
             if (Time.unscaledTime - _lastAlertTime < _alertCooldown) return;
             if (_worker.ObstacleRatio < _obstacleAlertThreshold) return;
+
             _lastAlertTime = Time.unscaledTime;
             string msg = _worker.ObstacleRatio > 0.25f
                 ? "Precaución, obstáculo muy cerca"
                 : "Obstáculo detectado al frente";
+
             VoiceCommandAPI.Instance?.SpeakArbitraryText(msg, priority: 2, interrupt: false);
-            Debug.Log($"[SegCtrl] 🚧 Alerta: {msg} ({_worker.ObstacleRatio:P1})");
+            Debug.Log($"[SegCtrl] 🚧 Alerta standalone: {msg} ({_worker.ObstacleRatio:P1})");
         }
 
         // ── Debug ─────────────────────────────────────────────────────────
@@ -428,13 +437,14 @@ namespace IndoorNavAR.Segmentation
             Debug.Log($"[SegCtrl] Obstacle={_worker?.ObstacleRatio:P1} Floor={_worker?.FloorRatio:P1} " +
                       $"Busy={_worker?.IsBusy} Frames={_totalFramesReceived} Rot={_tensorRotation}° " +
                       $"FlipY={_flipInputY} FlipX={_flipInputX} Interval={_currentInterval}f " +
-                      $"MODEL_SIZE={MODEL_SIZE} CPU={_cpuFallbackActive}");
+                      $"MODEL_SIZE={MODEL_SIZE} CPU={_cpuFallbackActive} " +
+                      $"MediatorActive={ObstacleRerouteMediator.IsActive}"); // ✅ FIX #4: visible en debug
         }
 
         public void SetROITopSkip(float ratio)
         {
             _roiTopSkip = Mathf.Clamp01(ratio);
-            Debug.Log($"[SegCtrl] ROI skip → {_roiTopSkip:P0} (solo captura, no overlay).");
+            Debug.Log($"[SegCtrl] ROI skip → {_roiTopSkip:P0}.");
         }
     }
 }

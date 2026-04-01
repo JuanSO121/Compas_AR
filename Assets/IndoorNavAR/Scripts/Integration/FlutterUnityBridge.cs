@@ -1,50 +1,29 @@
 // File: FlutterUnityBridge.cs
 // Carpeta: Assets/IndoorNavAR/Scripts/Integration/
-// ✅ v4 — Comandos de voz ejecutables desde Flutter + COMPAS classifier
+// ✅ v4.1 — Fix errores de compilación en case "segmentation_ratio"
 //
 // ════════════════════════════════════════════════════════════════════════════
-// CAMBIOS v3 → v4
+// CAMBIOS v4 → v4.1
 // ════════════════════════════════════════════════════════════════════════════
 //
-//  NUEVOS COMANDOS (Flutter → Unity):
+//  CORRECCIONES en case "segmentation_ratio":
 //
-//  1. repeat_instruction
-//     { "action": "repeat_instruction" }
-//     Repite la última instrucción de navegación hablada.
-//     Llama NavigationVoiceGuide.RepeatLastInstruction().
-//     Usa p=1 e interrupt=false: se encola sin cortar lo que haya en curso.
+//  FIX 1 — CS0311: ObstacleSegmentationWorker no hereda de UnityEngine.Object
+//    ANTES: FindFirstObjectByType<ObstacleSegmentationWorker>()
+//    AHORA: ObstacleSegmentationWorker.Instance
+//    (el worker ya expone un singleton estático Instance)
 //
-//  2. stop_voice
-//     { "action": "stop_voice" }
-//     Detiene la guía de voz (sin cancelar la navegación física).
-//     Llama NavigationVoiceGuide.StopVoiceGuideFromBridge().
+//  FIX 2 — CS0136: variable local 'json' colisiona con parámetro del método
+//    ANTES: string json = $"{{...}}"
+//    AHORA: string segJson = $"{{...}}"
 //
-//  3. voice_status
-//     { "action": "voice_status" }
-//     Solicita el estado actual de la guía de voz.
-//     Responde con JSON via VoiceCommandAPI: isGuiding, ttsBusy,
-//     destination, remainingSteps, nextInstruction.
+//  FIX 3 — CS0122: VoiceCommandAPI.Reply() es private
+//    ANTES: VoiceCommandAPI.Instance?.Reply(json)
+//    AHORA: VoiceCommandAPI.Instance?.SendSegmentationRatio(obstacle, floor)
+//    Se añade el método público SendSegmentationRatio() en VoiceCommandAPI
+//    (ver VoiceCommandAPI.cs v8.6).
 //
-//  4. tts_speak
-//     { "action": "tts_speak", "text": "Texto libre", "priority": 1, "interrupt": false }
-//     Permite a Flutter disparar un TTS arbitrario (ej. respuesta del
-//     clasificador COMPAS conversacional) sin pasar por el bus de eventos.
-//     Útil para el prompt conversacional de COMPAS.
-//
-//  CONTEXT — integración con COMPAS classifier:
-//
-//     Flutter clasifica el comando de voz del usuario con el LLM:
-//       label=START_NAVIGATION → action="navigate_to"
-//       label=STOP             → action="stop_navigation"
-//       label=REPEAT           → action="repeat_instruction"
-//       label=STATUS           → action="voice_status"
-//       label=HELP             → action="tts_speak" con texto empático de COMPAS
-//       label=<conversacional> → action="tts_speak" con respuesta generada
-//
-//     Unity no necesita conocer el prompt del clasificador. Solo procesa
-//     el JSON resultante. La arquitectura es Flutter-first para el NLU.
-//
-//  TODOS LOS COMANDOS DE v3 SE CONSERVAN ÍNTEGRAMENTE.
+//  TODOS LOS COMPORTAMIENTOS DE v4 SE CONSERVAN ÍNTEGRAMENTE.
 
 using UnityEngine;
 
@@ -75,6 +54,8 @@ namespace IndoorNavAR.Integration
         //  { "action": "stop_voice" }
         //  { "action": "voice_status" }
         //  { "action": "tts_speak", "text": "...", "priority": 1, "interrupt": false }
+        //  { "action": "reroute_obstacle" }
+        //  { "action": "segmentation_ratio" }
 
         [System.Serializable]
         private class Cmd
@@ -128,7 +109,7 @@ namespace IndoorNavAR.Integration
                     api.OnTTSStatus(ttsJson);
                     break;
 
-                // ── Control de guía de voz (v4 NUEVOS) ────────────────────────
+                // ── Control de guía de voz (v4) ────────────────────────────────
 
                 // Repite la última instrucción. Diseñado para el comando
                 // de voz "repetir" / "¿qué dijiste?" del usuario.
@@ -163,16 +144,49 @@ namespace IndoorNavAR.Integration
                 // Permite que el clasificador conversacional envíe mensajes
                 // empáticos sin pasar por el bus de eventos de Unity.
                 // COMPAS classifier → label=HELP/conversacional → action="tts_speak"
-                // Prioridad recomendada:
-                //   p=1 para respuestas informativas (encola detrás del TTS actual)
-                //   p=2 para instrucciones importantes (puede preemptir p≤1)
-                //   p=3 SOLO para urgencias (obstáculo, emergencia) — usar con cuidado
                 case "tts_speak":
                     if (!string.IsNullOrWhiteSpace(cmd.text))
                         api.SpeakArbitraryText(cmd.text, cmd.priority, cmd.interrupt);
                     else
                         Debug.LogWarning("[Bridge] tts_speak: campo 'text' vacío.");
                     break;
+
+                // Simula un obstáculo desde Flutter para forzar recálculo de ruta.
+                case "reroute_obstacle":
+                    var mediator = FindFirstObjectByType<IndoorNavAR.Navigation.ObstacleRerouteMediator>();
+                    if (mediator != null)
+                        mediator.SimulateObstacleFromFlutter();
+                    else
+                        Debug.LogWarning("[Bridge] reroute_obstacle: ObstacleRerouteMediator no disponible.");
+                    break;
+
+                // ── Segmentación (v4.1 FIX) ───────────────────────────────────
+                //
+                // FIX 1: ObstacleSegmentationWorker no hereda de UnityEngine.Object,
+                //        por lo que FindFirstObjectByType<T> no compila.
+                //        Usamos el singleton estático Instance que ya expone el worker.
+                //
+                // FIX 2: renombramos la variable local de 'json' a 'segJson'
+                //        para evitar la colisión con el parámetro del método.
+                //
+                // FIX 3: Reply() es private en VoiceCommandAPI. Se delega al
+                //        nuevo método público SendSegmentationRatio() (v8.6).
+                case "segmentation_ratio":
+                {
+                    var worker = IndoorNavAR.Segmentation.ObstacleSegmentationWorker.Instance;
+                    if (worker != null)
+                    {
+                        // FIX 3: delegamos al método público — VoiceCommandAPI
+                        //        construye el JSON internamente y llama Reply().
+                        api.SendSegmentationRatio(worker.ObstacleRatio, worker.FloorRatio);
+                    }
+                    else
+                    {
+                        Debug.LogWarning("[Bridge] segmentation_ratio: ObstacleSegmentationWorker.Instance es null. " +
+                                         "¿SegmentationController ya inicializó el worker?");
+                    }
+                    break;
+                }
 
                 default:
                     Debug.LogWarning($"[Bridge] Acción desconocida: {cmd.action}");

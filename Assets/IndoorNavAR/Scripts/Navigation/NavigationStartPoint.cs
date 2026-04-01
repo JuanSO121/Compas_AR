@@ -1,36 +1,4 @@
 // File: NavigationStartPoint.cs
-// ✅ v8 — FIX: NotifyNavMeshReady* respetan _autoTeleportOnStart
-//
-// ============================================================================
-//  PROBLEMA CORREGIDO (v7 → v8)
-// ============================================================================
-//
-//  BUG RAÍZ (confirmado por log):
-//    [16:22:24] AROriginAligner: XR Origin → (5.62, 1.60, -2.62)  ← piso 0 ✅
-//    [16:22:25] StartPoint Level0: teleporta a Y=0.030             ← correcto ✅
-//    [16:22:25] StartPoint Level1: teleporta a Y=3.510             ← ROMPE TODO ❌
-//    [16:22:58] PathController: Ruta 0,0m                          ← agente=destino
-//
-//  CAUSA:
-//    NotifyNavMeshReadyAfterSessionRestore() lanza TeleportAgentWhenReady()
-//    cuando _hasTeleported=false (primera ejecución), IGNORANDO el valor de
-//    _autoTeleportOnStart. El StartPoint Level 1 tiene autoTeleportOnStart=false
-//    en el Inspector, pero el método bypaseaba esa comprobación.
-//
-//    El mismo bug existe en NotifyNavMeshReady() (flujo normal):
-//    también podía ejecutar TeleportAgentWhenReady() sin respetar el flag.
-//
-//  FIX v8:
-//    Ambos métodos comprueban _autoTeleportOnStart ANTES de lanzar la corrutina.
-//    Si autoTeleportOnStart=false, el StartPoint registra su Y para los cálculos
-//    de piso pero NO mueve el agente.
-//
-//    TeleportAgentWhenReady() (llamado desde Start()) ya estaba protegido por
-//    el if(_autoTeleportOnStart) en Start() — ese camino estaba correcto.
-//    El bug era solo en los métodos Notify*.
-//
-// ============================================================================
-//  TODOS LOS FIXES DE v7 SE CONSERVAN ÍNTEGRAMENTE.
 
 using System.Collections;
 using UnityEngine;

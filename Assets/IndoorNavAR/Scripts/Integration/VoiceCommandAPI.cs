@@ -1,30 +1,28 @@
 // File: VoiceCommandAPI.cs
-// ✅ v8.5 — Añade SendFrameToFlutter() para segmentación sin segunda cámara
+// ✅ v8.6 — Añade SendSegmentationRatio() para fix de FlutterUnityBridge
 //
 // ════════════════════════════════════════════════════════════════════════════
-// CAMBIOS v8.4 → v8.5
+// CAMBIOS v8.5 → v8.6
 // ════════════════════════════════════════════════════════════════════════════
 //
-//  ÚNICO CAMBIO: nuevo método público SendFrameToFlutter(string frameJson).
+//  ÚNICO CAMBIO: nuevo método público SendSegmentationRatio(float, float).
 //
 //  CONTEXTO:
-//    ARCore/ARKit toma control exclusivo de la cámara trasera. Flutter no
-//    puede abrir un CameraController independiente mientras Unity está activo.
-//    La solución es que Unity capture los frames (ya los tiene vía
-//    ARCameraManager) y los reenvíe a Flutter por el bridge existente.
+//    FlutterUnityBridge.cs (case "segmentation_ratio") necesitaba llamar
+//    Reply() directamente, pero Reply() es private. El error CS0122 impedía
+//    compilar. La solución correcta es exponer un método público específico
+//    que encapsule la construcción del JSON y la llamada a Reply().
 //
-//  FLUJO:
-//    CameraFrameSender.cs → SendFrameToFlutter() → Reply() →
-//    UnityBridgeService.dart (intercepta action="frame_data") →
-//    ObstacleDetectionService (TFLite, sin CameraController)
+//  DISEÑO:
+//    • Acepta obstacleRatio y floorRatio como float.
+//    • Si el patch de ObstacleSegmentationWorker_WallRatioPatch está aplicado,
+//      FlutterUnityBridge puede pasar también wallRatio usando la sobrecarga
+//      SendSegmentationRatio(float, float, float). Ambas sobrecargas se
+//      incluyen aquí para compatibilidad futura.
+//    • Sin log por defecto (igual que SendFrameToFlutter) — puede llamarse
+//      frecuentemente desde Flutter si el dev lo decide.
 //
-//  DISEÑO DEL MÉTODO:
-//    • Sin log por defecto — el volumen es 10 mensajes/s, logear cada uno
-//      saturaría la consola. Activar _logFrames para debug puntual.
-//    • Sin throttle propio — CameraFrameSender ya lo gestiona a nivel de fps.
-//    • Sin EventBus — envío directo igual que SpeakArbitraryText (v8.4 FIX).
-//
-//  TODO LO DEMÁS ES IDÉNTICO A v8.4.
+//  TODO LO DEMÁS ES IDÉNTICO A v8.5.
 
 using System;
 using System.Text;
@@ -285,15 +283,8 @@ namespace IndoorNavAR.Integration
 
         /// <summary>
         /// ✅ v8.4 FIX — Habla texto libre generado por Flutter (COMPAS).
-        ///
         /// Envía tts_request DIRECTAMENTE a Flutter via Reply(),
-        /// sin pasar por EventBus. Evita el loop de repetición que
-        /// existía en v8.3 (EventBus → OnTTSRequest → Reply → 2 veces).
-        ///
-        /// Restricciones de prioridad:
-        ///   • priority clamp: 0-2 (p=3 reservado para urgencias de Unity)
-        ///   • throttle: mínimo _ttsRequestThrottle segundos entre llamadas
-        ///   • interrupt=true solo si priority=2 Y el caller lo pidió
+        /// sin pasar por EventBus.
         /// </summary>
         public void SpeakArbitraryText(string text, int priority, bool interrupt)
         {
@@ -333,36 +324,76 @@ namespace IndoorNavAR.Integration
         #endregion
 
         // =====================================================================
-        //  ✅ v8.5 NUEVO — Envío de frames de cámara a Flutter
+        //  ✅ v8.5 — Envío de frames de cámara a Flutter
         // =====================================================================
 
         #region Frame sender (v8.5)
 
         /// <summary>
         /// ✅ v8.5 — Envía un frame de cámara AR a Flutter para segmentación.
-        ///
-        /// Llamado por CameraFrameSender.cs a ~10 fps con un JSON pre-serializado:
-        ///   { "action": "frame_data", "data": "<base64 JPEG>", "w": 224, "h": 224 }
-        ///
-        /// Flutter intercepta action="frame_data" en UnityBridgeService ANTES
-        /// de pasarlo a onResponse — no contamina el canal de comandos existente.
-        ///
-        /// DISEÑO:
-        ///   • Sin log por defecto (_logFrames) — 10 mensajes/s saturan la consola.
-        ///   • Sin throttle propio — CameraFrameSender ya lo gestiona.
-        ///   • Sin EventBus — envío directo via Reply() (igual que SpeakArbitraryText).
-        ///   • frameJson ya está serializado por CameraFrameSender para evitar
-        ///     asignaciones extra de StringBuilder en el hot path.
+        /// Llamado por CameraFrameSender.cs a ~10 fps.
         /// </summary>
         public void SendFrameToFlutter(string frameJson)
         {
             if (string.IsNullOrEmpty(frameJson)) return;
-
-            // Envío directo sin log en el hot path
             SendUnityMessageToFlutter(_flutterGameObject, _responseMethod, frameJson);
-
             if (_logFrames)
                 Debug.Log($"[VoiceAPI] 📸 frame_data → Flutter ({frameJson.Length} chars)");
+        }
+
+        #endregion
+
+        // =====================================================================
+        //  ✅ v8.6 NUEVO — Envío de ratios de segmentación a Flutter
+        // =====================================================================
+
+        #region Segmentation ratio sender (v8.6)
+
+        /// <summary>
+        /// ✅ v8.6 — Envía obstacle y floor ratio a Flutter.
+        ///
+        /// Reemplaza el acceso directo a Reply() desde FlutterUnityBridge,
+        /// que causaba CS0122 (Reply es private). Este método público
+        /// encapsula la construcción del JSON y la llamada a Reply().
+        ///
+        /// Llamado por FlutterUnityBridge cuando recibe action="segmentation_ratio".
+        ///
+        /// JSON enviado:
+        ///   { "action": "segmentation_ratio", "obstacle": 0.12, "floor": 0.45 }
+        /// </summary>
+        public void SendSegmentationRatio(float obstacleRatio, float floorRatio)
+        {
+            _sb.Clear();
+            _sb.Append("{\"action\":\"segmentation_ratio\"");
+            _sb.Append(",\"obstacle\":");
+            _sb.Append(obstacleRatio.ToString("F3"));
+            _sb.Append(",\"floor\":");
+            _sb.Append(floorRatio.ToString("F3"));
+            _sb.Append('}');
+
+            Reply(_sb.ToString());
+        }
+
+        /// <summary>
+        /// Sobrecarga con wallRatio — disponible cuando el patch
+        /// ObstacleSegmentationWorker_WallRatioPatch está aplicado.
+        ///
+        /// JSON enviado:
+        ///   { "action": "segmentation_ratio", "obstacle": 0.12, "floor": 0.45, "wall": 0.30 }
+        /// </summary>
+        public void SendSegmentationRatio(float obstacleRatio, float floorRatio, float wallRatio)
+        {
+            _sb.Clear();
+            _sb.Append("{\"action\":\"segmentation_ratio\"");
+            _sb.Append(",\"obstacle\":");
+            _sb.Append(obstacleRatio.ToString("F3"));
+            _sb.Append(",\"floor\":");
+            _sb.Append(floorRatio.ToString("F3"));
+            _sb.Append(",\"wall\":");
+            _sb.Append(wallRatio.ToString("F3"));
+            _sb.Append('}');
+
+            Reply(_sb.ToString());
         }
 
         #endregion
@@ -774,6 +805,12 @@ namespace IndoorNavAR.Integration
 
         [ContextMenu("Test: Frame sender — log toggle")]
         private void DbgToggleFrameLog() => _logFrames = !_logFrames;
+
+        [ContextMenu("Test: SendSegmentationRatio (0.6 obstacle, 0.05 floor)")]
+        private void DbgSegRatio() => SendSegmentationRatio(0.6f, 0.05f);
+
+        [ContextMenu("Test: SendSegmentationRatio con wall (0.6 wall, 0.04 floor)")]
+        private void DbgSegRatioWall() => SendSegmentationRatio(0.05f, 0.04f, 0.6f);
 
         #endregion
     }
