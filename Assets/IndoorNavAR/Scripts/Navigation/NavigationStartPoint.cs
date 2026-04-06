@@ -1,5 +1,23 @@
 // File: NavigationStartPoint.cs
-
+// ✅ FIX v8.1 — Corrección de bug de interpolación de string en
+//              NotifyNavMeshReadyAfterSessionRestore() (FloorHeight no se mostraba).
+//
+// ============================================================================
+//  CAMBIOS → v8.1
+// ============================================================================
+//
+//  BUG: En NotifyNavMeshReadyAfterSessionRestore(), el log que muestra
+//  FloorHeight usaba un string literal en lugar de un string interpolado:
+//
+//    ANTES (bug):
+//      "teleport omitido. Este StartPoint define FloorHeight={FloorHeight:F3}m ..."
+//      → Imprime literalmente "{FloorHeight:F3}m" en el log.
+//
+//    DESPUÉS (fix):
+//      $"teleport omitido. Este StartPoint define FloorHeight={FloorHeight:F3}m ..."
+//      → Imprime el valor real, ej: "FloorHeight=3.480m"
+//
+//  Todos los demás comportamientos se conservan íntegramente.
 
 using System.Collections;
 using UnityEngine;
@@ -107,8 +125,6 @@ namespace IndoorNavAR.Navigation
             _navMeshSignaled = true;
             Debug.Log($"[StartPoint Level{_level}] 📡 NavMesh listo (notificación directa).");
 
-            // ✅ v8 FIX: respetar el flag. Si autoTeleportOnStart=false, este
-            // StartPoint solo sirve para definir FloorHeight — no teleporta.
             if (!_autoTeleportOnStart)
             {
                 Debug.Log($"[StartPoint Level{_level}] ⏸ autoTeleportOnStart=false — " +
@@ -116,9 +132,6 @@ namespace IndoorNavAR.Navigation
                 return;
             }
 
-            // La corrutina ya fue lanzada en Start() si autoTeleportOnStart=true.
-            // Solo necesitamos señalar que el NavMesh está listo para desbloquearla.
-            // No relanzar si ya está corriendo o ya teleportó.
             if (_teleportCoroutine == null && !_hasTeleported)
             {
                 Debug.Log($"[StartPoint Level{_level}] 🚀 Relanzando corrutina de teleport " +
@@ -130,29 +143,22 @@ namespace IndoorNavAR.Navigation
         /// <summary>
         /// ✅ v7: Versión de NotifyNavMeshReady para uso durante restauración de sesión.
         /// ✅ v8 FIX: respeta _autoTeleportOnStart en TODOS los casos.
-        ///
-        /// Si autoTeleportOnStart=false → nunca teleporta (define solo FloorHeight).
-        /// Si autoTeleportOnStart=true  → solo teleporta en la primera carga
-        ///   (_hasTeleported=false). En restauraciones posteriores, el XR Origin
-        ///   ya está alineado y mover el agente al StartPoint causaría desalineación.
+        /// ✅ v8.1 FIX: corregido bug de interpolación de string en el log de FloorHeight.
         /// </summary>
         public void NotifyNavMeshReadyAfterSessionRestore()
         {
             _navMeshSignaled = true;
             Debug.Log($"[StartPoint Level{_level}] 📡 NavMesh listo (restauración de sesión).");
 
-            // ✅ v8 FIX: respetar el flag PRIMERO, antes de cualquier otra lógica.
-            // Un StartPoint con autoTeleportOnStart=false nunca debe mover el agente,
-            // sin importar si es primera carga o restauración de sesión.
             if (!_autoTeleportOnStart)
             {
+                // ✅ FIX v8.1: agregado $ para interpolación correcta de FloorHeight
                 Debug.Log($"[StartPoint Level{_level}] ⏸ [SessionRestore] autoTeleportOnStart=false — " +
-                          "teleport omitido. Este StartPoint define FloorHeight={FloorHeight:F3}m " +
-                          "para cálculos de distancia multi-piso.");
+                          $"teleport omitido. Este StartPoint define FloorHeight={FloorHeight:F3}m " +
+                          $"para cálculos de distancia multi-piso.");
                 return;
             }
 
-            // ✅ v7: Si ya teleportó en esta sesión, no volver a hacerlo.
             if (_hasTeleported)
             {
                 Debug.Log($"[StartPoint Level{_level}] ✅ [SessionRestore] Agente ya fue teleportado — " +
@@ -160,7 +166,6 @@ namespace IndoorNavAR.Navigation
                 return;
             }
 
-            // Primera carga con autoTeleportOnStart=true → ejecutar.
             Debug.Log($"[StartPoint Level{_level}] 🚀 [SessionRestore] Primer teleport — ejecutando.");
             if (_teleportCoroutine != null)
                 StopCoroutine(_teleportCoroutine);
@@ -220,7 +225,6 @@ namespace IndoorNavAR.Navigation
             Debug.Log($"[StartPoint Level{_level}] ✅ NavigationAgent encontrado: " +
                       $"'{_agent.gameObject.name}' (activo={_agent.gameObject.activeInHierarchy})");
 
-            // Esperar confirmación de posición del modelo
             if (!_modelPositionConfirmed)
             {
                 Debug.Log($"[StartPoint Level{_level}] ⏳ Esperando confirmación de posición del modelo...");
@@ -235,7 +239,6 @@ namespace IndoorNavAR.Navigation
                     Debug.LogWarning($"[StartPoint Level{_level}] ⚠️ Timeout esperando posición del modelo.");
             }
 
-            // Esperar NavMesh disponible
             if (_waitForNavMesh)
             {
                 float elapsed = 0f;
@@ -253,10 +256,8 @@ namespace IndoorNavAR.Navigation
                 Debug.Log($"[StartPoint Level{_level}] NavMesh detectado vía: {source}");
             }
 
-            // Frame extra para propagación
             yield return new WaitForSeconds(0.3f);
 
-            // Esperar a que el agente esté activo
             float activationWait = 0f;
             while (!_agent.gameObject.activeInHierarchy && activationWait < 5f)
             {
@@ -531,10 +532,6 @@ namespace IndoorNavAR.Navigation
                 p.NotifyNavMeshReady();
         }
 
-        /// <summary>
-        /// ✅ v7: Notifica NavMesh listo tras restauración de sesión.
-        /// ✅ v8: Los StartPoints con autoTeleportOnStart=false no moverán el agente.
-        /// </summary>
         public static void NotifyNavMeshReadyAfterSessionRestore()
         {
             _startPoints.RemoveAll(p => p == null);

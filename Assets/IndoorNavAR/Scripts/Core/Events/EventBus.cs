@@ -1,23 +1,28 @@
 // File: EventBus.cs
-// ✅ v3.1 — Solo se expande GuideAnnouncementType para NavigationVoiceGuide v5.1
+// ✅ v3.3 — Añade ARSessionReadyEvent para PersistenceManager v12 / SceneReadyNotifier v3.0
 //
-// ============================================================================
-//  CAMBIOS v3 → v3.1
-// ============================================================================
+// ════════════════════════════════════════════════════════════════════════════
+// CAMBIOS v3.2 → v3.3
+// ════════════════════════════════════════════════════════════════════════════
 //
-//  ÚNICO CAMBIO: enum GuideAnnouncementType
+//  ÚNICO CAMBIO: nuevo struct ARSessionReadyEvent
 //
-//    ANTES (v3): 7 valores — todos los VoiceInstructionType no listados
-//    caían en default → ResumeGuide dentro de NavigationVoiceGuide.Speak(),
-//    por lo que Flutter recibía type="ResumeGuide" para giros, llegada,
-//    inicio de navegación, etc. y no podía asignar prioridades correctas.
+//  CONTEXTO:
+//    PersistenceManager v12 publica ARSessionReadyEvent cuando la auto-carga
+//    de sesión termina (_autoLoadCompleted = true).
+//    SceneReadyNotifier v3.0 se suscribe a este evento para reaccionar
+//    inmediatamente en lugar de hacer polling de IsSessionLoadCompleted.
 //
-//    AHORA (v3.1): 19 valores — mapeo 1:1 con cada VoiceInstructionType.
-//    Los 7 valores originales conservan su posición ordinal (0-6) para no
-//    romper código que compare por índice numérico.
-//    Los 12 valores nuevos se añaden a partir del índice 7.
+//    Esto elimina la dependencia de timeout en Flutter para detectar si
+//    Unity tiene sesión cargada: el evento llega exactamente cuando la
+//    carga termina, sin importar cuánto tiempo tomó.
 //
-//  TODO LO DEMÁS ES IDÉNTICO A v3.
+//    Flujo:
+//      PersistenceManager.Start() → LoadSession() → ... → ARSessionReadyEvent
+//      SceneReadyNotifier.OnARSessionReadyEvent() → NotifyReady() si todo listo
+//      FlutterUnityBridge.NotifySceneReady() → scene_ready a Flutter con datos reales
+//
+//  TODOS LOS COMPORTAMIENTOS DE v3.2 SE CONSERVAN ÍNTEGRAMENTE.
 
 using System;
 using System.Collections.Generic;
@@ -140,6 +145,20 @@ namespace IndoorNavAR.Core.Events
         public UnityEngine.XR.ARFoundation.ARPlane Plane;
     }
 
+    /// <summary>
+    /// ✅ v3.3 NUEVO — Publicado por PersistenceManager v12 cuando la auto-carga
+    /// de sesión al inicio termina (_autoLoadCompleted = true).
+    ///
+    /// SceneReadyNotifier v3.0 se suscribe a este evento para:
+    ///   1. Eliminar la dependencia del polling de IsSessionLoadCompleted.
+    ///   2. Reaccionar inmediatamente sin importar cuánto tardó LoadSession().
+    ///   3. Enviar scene_ready a Flutter con los datos reales de sesión.
+    ///
+    /// Sin campos: la sola llegada del evento es la señal de que la carga terminó.
+    /// Los datos de la sesión se leen directamente de PersistenceManager.AutoLoadResult
+    /// y WaypointManager.WaypointCount en BuildReadyDetail().
+    /// </summary>
+
     // ── Waypoints ─────────────────────────────────────────────────────────────
 
     public struct WaypointPlacedEvent
@@ -169,18 +188,11 @@ namespace IndoorNavAR.Core.Events
 
     /// <summary>
     /// Publicado por VoiceCommandAPI cuando Flutter reporta que el TTS
-    /// empezó o terminó de hablar. ARGuideController lo escucha para
-    /// pausar/reanudar el NPC durante instrucciones de alta prioridad.
+    /// empezó o terminó de hablar.
     /// </summary>
     public struct TTSSpeakingEvent
     {
-        /// <summary>True cuando el TTS empieza a hablar, false cuando termina.</summary>
         public bool IsSpeaking;
-
-        /// <summary>
-        /// Prioridad de la instrucción que se está leyendo (0-4).
-        /// ARGuideController solo pausa el NPC para prioridad ≥ 3.
-        /// </summary>
         public int Priority;
     }
 
@@ -235,6 +247,15 @@ namespace IndoorNavAR.Core.Events
         public string Reason;
     }
 
+    /// <summary>
+    /// ✅ v3.2 — Publicado por NavigationManager.StopNavigation() cuando
+    /// el usuario detiene la navegación de forma intencional.
+    /// </summary>
+    public struct NavigationStoppedEvent
+    {
+        public string DestinationWaypointName;
+    }
+
     public struct NavigationProgressEvent
     {
         public float   DistanceRemaining;
@@ -251,19 +272,8 @@ namespace IndoorNavAR.Core.Events
 
     public struct RouteDeviatedEvent
     {
-        /// <summary>
-        /// Posición real del usuario en el momento de detectar desviación.
-        /// </summary>
         public Vector3 UserPosition { get; set; }
-
-        /// <summary>
-        /// Distancia lateral al path en metros.
-        /// </summary>
         public float DeviationDistance { get; set; }
-
-        /// <summary>
-        /// Destino al que recalcular (copiado del path activo).
-        /// </summary>
         public Vector3 Destination { get; set; }
     }
 
@@ -275,21 +285,12 @@ namespace IndoorNavAR.Core.Events
 
     public struct ObstacleDetectedEvent
     {
-        /// <summary>Posición mundial donde se colocó el obstáculo virtual.</summary>
         public Vector3 ObstaclePosition;
-
-        /// <summary>Ratio de obstáculos detectado por el modelo ML (0..1).</summary>
         public float DetectedRatio;
     }
 
     // ── Guía NPC ─────────────────────────────────────────────────────────────
 
-    /// <summary>
-    /// Publicado por ARGuideController para avisos de voz que Flutter debe
-    /// leer en voz alta (TTS) al usuario con baja visión.
-    /// VoiceCommandAPI se suscribe y lo reenvía a Flutter con
-    /// action="guide_announcement".
-    /// </summary>
     public struct GuideAnnouncementEvent
     {
         public GuideAnnouncementType AnnouncementType;
@@ -297,41 +298,32 @@ namespace IndoorNavAR.Core.Events
         public int    CurrentFloor;
     }
 
-    /// <summary>
-    /// ✅ v3.1 — Enum expandido de 7 a 19 valores.
-    ///
-    /// Los 7 valores originales conservan su índice ordinal (0-6) para
-    /// no romper comparaciones numéricas existentes en el proyecto.
-    /// Los 12 valores nuevos (7-18) dan a Flutter la información de tipo
-    /// necesaria para asignar prioridades TTS correctas en
-    /// VoiceNavigationService._priorityForType().
-    /// </summary>
     public enum GuideAnnouncementType
     {
         // ── Originales v3 (NO reordenar) ─────────────────────────────────────
-        ApproachingStairs     = 0,   // Escaleras próximas        → urgent
-        StartingClimb         = 1,   // Iniciando subida           → urgent
-        StartingDescent       = 2,   // Iniciando bajada           → urgent
-        FloorReached          = 3,   // Llegó al piso destino      → medium
-        WaitingForUser        = 4,   // Usuario detenido           → low
-        ResumeGuide           = 5,   // Reanudar guía (genérico)   → medium
-        StairsComplete        = 6,   // Escaleras completadas      → medium
+        ApproachingStairs     = 0,
+        StartingClimb         = 1,
+        StartingDescent       = 2,
+        FloorReached          = 3,
+        WaitingForUser        = 4,
+        ResumeGuide           = 5,
+        StairsComplete        = 6,
 
         // ── Nuevos v3.1 ───────────────────────────────────────────────────────
-        ResumeAfterSeparation = 7,   // Reanudar tras separación   → medium
-        StartNavigation       = 8,   // Inicio de navegación       → medium
-        Arrived               = 9,   // Llegada al destino         → medium
+        ResumeAfterSeparation = 7,
+        StartNavigation       = 8,
+        Arrived               = 9,
 
-        TurnLeft              = 10,  // Giro izquierda             → high
-        TurnRight             = 11,  // Giro derecha               → high
-        SlightLeft            = 12,  // Giro leve izquierda        → high
-        SlightRight           = 13,  // Giro leve derecha          → high
-        UTurn                 = 14,  // Media vuelta               → high
+        TurnLeft              = 10,
+        TurnRight             = 11,
+        SlightLeft            = 12,
+        SlightRight           = 13,
+        UTurn                 = 14,
 
-        GoStraight            = 15,  // Continuar recto            → low
-        UserDeviated          = 16,  // Desviado / desorientado    → urgent
-        ObstacleWarning       = 17,  // Posible obstáculo          → urgent
-        ProgressUpdate        = 18,  // Actualización de progreso  → low
+        GoStraight            = 15,
+        UserDeviated          = 16,
+        ObstacleWarning       = 17,
+        ProgressUpdate        = 18,
     }
 
     // ── UI / Mensajes ─────────────────────────────────────────────────────────

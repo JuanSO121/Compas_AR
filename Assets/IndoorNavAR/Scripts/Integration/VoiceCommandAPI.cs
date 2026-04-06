@@ -1,28 +1,21 @@
 // File: VoiceCommandAPI.cs
-// ✅ v8.6 — Añade SendSegmentationRatio() para fix de FlutterUnityBridge
+// ✅ v8.7 — Añade ReplyPublic() para que FlutterUnityBridge.NotifySceneReady()
+//           pueda enviar scene_ready sin romper encapsulación.
 //
 // ════════════════════════════════════════════════════════════════════════════
-// CAMBIOS v8.5 → v8.6
+// CAMBIOS v8.6 → v8.7
 // ════════════════════════════════════════════════════════════════════════════
 //
-//  ÚNICO CAMBIO: nuevo método público SendSegmentationRatio(float, float).
+//  ÚNICO CAMBIO: nuevo método público ReplyPublic(string json).
 //
 //  CONTEXTO:
-//    FlutterUnityBridge.cs (case "segmentation_ratio") necesitaba llamar
-//    Reply() directamente, pero Reply() es private. El error CS0122 impedía
-//    compilar. La solución correcta es exponer un método público específico
-//    que encapsule la construcción del JSON y la llamada a Reply().
+//    FlutterUnityBridge.NotifySceneReady() (v4.3) necesita enviar el mensaje
+//    { "action": "scene_ready", "ok": true } a Flutter. Reply() es private,
+//    por lo que se expone una versión pública con el mismo comportamiento.
+//    Igual que SendSegmentationRatio(), encapsula la llamada sin exponer
+//    la implementación interna de SendUnityMessageToFlutter().
 //
-//  DISEÑO:
-//    • Acepta obstacleRatio y floorRatio como float.
-//    • Si el patch de ObstacleSegmentationWorker_WallRatioPatch está aplicado,
-//      FlutterUnityBridge puede pasar también wallRatio usando la sobrecarga
-//      SendSegmentationRatio(float, float, float). Ambas sobrecargas se
-//      incluyen aquí para compatibilidad futura.
-//    • Sin log por defecto (igual que SendFrameToFlutter) — puede llamarse
-//      frecuentemente desde Flutter si el dev lo decide.
-//
-//  TODO LO DEMÁS ES IDÉNTICO A v8.5.
+//  TODO LO DEMÁS ES IDÉNTICO A v8.6.
 
 using System;
 using System.Text;
@@ -344,22 +337,13 @@ namespace IndoorNavAR.Integration
         #endregion
 
         // =====================================================================
-        //  ✅ v8.6 NUEVO — Envío de ratios de segmentación a Flutter
+        //  ✅ v8.6 — Envío de ratios de segmentación a Flutter
         // =====================================================================
 
         #region Segmentation ratio sender (v8.6)
 
         /// <summary>
         /// ✅ v8.6 — Envía obstacle y floor ratio a Flutter.
-        ///
-        /// Reemplaza el acceso directo a Reply() desde FlutterUnityBridge,
-        /// que causaba CS0122 (Reply es private). Este método público
-        /// encapsula la construcción del JSON y la llamada a Reply().
-        ///
-        /// Llamado por FlutterUnityBridge cuando recibe action="segmentation_ratio".
-        ///
-        /// JSON enviado:
-        ///   { "action": "segmentation_ratio", "obstacle": 0.12, "floor": 0.45 }
         /// </summary>
         public void SendSegmentationRatio(float obstacleRatio, float floorRatio)
         {
@@ -375,11 +359,7 @@ namespace IndoorNavAR.Integration
         }
 
         /// <summary>
-        /// Sobrecarga con wallRatio — disponible cuando el patch
-        /// ObstacleSegmentationWorker_WallRatioPatch está aplicado.
-        ///
-        /// JSON enviado:
-        ///   { "action": "segmentation_ratio", "obstacle": 0.12, "floor": 0.45, "wall": 0.30 }
+        /// Sobrecarga con wallRatio.
         /// </summary>
         public void SendSegmentationRatio(float obstacleRatio, float floorRatio, float wallRatio)
         {
@@ -395,6 +375,27 @@ namespace IndoorNavAR.Integration
 
             Reply(_sb.ToString());
         }
+
+        #endregion
+
+        // =====================================================================
+        //  ✅ v8.7 NUEVO — ReplyPublic para handshake scene_ready
+        // =====================================================================
+
+        #region Reply público (v8.7)
+
+        /// <summary>
+        /// ✅ v8.7 — Versión pública de Reply() para uso exclusivo del handshake.
+        ///
+        /// Permite que FlutterUnityBridge.NotifySceneReady() envíe
+        /// { "action": "scene_ready" } a Flutter sin romper la encapsulación
+        /// de SendUnityMessageToFlutter().
+        ///
+        /// No usar para casos de uso distintos al handshake — el resto de
+        /// mensajes deben pasar por los métodos específicos (Reply privado,
+        /// SendSegmentationRatio, etc.).
+        /// </summary>
+        public void ReplyPublic(string json) => Reply(json);
 
         #endregion
 
@@ -616,6 +617,18 @@ namespace IndoorNavAR.Integration
 
         #region Cache de waypoints
 
+        // ✅ NUEVO — Permite marcar el cache como sucio desde otros sistemas
+        public void MarkWaypointCacheDirty() => _waypointCacheDirty = true;
+
+        // ✅ NUEVO — Expone el JSON cacheado sin reconstruir innecesariamente
+        public string GetWaypointListJson()
+        {
+            if (_waypointCacheDirty)
+                RebuildWaypointCache();
+
+            return _waypointListCache;
+        }
+
         private void RebuildWaypointCache()
         {
             var list = _waypointManager.Waypoints;
@@ -811,6 +824,10 @@ namespace IndoorNavAR.Integration
 
         [ContextMenu("Test: SendSegmentationRatio con wall (0.6 wall, 0.04 floor)")]
         private void DbgSegRatioWall() => SendSegmentationRatio(0.05f, 0.04f, 0.6f);
+
+        [ContextMenu("Test: Simular scene_ready")]
+        private void DbgSceneReady()
+            => ReplyPublic("{\"action\":\"scene_ready\",\"ok\":true,\"message\":\"Test desde ContextMenu\"}");
 
         #endregion
     }

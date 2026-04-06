@@ -1,29 +1,23 @@
 // File: SegmentationController.cs
-// ✅ v9.2 — Push automático de segmentation_ratio a Flutter + SetOverlayVisible público
+// ✅ v10.1 — Fix: NavigationStoppedEvent + notificación segmentation_active a Flutter
 //
 // ============================================================================
-//  CAMBIOS v9.1 → v9.2
+//  CAMBIOS v10.0 → v10.1
 // ============================================================================
 //
-//  FIX #5 — Push automático de ratios a Flutter (barras del panel)
-//    PROBLEMA: Las barras de segmentación en Flutter nunca se actualizaban
-//    porque el flujo era PULL (Flutter pide → Unity responde). Nadie en
-//    Flutter pedía "segmentation_ratio" periódicamente, así que el callback
-//    onSegmentationRatioReceived nunca se disparaba.
+//  FIX #1 — NavigationStoppedEvent (error CS0246 resuelto)
+//    v10.0 referenciaba NavigationStoppedEvent que no existía en EventBus.
+//    Se agrega en EventBus v3.2. El controller ya no usa NavigationCancelledEvent
+//    como workaround — usa el evento semánticamente correcto.
 //
-//    SOLUCIÓN: Cuando resultReady == true (inferencia completada), llamar
-//    directamente a VoiceCommandAPI.Instance?.SendSegmentationRatio()
-//    con los tres ratios (obstacle, floor, wall). Esto es un PUSH automático
-//    a la misma frecuencia que ocurre la inferencia (~cada 18 frames).
+//  FIX #2 — Notificación de estado a Flutter via VoiceCommandAPI
+//    Cuando la segmentación se activa o desactiva, se notifica a Flutter con:
+//      { "action": "segmentation_active", "active": true/false }
+//    Esto permite que Flutter muestre/oculte controles de overlay en su UI
+//    y sepa cuándo está disponible el ratio de segmentación.
+//    La notificación usa VoiceCommandAPI.Instance?.NotifySegmentationState().
 //
-//  NUEVO — OverlayVisible + SetOverlayVisible(bool)
-//    FlutterUnityBridge necesita poder activar/desactivar la máscara de
-//    segmentación desde el botón "Mask" del panel de Flutter.
-//    Se expone la propiedad pública OverlayVisible y el método
-//    SetOverlayVisible(bool visible) para que FlutterUnityBridge lo llame
-//    via case "toggle_seg_mask".
-//
-//  TODOS LOS CAMBIOS DE v9.1 SE CONSERVAN ÍNTEGRAMENTE.
+//  TODOS LOS CAMBIOS DE v10.0 SE CONSERVAN ÍNTEGRAMENTE.
 
 using System;
 using System.Collections;
@@ -34,7 +28,8 @@ using UnityEngine.XR.ARSubsystems;
 using Unity.Collections;
 using Unity.Sentis;
 using IndoorNavAR.Integration;
-using IndoorNavAR.Navigation; // para ObstacleRerouteMediator.IsActive
+using IndoorNavAR.Navigation;
+using IndoorNavAR.Core.Events;
 
 namespace IndoorNavAR.Segmentation
 {
@@ -78,6 +73,10 @@ namespace IndoorNavAR.Segmentation
         [SerializeField] private float _obstacleAlertThreshold = 0.12f;
         [SerializeField] private float _alertCooldown          = 3.5f;
 
+        [Header("✅ v10.0: Control de activación")]
+        [Tooltip("Si está marcado, la segmentación SOLO se activa durante navegación.")]
+        [SerializeField] private bool _onlyDuringNavigation = true;
+
         [Header("Debug")]
         [SerializeField] private bool _logStats        = true;
         [SerializeField] private bool _logFrameCapture = true;
@@ -105,9 +104,13 @@ namespace IndoorNavAR.Segmentation
         private int     _totalFramesReceived = 0;
         private Camera  _arCamera;
 
-        // ✅ v9.2 — Propiedad pública para que FlutterUnityBridge pueda
-        // leer el estado actual del overlay antes de togglearlo.
+        // ✅ v10.0: Estado de activación de segmentación
+        private bool _segmentationActive = false;
+
         public bool OverlayVisible => _showOverlay;
+        
+        // ✅ v10.0: Propiedad pública para verificar si la segmentación está activa
+        public bool IsSegmentationActive => _segmentationActive;
 
         // ─────────────────────────────────────────────────────────────────
 
@@ -162,16 +165,28 @@ namespace IndoorNavAR.Segmentation
             _overlayRenderer?.SetFlipMode(SegmentationOverlayRenderer.FlipMode.None);
 
             _worker.OnInferenceComplete += HandleInferenceComplete;
-            _cameraManager.frameReceived += OnCameraFrameReceived;
+            
+            // ✅ v10.0: Solo suscribirse a frames si NO requiere navegación
+            if (!_onlyDuringNavigation)
+            {
+                _cameraManager.frameReceived += OnCameraFrameReceived;
+                _segmentationActive = true;
+                // ✅ v10.1: Notificar a Flutter el estado inicial
+                NotifyFlutterSegmentationState(true);
+            }
 
             _currentInterval = _inferenceEveryNFrames;
             _initialized     = true;
 
+            // ✅ v10.0: Suscribirse a eventos de navegación
+            SubscribeToNavigationEvents();
+
             StartCoroutine(DiagnoseARFrames());
 
-            Debug.Log($"[SegCtrl] ✅ v9.2 inicializado. rotation={_tensorRotation}° " +
+            Debug.Log($"[SegCtrl] ✅ v10.1 inicializado. rotation={_tensorRotation}° " +
                       $"flipY={_flipInputY} flipX={_flipInputX} " +
-                      $"MODEL_SIZE={MODEL_SIZE} ROI={_roiTopSkip:P0}");
+                      $"MODEL_SIZE={MODEL_SIZE} ROI={_roiTopSkip:P0} " +
+                      $"onlyDuringNav={_onlyDuringNavigation}");
         }
 
         private void ForceCanvasExpand()
@@ -194,11 +209,126 @@ namespace IndoorNavAR.Segmentation
             if (_cameraManager != null)
                 _cameraManager.frameReceived -= OnCameraFrameReceived;
 
+            // ✅ v10.0: Desuscribirse de eventos de navegación
+            UnsubscribeFromNavigationEvents();
+
             _worker?.Dispose();
 
             if (_cameraRT != null)            { _cameraRT.Release(); Destroy(_cameraRT); }
             if (_frameBufferFallback != null)    Destroy(_frameBufferFallback);
             if (_fitTex != null)                 Destroy(_fitTex);
+        }
+
+        // ✅ v10.0 ──────────────────────────────────────────────────────────
+        // Gestión de eventos de navegación
+        // ──────────────────────────────────────────────────────────────────
+
+        private void SubscribeToNavigationEvents()
+        {
+            var bus = EventBus.Instance;
+            if (bus == null)
+            {
+                Debug.LogWarning("[SegCtrl] ⚠️ EventBus no disponible. " +
+                                 "Segmentación no se activará automáticamente.");
+                return;
+            }
+
+            bus.Subscribe<NavigationStartedEvent>(OnNavigationStarted);
+            bus.Subscribe<NavigationStoppedEvent>(OnNavigationStopped);   // ✅ v10.1: evento correcto
+            bus.Subscribe<NavigationArrivedEvent>(OnNavigationArrived);
+        }
+
+        private void UnsubscribeFromNavigationEvents()
+        {
+            var bus = EventBus.Instance;
+            if (bus == null) return;
+
+            bus.Unsubscribe<NavigationStartedEvent>(OnNavigationStarted);
+            bus.Unsubscribe<NavigationStoppedEvent>(OnNavigationStopped); // ✅ v10.1: evento correcto
+            bus.Unsubscribe<NavigationArrivedEvent>(OnNavigationArrived);
+        }
+
+        private void OnNavigationStarted(NavigationStartedEvent evt)
+        {
+            if (!_onlyDuringNavigation) return;
+            
+            ActivateSegmentation();
+            Debug.Log("[SegCtrl] 🚀 Navegación iniciada → Segmentación ACTIVADA");
+        }
+
+        private void OnNavigationStopped(NavigationStoppedEvent evt)  // ✅ v10.1: tipo correcto
+        {
+            if (!_onlyDuringNavigation) return;
+            
+            DeactivateSegmentation();
+            Debug.Log("[SegCtrl] 🛑 Navegación detenida → Segmentación DESACTIVADA");
+        }
+
+        private void OnNavigationArrived(NavigationArrivedEvent evt)
+        {
+            if (!_onlyDuringNavigation) return;
+            
+            DeactivateSegmentation();
+            Debug.Log("[SegCtrl] 🎯 Llegada a destino → Segmentación DESACTIVADA");
+        }
+
+        private void ActivateSegmentation()
+        {
+            if (_segmentationActive) return;
+            
+            _segmentationActive = true;
+            
+            if (_cameraManager != null)
+                _cameraManager.frameReceived += OnCameraFrameReceived;
+            
+            if (_showOverlay)
+                _overlayRenderer?.SetVisible(true);
+            
+            // ✅ v10.1: Notificar a Flutter que la segmentación está activa
+            NotifyFlutterSegmentationState(true);
+            
+            Debug.Log("[SegCtrl] ✅ Segmentación activada — consumo de recursos iniciado");
+        }
+
+        private void DeactivateSegmentation()
+        {
+            if (!_segmentationActive) return;
+            
+            _segmentationActive = false;
+            
+            if (_cameraManager != null)
+                _cameraManager.frameReceived -= OnCameraFrameReceived;
+            
+            _overlayRenderer?.SetVisible(false);
+            
+            // ✅ v10.1: Notificar a Flutter que la segmentación está inactiva
+            NotifyFlutterSegmentationState(false);
+            
+            Debug.Log("[SegCtrl] ⏸️ Segmentación desactivada — recursos liberados");
+        }
+
+        // ✅ v10.1 ──────────────────────────────────────────────────────────
+        // Notificación de estado a Flutter
+        // ──────────────────────────────────────────────────────────────────
+
+        /// <summary>
+        /// Envía a Flutter el estado actual de la segmentación:
+        ///   { "action": "segmentation_active", "active": true/false }
+        ///
+        /// Flutter puede usar esto para:
+        ///   - Mostrar/ocultar el botón "toggle_seg_mask"
+        ///   - Saber si los ratios de segmentación están disponibles
+        ///   - Actualizar indicadores visuales de estado en la UI
+        /// </summary>
+        private void NotifyFlutterSegmentationState(bool active)
+        {
+            var api = VoiceCommandAPI.Instance;
+            if (api == null) return;
+
+            string json = $"{{\"action\":\"segmentation_active\",\"active\":{(active ? "true" : "false")}}}";
+            api.ReplyPublic(json);
+
+            Debug.Log($"[SegCtrl] 📡 segmentation_active → Flutter: {active}");
         }
 
         // ─────────────────────────────────────────────────────────────────
@@ -216,6 +346,9 @@ namespace IndoorNavAR.Segmentation
 
         private void OnCameraFrameReceived(ARCameraFrameEventArgs args)
         {
+            // ✅ OPTIMIZACIÓN: Early exit si segmentación no está activa
+            if (!_segmentationActive) return;
+
             _totalFramesReceived++;
 
             if (_logFrameCapture && _totalFramesReceived <= 5)
@@ -319,7 +452,8 @@ namespace IndoorNavAR.Segmentation
 
         private void Update()
         {
-            if (!_initialized) return;
+            // ✅ OPTIMIZACIÓN: Early exit si segmentación no está activa
+            if (!_segmentationActive || !_initialized) return;
 
             bool resultReady = _worker.PollResult();
 
@@ -335,13 +469,13 @@ namespace IndoorNavAR.Segmentation
             {
                 _wasWorkerBusy           = false;
                 _consecutivePollTimeouts = 0;
-                _overlayRenderer?.UpdateMask(_worker.MaskData);
+                
+                // ✅ OPTIMIZACIÓN: Solo actualizar overlay si está visible
+                if (_overlayRenderer != null && _overlayRenderer.IsVisible)
+                    _overlayRenderer.UpdateMask(_worker.MaskData);
+                
                 EvaluateAlerts();
 
-                // ✅ v9.2 FIX #5 — Push automático de ratios a Flutter.
-                // Se llama en cada inferencia completada (~cada 18 frames).
-                // VoiceCommandAPI construye el JSON y llama Reply() internamente,
-                // por lo que no hay acceso a métodos privados desde aquí.
                 VoiceCommandAPI.Instance?.SendSegmentationRatio(
                     _worker.ObstacleRatio,
                     _worker.FloorRatio,
@@ -390,7 +524,11 @@ namespace IndoorNavAR.Segmentation
             if (!_worker.IsReady) { Debug.LogError("[SegCtrl] ❌ Fallback CPU falló."); return; }
 
             _worker.OnInferenceComplete += HandleInferenceComplete;
-            _cameraManager.frameReceived += OnCameraFrameReceived;
+            
+            // ✅ OPTIMIZACIÓN: Solo suscribirse si segmentación está activa
+            if (_segmentationActive)
+                _cameraManager.frameReceived += OnCameraFrameReceived;
+            
             _cpuFallbackActive = true;
             Debug.Log("[SegCtrl] ✅ Fallback CPU activo.");
         }
@@ -399,7 +537,6 @@ namespace IndoorNavAR.Segmentation
 
         private void EvaluateAlerts()
         {
-            // FIX #4 (v9.1): Si el mediador está activo, él maneja el TTS de obstáculo.
             if (ObstacleRerouteMediator.IsActive)
             {
                 if (_logStats)
@@ -419,16 +556,16 @@ namespace IndoorNavAR.Segmentation
             Debug.Log($"[SegCtrl] 🚧 Alerta standalone: {msg} ({_worker.ObstacleRatio:P1})");
         }
 
-        // ── Toggle overlay (v9.2) — llamado por FlutterUnityBridge ────────
+        // ── Toggle overlay ────────────────────────────────────────────────
 
-        /// <summary>
-        /// ✅ v9.2 — Activa o desactiva la máscara de segmentación visual.
-        /// Llamado por FlutterUnityBridge case "toggle_seg_mask".
-        /// </summary>
         public void SetOverlayVisible(bool visible)
         {
             _showOverlay = visible;
-            _overlayRenderer?.SetVisible(visible);
+            
+            // ✅ OPTIMIZACIÓN: Solo afectar overlay si segmentación está activa
+            if (_segmentationActive || !visible)
+                _overlayRenderer?.SetVisible(visible);
+            
             Debug.Log($"[SegCtrl] 🎭 Overlay → {(visible ? "VISIBLE" : "OCULTO")}");
         }
 
@@ -460,13 +597,20 @@ namespace IndoorNavAR.Segmentation
         [ContextMenu("Toggle Overlay")]
         private void DbgToggleOverlay()
         {
-            SetOverlayVisible(!_showOverlay); // ✅ v9.2: usa el método público
+            SetOverlayVisible(!_showOverlay);
         }
+
+        [ContextMenu("✅ Activar Segmentación")]
+        private void DbgActivate() => ActivateSegmentation();
+
+        [ContextMenu("⏸️ Desactivar Segmentación")]
+        private void DbgDeactivate() => DeactivateSegmentation();
 
         [ContextMenu("Log Stats")]
         private void DbgStats()
         {
-            Debug.Log($"[SegCtrl] Obstacle={_worker?.ObstacleRatio:P1} Floor={_worker?.FloorRatio:P1} " +
+            Debug.Log($"[SegCtrl] Active={_segmentationActive} " +
+                      $"Obstacle={_worker?.ObstacleRatio:P1} Floor={_worker?.FloorRatio:P1} " +
                       $"Wall={_worker?.WallRatio:P1} " +
                       $"Busy={_worker?.IsBusy} Frames={_totalFramesReceived} Rot={_tensorRotation}° " +
                       $"FlipY={_flipInputY} FlipX={_flipInputX} Interval={_currentInterval}f " +

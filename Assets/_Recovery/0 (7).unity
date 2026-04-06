@@ -463,11 +463,6 @@ MonoBehaviour:
   _waypointManager: {fileID: 186852594}
   _modelLoadManager: {fileID: 1492072617}
   _navMeshGenerator: {fileID: 976973327}
-  _stairRecreateDelayFrames: 10
-  _stairRecreateInterFrameMs: 0
-  _postNavMeshDelayMs: 500
-  _postStairsDelayMs: 300
-  _trackingWaitTimeout: 15
   _logOperations: 0
 --- !u!114 &626949938 stripped
 MonoBehaviour:
@@ -1018,8 +1013,6 @@ MonoBehaviour:
   _navMeshCoordinator: {fileID: 837302032}
   _autoInitialize: 1
   _autoLoadModel: 1
-  _alignWaitTimeout: 5
-  _alignPollInterval: 0.2
   _logDetailedEvents: 0
 --- !u!195 &1001452946
 NavMeshAgent:
@@ -1129,6 +1122,7 @@ GameObject:
   m_Component:
   - component: {fileID: 1112862960}
   - component: {fileID: 1112862959}
+  - component: {fileID: 1112862961}
   m_Layer: 0
   m_Name: AR Origin Aligner
   m_TagString: Untagged
@@ -1163,7 +1157,6 @@ MonoBehaviour:
   _floorSnapTolerance: 0.8
   _vioRecoveryDelay: 0.8
   _freezeAgentOnTrackingLoss: 1
-  _minTrackingLostDuration: 0.5
   _stableFramesRequired: 10
   _syncFailThreshold: 120
   _fullStabilityTimeout: 12
@@ -1184,6 +1177,26 @@ Transform:
   m_Children: []
   m_Father: {fileID: 0}
   m_LocalEulerAnglesHint: {x: 0, y: 0, z: 0}
+--- !u!114 &1112862961
+MonoBehaviour:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_GameObject: {fileID: 1112862958}
+  m_Enabled: 1
+  m_EditorHideFlags: 0
+  m_Script: {fileID: 11500000, guid: f0756550eaf4b024b98705d51e6745e3, type: 3}
+  m_Name: 
+  m_EditorClassIdentifier: Assembly-CSharp::IndoorNavAR.AR.ARWorldOriginStabilizer
+  _xrOrigin: {fileID: 2694462}
+  _arSession: {fileID: 867515508}
+  _modelRoot: {fileID: 0}
+  _driftThresholdPosition: 0.05
+  _driftThresholdRotation: 1
+  _stabilizationFrames: 15
+  _autoCorrect: 1
+  _logDrift: 1
 --- !u!1 &1113019003
 GameObject:
   m_ObjectHideFlags: 0
@@ -1703,9 +1716,8 @@ MonoBehaviour:
   _planeSearchRadius: 5
   _planeWaitTimeout: 8
   _planeCheckInterval: 0.3
-  _anchorManager: {fileID: 0}
-  _anchorCreateDelayFrames: 2
-  _anchorRestoreDelayMs: 300
+  _stabilizerCaptureDelayFrames: 2
+  _stabilizerRestoreDelayMs: 300
 --- !u!4 &1492072618
 Transform:
   m_ObjectHideFlags: 0
@@ -2058,6 +2070,37 @@ Transform:
   m_GameObject: {fileID: 1862595137}
   serializedVersion: 2
   m_LocalRotation: {x: 0, y: 0, z: 0, w: 1}
+  m_LocalPosition: {x: 0, y: 0, z: 0}
+  m_LocalScale: {x: 1, y: 1, z: 1}
+  m_ConstrainProportionsScale: 0
+  m_Children: []
+  m_Father: {fileID: 0}
+  m_LocalEulerAnglesHint: {x: 0, y: 0, z: 0}
+--- !u!1 &1873175135
+GameObject:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  serializedVersion: 6
+  m_Component:
+  - component: {fileID: 1873175137}
+  m_Layer: 0
+  m_Name: WaypointManager
+  m_TagString: Untagged
+  m_Icon: {fileID: 0}
+  m_NavMeshLayer: 0
+  m_StaticEditorFlags: 0
+  m_IsActive: 1
+--- !u!4 &1873175137
+Transform:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_GameObject: {fileID: 1873175135}
+  serializedVersion: 2
+  m_LocalRotation: {x: -0, y: -0, z: -0, w: 1}
   m_LocalPosition: {x: 0, y: 0, z: 0}
   m_LocalScale: {x: 1, y: 1, z: 1}
   m_ConstrainProportionsScale: 0
@@ -2489,6 +2532,7 @@ SceneRoots:
   - {fileID: 2694463}
   - {fileID: 867515509}
   - {fileID: 6053017865874710982}
+  - {fileID: 1873175137}
   - {fileID: 2008524775}
   - {fileID: 999373695}
   - {fileID: 1112862960}

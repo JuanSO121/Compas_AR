@@ -18,7 +18,6 @@ namespace IndoorNavAR.Segmentation
         [SerializeField, Range(0f, 1f)]
         private float _alpha = 0.45f;
 
-        // ⚠️ mantener para compatibilidad con tu código existente
         public enum FlipMode
         {
             None,
@@ -36,6 +35,9 @@ namespace IndoorNavAR.Segmentation
 
         private int _maskWidth;
         private int _maskHeight;
+        
+        // ✅ NUEVO: Flag para controlar si el overlay está activo
+        private bool _isVisible = true;
 
         private void Awake()
         {
@@ -64,7 +66,6 @@ namespace IndoorNavAR.Segmentation
             ApplyLetterboxCrop();
         }
 
-        // Mantener método para compatibilidad
         public void SetFlipMode(FlipMode mode)
         {
             _flipMode = mode;
@@ -93,7 +94,6 @@ namespace IndoorNavAR.Segmentation
             }
         }
 
-        // 🔥 Corrige padding horizontal en celular
         private void ApplyLetterboxCrop()
         {
             float screenAspect = (float)Screen.width / Screen.height;
@@ -122,7 +122,8 @@ namespace IndoorNavAR.Segmentation
 
         public void UpdateMask(int[] maskData)
         {
-            if (_maskTexture == null) return;
+            // ✅ FIX: No actualizar textura si el overlay no está visible
+            if (!_isVisible || _maskTexture == null) return;
 
             for (int i = 0; i < maskData.Length; i++)
             {
@@ -138,8 +139,24 @@ namespace IndoorNavAR.Segmentation
 
         public void SetVisible(bool visible)
         {
+            _isVisible = visible;
             _rawImage.enabled = visible;
+            
+            // ✅ NUEVO: Limpiar textura cuando se oculta para liberar GPU
+            if (!visible && _maskTexture != null)
+            {
+                // Llenar con transparente
+                for (int i = 0; i < _pixels.Length; i++)
+                {
+                    _pixels[i] = new Color32(0, 0, 0, 0);
+                }
+                _maskTexture.SetPixels32(_pixels);
+                _maskTexture.Apply(false);
+            }
         }
+        
+        // ✅ NUEVO: Propiedad pública para verificar visibilidad
+        public bool IsVisible => _isVisible;
 
         private void OnDestroy()
         {

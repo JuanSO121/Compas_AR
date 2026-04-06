@@ -1,24 +1,41 @@
 // File: NavigationManager.cs
-// ✅ FIX #11 — Añade RerouteToWaypoint() para ObstacleRerouteMediator
+// ✅ FIX #13 — Esperar InitialAlignDone real antes de ReparentWaypointsAfterAlignment()
 //
 // ============================================================================
-//  CAMBIOS FIX #10 → FIX #11
+//  CAMBIOS FIX #12 → FIX #13
 // ============================================================================
 //
-//  NUEVO MÉTODO: RerouteToWaypoint(WaypointData waypoint)
+//  PROBLEMA EN FIX #12:
+//  ─────────────────────────────────────────────────────────────────────────
+//  InitializeFromSavedSession() llamaba:
 //
-//    Diferencia vs NavigateToWaypoint():
-//      • NO llama NavigationVoiceGuide.TriggerFromWaypoint()
-//        → evita el doble TTS "Listo, vamos a X." en rerouteos mid-ruta
-//      • Pasa forceRecalculate=true internamente al NavigationAgent
-//        → NavigationPathController dispara OnPathRecalculated
-//        → NavigationVoiceGuide.Resync() genera "Ruta actualizada. N pasos."
-//      • SÍ llama ForceSnapAgentToCamera() en FullAR (igual que NavigateToWaypoint)
-//      • NO publica NavigationStartedEvent extra — el agente ya está navegando.
+//    _arOriginAligner.NotifySessionRestored();  // Inicia HandleModelReady() coroutine
+//    await Task.Yield();
+//    await Task.Delay(150);                      // ← INSUFICIENTE
+//    await _persistenceManager.ReparentWaypointsAfterAlignment();
 //
-//    Llamado por: ObstacleRerouteMediator.RerouteAfterNavMeshUpdate()
+//  HandleModelReady() tiene WaitForFullyStable() que puede tardar hasta
+//  _fullStabilityTimeout = 12s. 150ms NO garantiza que AlignXROriginOnce()
+//  haya terminado antes de que ReparentWaypointsAfterAlignment() re-cree
+//  los waypoints.
 //
-//  TODOS LOS CAMBIOS DE FIX #10 SE CONSERVAN ÍNTEGRAMENTE.
+//  Resultado: waypoints se crean con el transform PRE-alineación del modelo,
+//  luego AlignXROriginOnce() mueve el modelo → waypoints quedan descolocados.
+//
+//  SOLUCIÓN FIX #13:
+//  ─────────────────────────────────────────────────────────────────────────
+//  Esperar activamente a que _arOriginAligner.InitialAlignDone sea true,
+//  con polling de 200ms y timeout de 5s (conservador).
+//
+//  InitialAlignDone es la nueva propiedad pública expuesta en AROriginAligner v8.9.
+//  Se pone a true solo cuando AlignXROriginOnce() completa exitosamente.
+//
+//  Con este fix:
+//    - Si ARCore ya está en tracking → AlignXROriginOnce() completa en <1s
+//    - Si ARCore tarda → esperamos hasta que trackee (máx 5s)
+//    - Si hay timeout → continuamos de todos modos con advertencia
+//
+//  TODOS LOS CAMBIOS DE FIX #12 SE CONSERVAN ÍNTEGRAMENTE.
 
 using System;
 using System.Threading.Tasks;
@@ -52,11 +69,24 @@ namespace IndoorNavAR.Core
         [SerializeField] private bool _autoInitialize = true;
         [SerializeField] private bool _autoLoadModel  = true;
 
+        [Header("⏱️ FIX #13 — Timeout espera alineación")]
+        [Tooltip("Segundos máximos esperando que AROriginAligner.InitialAlignDone sea true\n" +
+                 "antes de llamar ReparentWaypointsAfterAlignment().\n" +
+                 "Si el timeout se alcanza, se continúa con advertencia.\n" +
+                 "Default: 5s (ARCore suele alinear en <2s con tracking)")]
+        [SerializeField] private float _alignWaitTimeout = 5f;
+
+        [Tooltip("Intervalo de polling para verificar InitialAlignDone (segundos).\n" +
+                 "Default: 0.2s — balance entre responsividad y overhead.")]
+        [SerializeField] private float _alignPollInterval = 0.2f;
+
         [Header("🐛 Debug")]
         [SerializeField] private bool _logDetailedEvents = false;
 
         private AppMode _currentState = AppMode.Initialization;
         private bool    _isInitialized;
+
+        private string _currentDestinationName;
 
         private NavigationPathController _pathController;
 
@@ -133,8 +163,7 @@ namespace IndoorNavAR.Core
             if (_navMeshCoordinator == null)
                 Debug.LogWarning("[NavManager] ⚠️ NavMeshCoordinator no encontrado");
             if (_pathController == null)
-                Debug.LogWarning("[NavManager] ⚠️ NavigationPathController no encontrado " +
-                                 "— SetFullARMode no se aplicará.");
+                Debug.LogWarning("[NavManager] ⚠️ NavigationPathController no encontrado.");
 
             if (hasErrors)
             { Debug.LogError("[NavManager] ❌ Sistema deshabilitado"); enabled = false; }
@@ -278,7 +307,7 @@ namespace IndoorNavAR.Core
         {
             try
             {
-                Debug.Log("[NavManager] 📂 [1/3] Llamando LoadSession...");
+                Debug.Log("[NavManager] 📂 [1/4] Llamando LoadSession...");
                 bool sessionLoaded = await _persistenceManager.LoadSession();
                 Debug.Log($"[NavManager] 📂 LoadSession resultado: {sessionLoaded}");
 
@@ -288,18 +317,38 @@ namespace IndoorNavAR.Core
                     return false;
                 }
 
-                Debug.Log("[NavManager] ✅ [2/3] Marcando coordinador...");
+                Debug.Log("[NavManager] ✅ [2/4] Marcando coordinador...");
                 _navMeshCoordinator?.MarkSetupDone();
 
                 if (_arOriginAligner != null)
                 {
-                    Debug.Log("[NavManager] 🎯 [3/3] Notificando AROriginAligner de sesión restaurada...");
+                    Debug.Log("[NavManager] 🎯 [3/4] Ajustando VIO — NotifySessionRestored()...");
                     _arOriginAligner.NotifySessionRestored();
+
+                    // ✅ FIX #13 — Esperar activamente a que AlignXROriginOnce() complete.
+                    //
+                    // PROBLEMA ANTERIOR (FIX #12):
+                    //   Task.Yield() + Task.Delay(150) no garantizaba nada.
+                    //   HandleModelReady() tiene WaitForFullyStable() que puede tardar 12s.
+                    //   Si ReparentWaypointsAfterAlignment() corría antes de AlignXROriginOnce(),
+                    //   los waypoints se creaban con posiciones pre-VIO y quedaban descolocados.
+                    //
+                    // SOLUCIÓN FIX #13:
+                    //   Polling con AROriginAligner.InitialAlignDone (nueva prop en v8.9).
+                    //   Solo avanzamos cuando sabemos que la alineación terminó.
+                    //   Timeout de _alignWaitTimeout (5s) como fallback de seguridad.
+                    await WaitForAlignmentOrTimeout();
                 }
                 else
                 {
-                    Debug.LogWarning("[NavManager] ⚠️ AROriginAligner no disponible.");
+                    Debug.LogWarning("[NavManager] ⚠️ AROriginAligner no disponible — saltando espera.");
                 }
+
+                // ✅ FIX #12/#13 — Re-crear waypoints con posiciones correctas post-VIO
+                // y notificar Flutter que todo está listo.
+                Debug.Log("[NavManager] 🔄 [4/4] ReparentWaypointsAfterAlignment()...");
+                await _persistenceManager.ReparentWaypointsAfterAlignment();
+                Debug.Log("[NavManager] ✅ Waypoints re-creados y Flutter notificado.");
 
                 ChangeState(AppMode.Navigation);
                 Debug.Log("[NavManager] ✅ InitializeFromSavedSession COMPLETADO.");
@@ -310,6 +359,44 @@ namespace IndoorNavAR.Core
                 Debug.LogError($"[NavManager] ❌ InitializeFromSavedSession: {ex.Message}\n{ex.StackTrace}");
                 return false;
             }
+        }
+
+        /// <summary>
+        /// ✅ FIX #13 — Espera activamente a que AROriginAligner.InitialAlignDone sea true.
+        ///
+        /// Usa polling en lugar de un delay fijo porque la duración de AlignXROriginOnce()
+        /// depende de WaitForFullyStable(), que a su vez depende de ARCore tracking
+        /// (puede ser instantáneo o tardar varios segundos).
+        ///
+        /// Timeout de _alignWaitTimeout como fallback — si ARCore no trackea,
+        /// continuamos de todos modos y los waypoints se alinearán con lo que haya.
+        /// </summary>
+        private async Task WaitForAlignmentOrTimeout()
+        {
+            float elapsed     = 0f;
+            int   pollMs      = Mathf.RoundToInt(_alignPollInterval * 1000f);
+
+            Debug.Log($"[NavManager] ⏳ [FIX #13] Esperando InitialAlignDone " +
+                      $"(timeout={_alignWaitTimeout}s, poll={_alignPollInterval:F2}s)...");
+
+            while (elapsed < _alignWaitTimeout)
+            {
+                // Verificar en cada tick si la alineación terminó
+                if (_arOriginAligner.InitialAlignDone)
+                {
+                    Debug.Log($"[NavManager] ✅ [FIX #13] InitialAlignDone=true en {elapsed:F1}s — " +
+                              "procediendo a ReparentWaypointsAfterAlignment().");
+                    return;
+                }
+
+                await Task.Delay(pollMs);
+                elapsed += _alignPollInterval;
+            }
+
+            // Timeout: continuar de todos modos con advertencia
+            Debug.LogWarning($"[NavManager] ⚠️ [FIX #13] Timeout {_alignWaitTimeout}s esperando " +
+                             "InitialAlignDone. ARCore puede no estar en tracking. " +
+                             "Continuando — los waypoints pueden tener posiciones sub-óptimas.");
         }
 
         private async Task InitializeAR()
@@ -367,11 +454,6 @@ namespace IndoorNavAR.Core
 
         #region Navigation
 
-        /// <summary>
-        /// Navegación completa desde cero.
-        /// Llama TriggerFromWaypoint() → VoiceGuide genera "Listo, vamos a X."
-        /// Usar para navegaciones nuevas iniciadas por el usuario.
-        /// </summary>
         public bool NavigateToWaypoint(WaypointData waypoint)
         {
             if (waypoint == null) return false;
@@ -380,6 +462,8 @@ namespace IndoorNavAR.Core
                 Debug.LogError("[NavManager] ❌ NavigationAgent no disponible");
                 return false;
             }
+
+            _currentDestinationName = waypoint.WaypointName;
 
             bool isFullAR = _arOriginAligner == null || _arOriginAligner.IsFullARMode;
 
@@ -399,7 +483,7 @@ namespace IndoorNavAR.Core
 
                 Vector3 agentPos = _navigationAgent.transform.position;
                 Debug.Log($"[NavManager] 🧭 [FullAR] → {waypoint.WaypointName} | " +
-                          $"agentPos={agentPos:F2} | dist={Vector3.Distance(agentPos, waypoint.Position):F2}m");
+                        $"agentPos={agentPos:F2} | dist={Vector3.Distance(agentPos, waypoint.Position):F2}m");
 
                 bool ok = _navigationAgent.NavigateToWaypoint(waypoint);
                 if (ok)
@@ -414,7 +498,6 @@ namespace IndoorNavAR.Core
                 return ok;
             }
 
-            // NoAR
             if (_pathController != null && _pathController.IsFullARMode)
             {
                 _pathController.SetFullARMode(false);
@@ -432,15 +515,6 @@ namespace IndoorNavAR.Core
 
         /// <summary>
         /// ✅ FIX #11 — Recálculo silencioso de ruta para ObstacleRerouteMediator.
-        ///
-        /// DIFERENCIAS vs NavigateToWaypoint():
-        ///   • NO llama TriggerFromWaypoint() → evita "Listo, vamos a X." duplicado.
-        ///   • Pasa forceRecalculate=true → NavigationPathController dispara OnPathRecalculated
-        ///     → NavigationVoiceGuide.Resync() genera "Ruta actualizada. N pasos."
-        ///   • SÍ llama ForceSnapAgentToCamera() en FullAR (mismo que NavigateToWaypoint).
-        ///   • NO publica NavigationStartedEvent adicional.
-        ///
-        /// Llamado por: ObstacleRerouteMediator.RerouteAfterNavMeshUpdate()
         /// </summary>
         public bool RerouteToWaypoint(WaypointData waypoint)
         {
@@ -451,6 +525,8 @@ namespace IndoorNavAR.Core
                 return false;
             }
 
+            _currentDestinationName = waypoint.WaypointName;
+
             bool isFullAR = _arOriginAligner == null || _arOriginAligner.IsFullARMode;
 
             if (isFullAR && _arOriginAligner != null)
@@ -459,12 +535,10 @@ namespace IndoorNavAR.Core
                 Debug.Log("[NavManager] 📍 [Reroute/FullAR] ForceSnapAgentToCamera().");
             }
 
-            // forceRecalculate=true → PathController invalida caché y dispara OnPathRecalculated
             bool ok = _navigationAgent.NavigateToWaypointForced(waypoint);
 
             if (ok)
-                Debug.Log($"[NavManager] 🔄 [Reroute] Ruta recalculada a '{waypoint.WaypointName}'. " +
-                          "VoiceGuide hará Resync via OnPathRecalculated.");
+                Debug.Log($"[NavManager] 🔄 [Reroute] Ruta recalculada a '{waypoint.WaypointName}'.");
             else
                 Debug.LogError($"[NavManager] ❌ [Reroute] Sin ruta a '{waypoint.WaypointName}'.");
 
@@ -475,6 +549,11 @@ namespace IndoorNavAR.Core
         {
             _navigationAgent?.StopNavigation("Usuario canceló");
             NavigationVoiceGuide.Instance?.StopVoiceGuide();
+
+            EventBus.Instance?.Publish(new NavigationStoppedEvent
+            {
+                DestinationWaypointName = _currentDestinationName ?? ""
+            });
         }
 
         #endregion
@@ -525,7 +604,8 @@ namespace IndoorNavAR.Core
             bool isFullAR = _arOriginAligner == null || _arOriginAligner.IsFullARMode;
             Debug.Log($"[NavManager] Estado: {_currentState} | Init: {_isInitialized} | " +
                       $"Modo: {(isFullAR ? "FullAR" : "NoAR")} | " +
-                      $"Waypoints: {_waypointManager?.WaypointCount ?? 0}");
+                      $"Waypoints: {_waypointManager?.WaypointCount ?? 0} | " +
+                      $"InitialAlignDone: {_arOriginAligner?.InitialAlignDone ?? false}");
             if (_pathController != null)
                 Debug.Log($"[NavManager] PathController: IsFullARMode={_pathController.IsFullARMode} | " +
                           $"IsNavigating={_pathController.IsNavigating}");
