@@ -29,7 +29,7 @@ namespace IndoorNavAR.Segmentation
         public const int CLASS_OBSTACLE   = 2;
         public const int CLASS_WALL       = 3;
 
-        public const int IMAGE_SIZE      = 312;
+        public const int IMAGE_SIZE = 256;
         private const int MAX_POLL_FAILS = 60;
 
         private readonly ModelAsset  _modelAsset;

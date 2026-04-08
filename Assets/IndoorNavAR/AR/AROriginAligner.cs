@@ -413,25 +413,49 @@ namespace IndoorNavAR.AR
             _lastWaitForFullyStableResult = false;
             if (_noArMode) { _lastWaitForFullyStableResult = true; yield break; }
 
+        #if UNITY_EDITOR
+            if (ARSession.state == ARSessionState.None || 
+                ARSession.state == ARSessionState.Ready)
+            {
+                Debug.LogWarning("[AROriginAligner] ✅ [v8.12] Editor sin ARCore activo — Wait inmediato.");
+                _lastWaitForFullyStableResult = true;
+                yield break;
+            }
+        #endif
+
             if (_arSessionManager != null && _arSessionManager.IsFullyStable)
-            { Log("✅ [WaitForFullyStable] Ya estable."); _lastWaitForFullyStableResult = true; yield break; }
+            { 
+                Log("✅ [WaitForFullyStable] Ya estable."); 
+                _lastWaitForFullyStableResult = true; 
+                yield break; 
+            }
 
             if (ARSession.state == ARSessionState.SessionTracking)
             {
                 Log("✅ [WaitForFullyStable] SessionTracking activo — 10 frames...");
                 for (int i = 0; i < 10; i++) yield return null;
-                _lastWaitForFullyStableResult = true; yield break;
+                _lastWaitForFullyStableResult = true; 
+                yield break;
             }
 
             float elapsed = 0f;
             Log($"⏳ [WaitForFullyStable] Esperando (timeout={_fullStabilityTimeout}s)...");
+
             while (elapsed < _fullStabilityTimeout)
             {
-                yield return null; elapsed += Time.deltaTime;
+                yield return null;
+                elapsed += Time.deltaTime;
+
                 bool isStable = _arSessionManager != null
                     ? _arSessionManager.IsFullyStable
                     : ARSession.state == ARSessionState.SessionTracking;
-                if (isStable) { Log($"✅ Estabilidad en {elapsed:F1}s."); _lastWaitForFullyStableResult = true; yield break; }
+
+                if (isStable)
+                {
+                    Log($"✅ Estabilidad en {elapsed:F1}s.");
+                    _lastWaitForFullyStableResult = true;
+                    yield break;
+                }
             }
 
             Debug.LogWarning($"[AROriginAligner] ⚠️ WaitForFullyStable timeout {_fullStabilityTimeout}s — Estado: {ARSession.state}");

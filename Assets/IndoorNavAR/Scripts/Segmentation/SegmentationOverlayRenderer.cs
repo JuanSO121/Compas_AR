@@ -37,15 +37,24 @@ namespace IndoorNavAR.Segmentation
         private int _maskHeight;
         
         // ✅ NUEVO: Flag para controlar si el overlay está activo
-        private bool _isVisible = true;
+        private bool _isVisible = false;
 
         private void Awake()
         {
             _rawImage = GetComponent<RawImage>();
+            _rawImage.gameObject.SetActive(false);
         }
 
         public void Initialize(int width, int height)
         {
+            _rawImage ??= GetComponent<RawImage>();
+
+            if (_rawImage == null)
+            {
+                Debug.LogError("[SegOverlay] ❌ RawImage no encontrado.");
+                return;
+            }
+
             _maskWidth  = width;
             _maskHeight = height;
 
@@ -96,6 +105,8 @@ namespace IndoorNavAR.Segmentation
 
         private void ApplyLetterboxCrop()
         {
+            if (_maskWidth == 0 || _maskHeight == 0) return;
+
             float screenAspect = (float)Screen.width / Screen.height;
 
             if (screenAspect < 1f) // portrait celular
@@ -139,20 +150,10 @@ namespace IndoorNavAR.Segmentation
 
         public void SetVisible(bool visible)
         {
+            if (_isVisible == visible) return;
+
             _isVisible = visible;
-            _rawImage.enabled = visible;
-            
-            // ✅ NUEVO: Limpiar textura cuando se oculta para liberar GPU
-            if (!visible && _maskTexture != null)
-            {
-                // Llenar con transparente
-                for (int i = 0; i < _pixels.Length; i++)
-                {
-                    _pixels[i] = new Color32(0, 0, 0, 0);
-                }
-                _maskTexture.SetPixels32(_pixels);
-                _maskTexture.Apply(false);
-            }
+            _rawImage.gameObject.SetActive(visible);
         }
         
         // ✅ NUEVO: Propiedad pública para verificar visibilidad

@@ -1,223 +1,272 @@
-    // File: SceneReadyNotifier.cs
-    // Carpeta: Assets/IndoorNavAR/Scripts/Integration/
-    // ✅ v4.1 — Re-notifica scene_ready tras resume de background
-    //
-    // ════════════════════════════════════════════════════════════════════════════
-    // CAMBIOS v4.0 → v4.1
-    // ════════════════════════════════════════════════════════════════════════════
-    //
-    //  PROBLEMA RAÍZ (v4.0):
-    //    IsSceneReady en FlutterUnityBridge es estático y nunca se reseteaba
-    //    en builds de Android al volver del background.
-    //
-    //    Flujo problemático:
-    //      App → background → resume
-    //      Flutter: _sceneReady = false (espera nuevo scene_ready)
-    //      Unity:   SceneReadyNotifier._notified = true → no re-notifica
-    //      Unity:   NotifySceneReady() → IsSceneReady==true → ignorado
-    //      Resultado: Flutter espera scene_ready que nunca llega.
-    //               Todos los comandos (navigate_to, etc.) se encolan y
-    //               nunca se ejecutan.
-    //
-    //    Evidencia en log:
-    //      [Bridge] ⏳ Escena no lista — encolando: {"action":"navigate_to",...}
-    //
-    //  SOLUCIÓN v4.1:
-    //    OnApplicationPause(false) detecta el resume y ejecuta el ciclo:
-    //      1. ResetSceneReadyForResume() — IsSceneReady=false, cola limpia
-    //      2. WaitForSeconds(0.5f)       — ARCore re-inicializa
-    //      3. NotifySceneReady()         — scene_ready re-enviado a Flutter
-    //
-    //    _notified se resetea también para permitir el re-envío.
-    //    El delay de 0.5s es suficiente para que VoiceCommandAPI y ARSession
-    //    vuelvan a estar disponibles tras el resume.
-    //
-    //  FLUJO CORRECTO TRAS RESUME:
-    //    t=0:    OnApplicationPause(false)
-    //    t=0:    ResetSceneReadyForResume() → IsSceneReady=false
-    //    t=0.5s: NotifySceneReady("Resume...") → scene_ready enviado
-    //    t=0.5s: Flutter recibe scene_ready → _sceneReady=true
-    //    t=0.5s+: Comandos se ejecutan normalmente
-    //
-    //  TODO LO DEMÁS ES IDÉNTICO A v4.0.
+// File: SceneReadyNotifier.cs
+// Carpeta: Assets/IndoorNavAR/Scripts/Integration/
+// ✅ v5.1 — FIX: WaitForSessionLoad() nunca completaba porque IsSessionLoadCompleted
+//           siempre era false (bug en PersistenceManager v14.x).
+//
+// ════════════════════════════════════════════════════════════════════════════
+// CAMBIOS v5.0 → v5.1
+// ════════════════════════════════════════════════════════════════════════════
+//
+//  PROBLEMA EN v5.0:
+//  ─────────────────────────────────────────────────────────────────────────
+//  WaitForSessionLoad() hace polling sobre pm.IsSessionLoadCompleted, que
+//  en PersistenceManager v14.x era _autoLoadAttempted && _autoLoadCompleted.
+//  Esos flags nunca se ponían en true porque el auto-load fue eliminado pero
+//  los flags quedaron huérfanos. Resultado: polling espera 20s hasta timeout,
+//  y solo entonces llama NotifySceneReady(). El bridge llega a Ready con 20s
+//  de delay, o nunca si el timeout tampoco era suficiente.
+//
+//  SOLUCIÓN v5.1:
+//  ─────────────────────────────────────────────────────────────────────────
+//  1. WaitForSessionLoad() ahora también verifica BridgeState.Ready como
+//     condición de salida temprana — si PersistenceManager.ReparentWaypointsAfterAlignment()
+//     ya llamó NotifySceneReady() directamente (fix en v14.3), el polling
+//     termina de inmediato sin esperar el timeout.
+//  2. Reducción del _sessionLoadTimeout default a 12s (era 20s). El timeout
+//     sigue siendo el último fallback para casos donde PersistenceManager
+//     falla completamente, pero ya no es el camino normal.
+//  3. Log mejorado para diagnosticar la ruta de salida de WaitForSessionLoad().
+//
+//  TODOS LOS COMPORTAMIENTOS DE v5.0 SE CONSERVAN ÍNTEGRAMENTE.
 
-    using System.Collections;
-    using UnityEngine;
-    using UnityEngine.XR.ARFoundation;
-    using IndoorNavAR.Core;
-    using IndoorNavAR.Core.Managers;
-    using IndoorNavAR.Integration;
+using System.Collections;
+using UnityEngine;
+using UnityEngine.XR.ARFoundation;
+using IndoorNavAR.Core;
+using IndoorNavAR.Core.Managers;
+using IndoorNavAR.Integration;
 
-    namespace IndoorNavAR.Integration
+namespace IndoorNavAR.Integration
+{
+    public class SceneReadyNotifier : MonoBehaviour
     {
-        public class SceneReadyNotifier : MonoBehaviour
+        // ─── Configuración ────────────────────────────────────────────────────
+
+        [Header("Referencias (auto-detectadas si quedan vacías)")]
+        [SerializeField] private PersistenceManager _persistenceManager;
+        [SerializeField] private ARSession          _arSession;
+
+        [Header("Configuración")]
+        [Tooltip("Segundos máximos esperando VoiceCommandAPI + ARSession.")]
+        [SerializeField] private float _maxWaitSeconds     = 10f;
+
+        [Tooltip("Intervalo de polling para verificar subsistemas.")]
+        [SerializeField] private float _pollIntervalSeconds = 0.1f;
+
+        [Tooltip("Segundos máximos esperando que LoadSession() complete.\n" +
+                 "v5.1: reducido a 12s (era 20s). En v14.3, PersistenceManager llama\n" +
+                 "NotifySceneReady() directamente, así que este timeout es solo fallback.")]
+        [SerializeField] private float _sessionLoadTimeout  = 12f;
+
+        [Tooltip("Log de progreso.")]
+        [SerializeField] private bool  _logProgress         = true;
+
+        [Header("Configuración Resume")]
+        [Tooltip("Delay (s) tras resume antes de re-notificar. " +
+                 "Da tiempo a ARCore y VoiceCommandAPI para re-inicializarse.")]
+        [SerializeField] private float _resumeDelay = 1.5f;
+
+        // ─── Estado interno ───────────────────────────────────────────────────
+
+        private bool _subsystemsNotified = false;
+
+        // ─── Lifecycle ────────────────────────────────────────────────────────
+
+        private void Start()
         {
-            [Header("Referencias (auto-detectadas si quedan vacías)")]
-            [SerializeField] private PersistenceManager _persistenceManager;
-            [SerializeField] private ARSession          _arSession;
+            _persistenceManager ??= FindFirstObjectByType<PersistenceManager>();
+            _arSession          ??= FindFirstObjectByType<ARSession>();
 
-            [Header("Configuración v4.0")]
-            [Tooltip("Segundos máximos esperando que exista VoiceCommandAPI y ARSession.")]
-            [SerializeField] private float _maxWaitSeconds = 10f;
+            if (_persistenceManager == null)
+                Debug.LogWarning("[SceneReadyNotifier] ⚠️ PersistenceManager no encontrado.");
+            if (_arSession == null)
+                Debug.LogWarning("[SceneReadyNotifier] ⚠️ ARSession no encontrado.");
 
-            [Tooltip("Intervalo de polling para verificar subsistemas mínimos.")]
-            [SerializeField] private float _pollIntervalSeconds = 0.1f;
+            StartCoroutine(WaitForSubsystems());
+        }
 
-            [Tooltip("Log del progreso de inicialización.")]
-            [SerializeField] private bool _logProgress = true;
+        // ─── Resume ───────────────────────────────────────────────────────────
 
-            [Header("Configuración v4.1 — Resume")]
-            [Tooltip("Segundos de espera tras resume antes de re-enviar scene_ready. " +
-                    "Da tiempo a ARCore y VoiceCommandAPI para re-inicializarse.")]
-            [SerializeField] private float _resumeDelay = 1.5f;
+        private void OnApplicationPause(bool pauseStatus)
+        {
+            if (pauseStatus) return;
+            if (!_subsystemsNotified) return;
 
-            // Guard: evitar doble notificación en la misma sesión
-            private bool _notified = false;
+            Log("▶️ Resume — preparando re-notificación...");
+            StartCoroutine(RenotifyAfterResume());
+        }
 
-            // ─── Lifecycle ────────────────────────────────────────────────────────
+        private IEnumerator RenotifyAfterResume()
+        {
+            _subsystemsNotified = false;
+            FlutterUnityBridge.ResetForResume();
 
-            private void Start()
+            Log($"⏳ Resume delay: {_resumeDelay}s...");
+            yield return new WaitForSeconds(_resumeDelay);
+
+            yield return StartCoroutine(WaitForSubsystems(isResume: true));
+        }
+
+        // ─── Coroutine principal: esperar subsistemas ─────────────────────────
+
+        private IEnumerator WaitForSubsystems(bool isResume = false)
+        {
+            float elapsed = 0f;
+            Log($"⏳ Esperando subsistemas{(isResume ? " (resume)" : "")}...");
+
+            while (elapsed < _maxWaitSeconds)
             {
-                _persistenceManager ??= FindFirstObjectByType<PersistenceManager>();
-                _arSession          ??= FindFirstObjectByType<ARSession>();
+                bool apiReady = VoiceCommandAPI.Instance != null;
+                bool arReady  = _arSession != null && _arSession.enabled;
 
-                if (_persistenceManager == null)
-                    Debug.LogWarning("[SceneReadyNotifier] ⚠️ PersistenceManager no encontrado.");
+                if (_logProgress && elapsed > 0f && Mathf.RoundToInt(elapsed * 10f) % 10 == 0)
+                    Log($"  [{elapsed:F1}s] API={apiReady} | AR={arReady}");
 
-                if (_arSession == null)
-                    Debug.LogWarning("[SceneReadyNotifier] ⚠️ ARSession no encontrado.");
-
-                StartCoroutine(WaitForMinimalSubsystems());
-            }
-
-            // ─── ✅ v4.1 — Resume desde background ───────────────────────────────
-
-            /// <summary>
-            /// ✅ v4.1 — Detecta cuando la app vuelve del background (pauseStatus=false)
-            /// y re-envía scene_ready a Flutter para desbloquear el bridge.
-            ///
-            /// Sin esto, Flutter queda esperando scene_ready indefinidamente tras
-            /// un ciclo background/foreground y todos los comandos quedan encolados.
-            /// </summary>
-            private void OnApplicationPause(bool pauseStatus)
-            {
-                if (pauseStatus) return; // Entrando en background — no hacer nada
-
-                // Volviendo al foreground
-                if (!_notified) return; // Nunca llegamos a notificar — WaitForMinimalSubsystems lo hará
-
-                Log("▶️ Resume desde background — preparando re-notificación de scene_ready...");
-                StartCoroutine(RenotifyAfterResume());
-            }
-
-            private IEnumerator RenotifyAfterResume()
-            {
-                _notified = false;
-                FlutterUnityBridge.ResetSceneReadyForResume();
-
-                // Reutilizar el mismo polling robusto del arranque inicial
-                yield return StartCoroutine(WaitForMinimalSubsystems());
-            }
-
-            // ─── Coroutine principal (arranque inicial) ───────────────────────────
-
-            private IEnumerator WaitForMinimalSubsystems()
-            {
-                float elapsed = 0f;
-                Log("⏳ Esperando subsistemas mínimos para scene_ready...");
-
-                while (elapsed < _maxWaitSeconds)
+                if (apiReady && arReady)
                 {
-                    bool apiReady = VoiceCommandAPI.Instance != null;
-                    bool arReady  = _arSession != null && _arSession.enabled;
+                    _subsystemsNotified = true;
+                    string detail = isResume
+                        ? "Escena AR lista — resume desde background"
+                        : BuildInitialDetail();
 
-                    if (_logProgress && elapsed > 0f && Mathf.RoundToInt(elapsed * 10f) % 10 == 0)
-                        Log($"  [{elapsed:F1}s] API={apiReady} | ARSession={arReady}");
+                    Log($"✅ Subsistemas OK en {elapsed:F2}s — NotifySubsystemsReady()");
 
-                    if (apiReady && arReady)
-                    {
-                        if (_notified) yield break;
-                        string detail = BuildInitialDetail();
-                        Log($"✅ Subsistemas mínimos listos en {elapsed:F2}s — enviando scene_ready.");
-                        NotifyReady(detail);
-                        yield break;
-                    }
+                    // Paso 1: bridge → SessionLoading (o Ready si sesión ya cargó)
+                    FlutterUnityBridge.NotifySubsystemsReady(detail);
 
-                    yield return new WaitForSeconds(_pollIntervalSeconds);
-                    elapsed += _pollIntervalSeconds;
+                    // Paso 2: esperar carga de sesión → bridge → Ready
+                    yield return StartCoroutine(WaitForSessionLoad());
+                    yield break;
                 }
 
-                if (_notified) yield break;
-                Log($"⚠️ Timeout {_maxWaitSeconds}s — enviando scene_ready igualmente.");
-                NotifyReady($"Timeout {_maxWaitSeconds}s — subsistemas parcialmente listos");
+                yield return new WaitForSeconds(_pollIntervalSeconds);
+                elapsed += _pollIntervalSeconds;
             }
 
-            // ─── Detail builders ──────────────────────────────────────────────────
+            // Timeout
+            Log($"⚠️ Timeout {_maxWaitSeconds}s — forzando NotifySubsystemsReady().");
+            _subsystemsNotified = true;
+            FlutterUnityBridge.NotifySubsystemsReady(
+                $"Timeout {_maxWaitSeconds}s — subsistemas parcialmente listos");
+            yield return StartCoroutine(WaitForSessionLoad());
+        }
 
-            private string BuildInitialDetail()
+        // ─── Coroutine: esperar que LoadSession() complete ────────────────────
+
+        /// <summary>
+        /// Espera que el bridge llegue a Ready, lo cual ocurre por una de tres vías:
+        ///   A) pm.IsSessionLoadCompleted=true   → NotifySceneReady() desde aquí (v5.0)
+        ///   B) BridgeState.Ready ya alcanzado   → PersistenceManager.ReparentWaypointsAfterAlignment()
+        ///                                          llamó NotifySceneReady() directamente (v14.3)
+        ///   C) pm == null o sin sesión guardada → NotifySceneReady() inmediato
+        ///   D) Timeout de _sessionLoadTimeout   → NotifySceneReady() forzado (último fallback)
+        /// </summary>
+        private IEnumerator WaitForSessionLoad()
+        {
+            // Salida rápida A: bridge ya en Ready (puede haber llegado por auto-repair
+            // en NotifySubsystemsReady, o por llamada directa desde PersistenceManager v14.3)
+            if (FlutterUnityBridge.State == BridgeState.Ready)
             {
-                if (_persistenceManager == null)
-                    return "Escena AR lista (sin PersistenceManager)";
-
-                bool hasSaved = _persistenceManager.HasSavedSession();
-                return hasSaved
-                    ? "Escena AR lista — cargando sesión previa en segundo plano..."
-                    : "Escena AR lista — sin sesión previa guardada";
+                Log("WaitForSessionLoad: bridge ya Ready — saltando. (ruta A)");
+                yield break;
             }
 
-            private string BuildResumeDetail()
+            if (_persistenceManager == null)
             {
-                return "Escena AR lista — resume desde background";
+                Log("WaitForSessionLoad: sin PersistenceManager — Ready inmediato. (ruta C)");
+                FlutterUnityBridge.NotifySceneReady("Sin PersistenceManager");
+                yield break;
             }
 
-            // ─── Notificación ─────────────────────────────────────────────────────
-
-            private void NotifyReady(string detail)
+            // Si no hay sesión guardada → IsSessionLoadCompleted ya es true (v14.3 lo setea en Start())
+            // pero verificamos ambas condiciones por si acaso
+            if (!_persistenceManager.HasSavedSession())
             {
-                if (_notified) return;
-                _notified = true;
-                FlutterUnityBridge.NotifySceneReady(detail);
+                Log("WaitForSessionLoad: sin sesión previa — Ready inmediato. (ruta C)");
+                FlutterUnityBridge.NotifySceneReady("Sin sesión previa guardada");
+                yield break;
             }
 
-            // ─── Helpers ──────────────────────────────────────────────────────────
+            float elapsed = 0f;
+            Log($"⏳ Esperando IsSessionLoadCompleted o BridgeState.Ready (max {_sessionLoadTimeout}s)...");
 
-            private void Log(string msg)
+            while (elapsed < _sessionLoadTimeout)
             {
-                if (_logProgress) Debug.Log($"[SceneReadyNotifier] {msg}");
+                // ✅ v5.1 FIX: salida temprana si el bridge ya llegó a Ready.
+                // En v14.3, PersistenceManager.ReparentWaypointsAfterAlignment() llama
+                // NotifySceneReady() directamente, así que el bridge puede estar en Ready
+                // antes de que IsSessionLoadCompleted sea true desde nuestra perspectiva.
+                if (FlutterUnityBridge.State == BridgeState.Ready)
+                {
+                    Log($"WaitForSessionLoad: BridgeState=Ready en {elapsed:F2}s — OK. (ruta B)");
+                    yield break;
+                }
+
+                if (_persistenceManager.IsSessionLoadCompleted)
+                {
+                    Log($"✅ Sesión cargada en {elapsed:F2}s — NotifySceneReady(). (ruta A)");
+                    FlutterUnityBridge.NotifySceneReady(
+                        $"Sesión cargada ({(_persistenceManager.SessionWasRestored ? "restaurada" : "nueva")})");
+                    yield break;
+                }
+
+                yield return new WaitForSeconds(_pollIntervalSeconds);
+                elapsed += _pollIntervalSeconds;
             }
 
-            // ─── ContextMenu debug ────────────────────────────────────────────────
+            Log($"⚠️ Timeout {_sessionLoadTimeout}s esperando sesión — forzando Ready. (ruta D)");
+            FlutterUnityBridge.NotifySceneReady($"Timeout sesión ({_sessionLoadTimeout}s)");
+        }
 
-            [ContextMenu("✅ Forzar scene_ready ahora")]
-            private void DbgForceReady()
-            {
-                StopAllCoroutines();
-                Log("🔧 scene_ready forzado manualmente.");
-                NotifyReady("Forzado manualmente desde ContextMenu");
-            }
+        // ─── Helpers ──────────────────────────────────────────────────────────
 
-            [ContextMenu("🔄 Simular Resume desde background")]
-            private void DbgSimulateResume()
-            {
-                Log("🔧 Resume simulado desde ContextMenu.");
-                OnApplicationPause(false);
-            }
+        private string BuildInitialDetail()
+        {
+            if (_persistenceManager == null)
+                return "Escena AR lista (sin PersistenceManager)";
 
-            [ContextMenu("📊 Estado actual")]
-            private void DbgState()
-            {
-                Debug.Log("══════════════════════════════════════════════");
-                Debug.Log("  SceneReadyNotifier v4.1 — Estado");
-                Debug.Log("══════════════════════════════════════════════");
-                Debug.Log($"  IsSceneReady (Bridge):    {FlutterUnityBridge.IsSceneReady}");
-                Debug.Log($"  _notified:                {_notified}");
-                Debug.Log($"  VoiceCommandAPI OK:       {VoiceCommandAPI.Instance != null}");
-                Debug.Log($"  ARSession OK:             {(_arSession != null && _arSession.enabled)}");
-                Debug.Log($"  ARSession state:          {ARSession.state}");
-                Debug.Log($"  PersistenceManager:       {(_persistenceManager != null ? "encontrado" : "NULL")}");
-                Debug.Log($"  HasSavedSession:          {_persistenceManager?.HasSavedSession()}");
-                Debug.Log($"  IsSessionLoadCompleted:   {_persistenceManager?.IsSessionLoadCompleted}");
-                Debug.Log("══════════════════════════════════════════════");
-            }
+            bool hasSaved = _persistenceManager.HasSavedSession();
+            return hasSaved
+                ? "Escena AR lista — cargando sesión previa..."
+                : "Escena AR lista — sin sesión previa";
+        }
+
+        private void Log(string msg)
+        {
+            if (_logProgress) Debug.Log($"[SceneReadyNotifier] {msg}");
+        }
+
+        // ─── ContextMenu debug ────────────────────────────────────────────────
+
+        [ContextMenu("✅ Forzar Ready ahora")]
+        private void DbgForceReady()
+        {
+            StopAllCoroutines();
+            Log("🔧 Ready forzado manualmente.");
+            FlutterUnityBridge.NotifySceneReady("Forzado desde ContextMenu");
+        }
+
+        [ContextMenu("🔄 Simular Resume")]
+        private void DbgSimulateResume() => OnApplicationPause(false);
+
+        [ContextMenu("📊 Estado actual")]
+        private void DbgState()
+        {
+            Debug.Log("══════════════════════════════════════════════");
+            Debug.Log($"  SceneReadyNotifier v5.1 — Estado");
+            Debug.Log("══════════════════════════════════════════════");
+            Debug.Log($"  BridgeState:              {FlutterUnityBridge.State}");
+            Debug.Log($"  IsSceneReady (compat):    {FlutterUnityBridge.IsSceneReady}");
+            Debug.Log($"  _subsystemsNotified:      {_subsystemsNotified}");
+            Debug.Log($"  _resumeDelay:             {_resumeDelay}s");
+            Debug.Log($"  VoiceCommandAPI OK:       {VoiceCommandAPI.Instance != null}");
+            Debug.Log($"  ARSession OK:             {(_arSession != null && _arSession.enabled)}");
+            Debug.Log($"  ARSession state:          {ARSession.state}");
+            Debug.Log($"  PersistenceManager:       {(_persistenceManager != null ? "OK" : "NULL")}");
+            Debug.Log($"  HasSavedSession:          {_persistenceManager?.HasSavedSession()}");
+            Debug.Log($"  IsSessionLoadCompleted:   {_persistenceManager?.IsSessionLoadCompleted}");
+            Debug.Log($"  SessionWasRestored:       {_persistenceManager?.SessionWasRestored}");
+            Debug.Log("══════════════════════════════════════════════");
         }
     }
+}

@@ -302,41 +302,42 @@ namespace IndoorNavAR.Core
                 return false;
             }
         }
-
         private async Task<bool> InitializeFromSavedSession()
         {
             try
             {
-                Debug.Log("[NavManager] 📂 [1/4] Llamando LoadSession...");
-                bool sessionLoaded = await _persistenceManager.LoadSession();
-                Debug.Log($"[NavManager] 📂 LoadSession resultado: {sessionLoaded}");
+                bool sessionLoaded;
 
-                if (!sessionLoaded)
+                // 🔒 Guard: si PersistenceManager ya completó la carga, no recargar
+                if (_persistenceManager.IsSessionLoadCompleted)
                 {
-                    Debug.LogWarning("[NavManager] ⚠️ LoadSession falló.");
-                    return false;
+                    Debug.Log("[NavManager] ✅ Sesión ya cargada por PM — reutilizando resultado.");
+                    sessionLoaded = _persistenceManager.SessionWasRestored;
+                }
+                else
+                {
+                    Debug.Log("[NavManager] 📂 [1/4] Llamando LoadSession...");
+                    sessionLoaded = await _persistenceManager.LoadSession();
+                    Debug.Log($"[NavManager] 📂 LoadSession resultado: {sessionLoaded}");
+
+                    if (!sessionLoaded)
+                    {
+                        Debug.LogWarning("[NavManager] ⚠️ LoadSession falló.");
+                        return false;
+                    }
                 }
 
+                // ✅ Paso 2: marcar coordinador
                 Debug.Log("[NavManager] ✅ [2/4] Marcando coordinador...");
                 _navMeshCoordinator?.MarkSetupDone();
 
+                // 🎯 Paso 3: esperar alineación VIO
                 if (_arOriginAligner != null)
                 {
                     Debug.Log("[NavManager] 🎯 [3/4] Ajustando VIO — NotifySessionRestored()...");
                     _arOriginAligner.NotifySessionRestored();
 
-                    // ✅ FIX #13 — Esperar activamente a que AlignXROriginOnce() complete.
-                    //
-                    // PROBLEMA ANTERIOR (FIX #12):
-                    //   Task.Yield() + Task.Delay(150) no garantizaba nada.
-                    //   HandleModelReady() tiene WaitForFullyStable() que puede tardar 12s.
-                    //   Si ReparentWaypointsAfterAlignment() corría antes de AlignXROriginOnce(),
-                    //   los waypoints se creaban con posiciones pre-VIO y quedaban descolocados.
-                    //
-                    // SOLUCIÓN FIX #13:
-                    //   Polling con AROriginAligner.InitialAlignDone (nueva prop en v8.9).
-                    //   Solo avanzamos cuando sabemos que la alineación terminó.
-                    //   Timeout de _alignWaitTimeout (5s) como fallback de seguridad.
+                    // Espera activa hasta que la alineación termine o timeout
                     await WaitForAlignmentOrTimeout();
                 }
                 else
@@ -344,14 +345,17 @@ namespace IndoorNavAR.Core
                     Debug.LogWarning("[NavManager] ⚠️ AROriginAligner no disponible — saltando espera.");
                 }
 
-                // ✅ FIX #12/#13 — Re-crear waypoints con posiciones correctas post-VIO
-                // y notificar Flutter que todo está listo.
+                // 🔄 Paso 4: reparent waypoints y notificar a Flutter
                 Debug.Log("[NavManager] 🔄 [4/4] ReparentWaypointsAfterAlignment()...");
                 await _persistenceManager.ReparentWaypointsAfterAlignment();
                 Debug.Log("[NavManager] ✅ Waypoints re-creados y Flutter notificado.");
 
+                // Finalización de cargas pesadas
+                ARPerformanceManager.Instance?.EndHeavyLoad("NavigationManager — cierre de seguridad");
+
                 ChangeState(AppMode.Navigation);
                 Debug.Log("[NavManager] ✅ InitializeFromSavedSession COMPLETADO.");
+
                 return true;
             }
             catch (Exception ex)
@@ -373,19 +377,29 @@ namespace IndoorNavAR.Core
         /// </summary>
         private async Task WaitForAlignmentOrTimeout()
         {
-            float elapsed     = 0f;
-            int   pollMs      = Mathf.RoundToInt(_alignPollInterval * 1000f);
+            // ✅ FIX_DEVICE: En builds de dispositivo, reducir timeout.
+            // Si el VIO está bloqueado por el main thread (las escaleras y NavMesh),
+            // esperar 5s solo retrasa la carga sin beneficio. 2s es suficiente:
+            // si ARCore va a trackear, lo hace en <1s normalmente.
+            // Referencia ARCore: https://developers.google.com/ar/develop/session-management
+        #if UNITY_EDITOR
+            float effectiveTimeout = _alignWaitTimeout;
+        #else
+            float effectiveTimeout = Mathf.Min(_alignWaitTimeout, 2f);
+        #endif
+
+            float elapsed = 0f;
+            int   pollMs  = Mathf.RoundToInt(_alignPollInterval * 1000f);
 
             Debug.Log($"[NavManager] ⏳ [FIX #13] Esperando InitialAlignDone " +
-                      $"(timeout={_alignWaitTimeout}s, poll={_alignPollInterval:F2}s)...");
+                    $"(timeout={effectiveTimeout}s, poll={_alignPollInterval:F2}s)...");
 
-            while (elapsed < _alignWaitTimeout)
+            while (elapsed < effectiveTimeout)
             {
-                // Verificar en cada tick si la alineación terminó
                 if (_arOriginAligner.InitialAlignDone)
                 {
                     Debug.Log($"[NavManager] ✅ [FIX #13] InitialAlignDone=true en {elapsed:F1}s — " +
-                              "procediendo a ReparentWaypointsAfterAlignment().");
+                            "procediendo a ReparentWaypointsAfterAlignment().");
                     return;
                 }
 
@@ -393,10 +407,9 @@ namespace IndoorNavAR.Core
                 elapsed += _alignPollInterval;
             }
 
-            // Timeout: continuar de todos modos con advertencia
-            Debug.LogWarning($"[NavManager] ⚠️ [FIX #13] Timeout {_alignWaitTimeout}s esperando " +
-                             "InitialAlignDone. ARCore puede no estar en tracking. " +
-                             "Continuando — los waypoints pueden tener posiciones sub-óptimas.");
+            Debug.LogWarning($"[NavManager] ⚠️ [FIX #13] Timeout {effectiveTimeout}s esperando " +
+                            "InitialAlignDone. ARCore puede no estar en tracking. " +
+                            "Continuando — los waypoints pueden tener posiciones sub-óptimas.");
         }
 
         private async Task InitializeAR()

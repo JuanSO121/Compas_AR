@@ -1,23 +1,49 @@
 // File: SegmentationController.cs
-// ✅ v10.1 — Fix: NavigationStoppedEvent + notificación segmentation_active a Flutter
+// ✅ v10.2 — Fix: Segmentación no se activaba al iniciar navegación
 //
 // ============================================================================
-//  CAMBIOS v10.0 → v10.1
+//  CAMBIOS v10.1 → v10.2
 // ============================================================================
 //
-//  FIX #1 — NavigationStoppedEvent (error CS0246 resuelto)
-//    v10.0 referenciaba NavigationStoppedEvent que no existía en EventBus.
-//    Se agrega en EventBus v3.2. El controller ya no usa NavigationCancelledEvent
-//    como workaround — usa el evento semánticamente correcto.
+//  BUG #1 — CRÍTICO: _initialized bloqueaba PollResult durante navegación
+//    En v10.1, Update() tenía el guard:
+//      if (!_segmentationActive || !_initialized) return;
+//    Si NavigationStartedEvent llegaba antes de que Start() completara
+//    (_initialized = false), los frames eran capturados por OnCameraFrameReceived
+//    pero PollResult() nunca se ejecutaba → inferencia completada pero resultados
+//    nunca procesados. La segmentación parecía "activa" pero no funcionaba.
 //
-//  FIX #2 — Notificación de estado a Flutter via VoiceCommandAPI
-//    Cuando la segmentación se activa o desactiva, se notifica a Flutter con:
-//      { "action": "segmentation_active", "active": true/false }
-//    Esto permite que Flutter muestre/oculte controles de overlay en su UI
-//    y sepa cuándo está disponible el ratio de segmentación.
-//    La notificación usa VoiceCommandAPI.Instance?.NotifySegmentationState().
+//    FIX: PollResult() ahora se llama si _segmentationActive && _worker != null,
+//    sin depender de _initialized. El guard _initialized se mantiene solo para
+//    la captura de frames (OnCameraFrameReceived), donde sí es necesario.
 //
-//  TODOS LOS CAMBIOS DE v10.0 SE CONSERVAN ÍNTEGRAMENTE.
+//  BUG #2 — Doble suscripción a frameReceived en ReinitializeWithCPU()
+//    v10.1 desuscribía siempre con -= (correcto), pero si _segmentationActive
+//    era true y el worker se reiniciaba, la re-suscripción se hacía sin verificar
+//    si ya había una suscripción activa previa del ciclo anterior. En práctica
+//    esto podía causar que OnCameraFrameReceived se llamara dos veces por frame.
+//
+//    FIX: ReinitializeWithCPU() desuscribe antes de re-suscribir
+//    independientemente del estado, garantizando exactamente 1 suscripción.
+//
+//  BUG #3 — ActivateSegmentation() no verificaba _worker.IsReady
+//    Si el worker fallaba al inicializar (GPU no disponible), ActivateSegmentation()
+//    igualmente suscribía el frameReceived y marcaba _segmentationActive = true,
+//    pero PollResult() fallaba silenciosamente cada frame.
+//
+//    FIX: ActivateSegmentation() verifica _worker?.IsReady antes de activar.
+//    Si el worker no está listo, intenta reinicializar con CPU como fallback.
+//
+//  BUG #4 — Race condition: NavigationStartedEvent antes de Start()
+//    Si el EventBus publicaba NavigationStartedEvent durante el primer frame
+//    (posible en dispositivos lentos donde AR se inicializa rápido), Start()
+//    aún no había completado y _worker era null → NullReferenceException en
+//    ActivateSegmentation() → _segmentationActive quedaba false.
+//
+//    FIX: ActivateSegmentation() hace null-check de _worker y encola la
+//    activación para el siguiente frame si Start() aún no completó.
+//
+//  TODOS LOS CAMBIOS DE v10.1 SE CONSERVAN ÍNTEGRAMENTE.
 
 using System;
 using System.Collections;
@@ -107,6 +133,9 @@ namespace IndoorNavAR.Segmentation
         // ✅ v10.0: Estado de activación de segmentación
         private bool _segmentationActive = false;
 
+        // ✅ v10.2: Flag para encolar activación pendiente si Start() no completó
+        private bool _pendingActivation = false;
+
         public bool OverlayVisible => _showOverlay;
         
         // ✅ v10.0: Propiedad pública para verificar si la segmentación está activa
@@ -161,7 +190,9 @@ namespace IndoorNavAR.Segmentation
             }
 
             _overlayRenderer?.Initialize(_worker.MaskWidth, _worker.MaskHeight);
-            _overlayRenderer?.SetVisible(_showOverlay);
+            // ✅ Solo visible si NO depende de navegación o si ya está activo
+            bool shouldShow = !_onlyDuringNavigation && _showOverlay;
+            _overlayRenderer?.SetVisible(shouldShow);
             _overlayRenderer?.SetFlipMode(SegmentationOverlayRenderer.FlipMode.None);
 
             _worker.OnInferenceComplete += HandleInferenceComplete;
@@ -181,9 +212,18 @@ namespace IndoorNavAR.Segmentation
             // ✅ v10.0: Suscribirse a eventos de navegación
             SubscribeToNavigationEvents();
 
+            // ✅ v10.2: Procesar activación pendiente si NavigationStartedEvent
+            //           llegó antes de que Start() completara.
+            if (_pendingActivation)
+            {
+                _pendingActivation = false;
+                Debug.Log("[SegCtrl] ✅ Procesando activación pendiente (NavigationStartedEvent llegó antes de Start())");
+                ActivateSegmentation();
+            }
+
             StartCoroutine(DiagnoseARFrames());
 
-            Debug.Log($"[SegCtrl] ✅ v10.1 inicializado. rotation={_tensorRotation}° " +
+            Debug.Log($"[SegCtrl] ✅ v10.2 inicializado. rotation={_tensorRotation}° " +
                       $"flipY={_flipInputY} flipX={_flipInputX} " +
                       $"MODEL_SIZE={MODEL_SIZE} ROI={_roiTopSkip:P0} " +
                       $"onlyDuringNav={_onlyDuringNavigation}");
@@ -234,7 +274,7 @@ namespace IndoorNavAR.Segmentation
             }
 
             bus.Subscribe<NavigationStartedEvent>(OnNavigationStarted);
-            bus.Subscribe<NavigationStoppedEvent>(OnNavigationStopped);   // ✅ v10.1: evento correcto
+            bus.Subscribe<NavigationStoppedEvent>(OnNavigationStopped);
             bus.Subscribe<NavigationArrivedEvent>(OnNavigationArrived);
         }
 
@@ -244,7 +284,7 @@ namespace IndoorNavAR.Segmentation
             if (bus == null) return;
 
             bus.Unsubscribe<NavigationStartedEvent>(OnNavigationStarted);
-            bus.Unsubscribe<NavigationStoppedEvent>(OnNavigationStopped); // ✅ v10.1: evento correcto
+            bus.Unsubscribe<NavigationStoppedEvent>(OnNavigationStopped);
             bus.Unsubscribe<NavigationArrivedEvent>(OnNavigationArrived);
         }
 
@@ -252,14 +292,25 @@ namespace IndoorNavAR.Segmentation
         {
             if (!_onlyDuringNavigation) return;
             
+            // ✅ v10.2: Si Start() aún no completó (_worker == null o !_initialized),
+            //           encolar la activación para ejecutarla cuando esté listo.
+            if (!_initialized || _worker == null)
+            {
+                _pendingActivation = true;
+                Debug.LogWarning("[SegCtrl] ⚠️ NavigationStartedEvent recibido antes de inicialización completa. " +
+                                 "Activación encolada.");
+                return;
+            }
+
             ActivateSegmentation();
             Debug.Log("[SegCtrl] 🚀 Navegación iniciada → Segmentación ACTIVADA");
         }
 
-        private void OnNavigationStopped(NavigationStoppedEvent evt)  // ✅ v10.1: tipo correcto
+        private void OnNavigationStopped(NavigationStoppedEvent evt)
         {
             if (!_onlyDuringNavigation) return;
             
+            _pendingActivation = false; // ✅ v10.2: cancelar activación pendiente si la nav se detiene antes de inicializar
             DeactivateSegmentation();
             Debug.Log("[SegCtrl] 🛑 Navegación detenida → Segmentación DESACTIVADA");
         }
@@ -268,6 +319,7 @@ namespace IndoorNavAR.Segmentation
         {
             if (!_onlyDuringNavigation) return;
             
+            _pendingActivation = false; // ✅ v10.2: cancelar activación pendiente
             DeactivateSegmentation();
             Debug.Log("[SegCtrl] 🎯 Llegada a destino → Segmentación DESACTIVADA");
         }
@@ -275,14 +327,35 @@ namespace IndoorNavAR.Segmentation
         private void ActivateSegmentation()
         {
             if (_segmentationActive) return;
+
+            // ✅ v10.2: Verificar que el worker esté listo antes de activar.
+            //           Si no lo está, intentar fallback CPU.
+            if (_worker == null || !_worker.IsReady)
+            {
+                Debug.LogWarning("[SegCtrl] ⚠️ ActivateSegmentation: worker no listo. " +
+                                 "Intentando fallback CPU...");
+                if (!_cpuFallbackActive && _modelAsset != null)
+                    ReinitializeWithCPU();
+                
+                // Si tras el intento sigue sin estar listo, abortar
+                if (_worker == null || !_worker.IsReady)
+                {
+                    Debug.LogError("[SegCtrl] ❌ No se pudo activar segmentación: worker inválido.");
+                    return;
+                }
+            }
             
             _segmentationActive = true;
             
+            // ✅ v10.2: Garantizar exactamente 1 suscripción desuscribiendo primero
             if (_cameraManager != null)
+            {
+                _cameraManager.frameReceived -= OnCameraFrameReceived; // safe: -= no falla si no estaba suscrito
                 _cameraManager.frameReceived += OnCameraFrameReceived;
+            }
             
             if (_showOverlay)
-                _overlayRenderer?.SetVisible(true);
+                _overlayRenderer?.SetVisible(_showOverlay);
             
             // ✅ v10.1: Notificar a Flutter que la segmentación está activa
             NotifyFlutterSegmentationState(true);
@@ -314,11 +387,6 @@ namespace IndoorNavAR.Segmentation
         /// <summary>
         /// Envía a Flutter el estado actual de la segmentación:
         ///   { "action": "segmentation_active", "active": true/false }
-        ///
-        /// Flutter puede usar esto para:
-        ///   - Mostrar/ocultar el botón "toggle_seg_mask"
-        ///   - Saber si los ratios de segmentación están disponibles
-        ///   - Actualizar indicadores visuales de estado en la UI
         /// </summary>
         private void NotifyFlutterSegmentationState(bool active)
         {
@@ -354,7 +422,9 @@ namespace IndoorNavAR.Segmentation
             if (_logFrameCapture && _totalFramesReceived <= 5)
                 Debug.Log($"[SegCtrl] 📸 Frame AR #{_totalFramesReceived}");
 
-            if (!_initialized || !_worker.IsReady) return;
+            // ✅ v10.2: Guard _initialized solo para captura de frames
+            //           (PollResult se mueve a Update() con su propio guard mejorado)
+            if (!_initialized || _worker == null || !_worker.IsReady) return;
 
             _frameCounter++;
             _framesSinceLastInference++;
@@ -452,8 +522,14 @@ namespace IndoorNavAR.Segmentation
 
         private void Update()
         {
-            // ✅ OPTIMIZACIÓN: Early exit si segmentación no está activa
-            if (!_segmentationActive || !_initialized) return;
+            // ✅ v10.2 FIX CRÍTICO: PollResult() se ejecuta si _segmentationActive && _worker != null,
+            //    independientemente de _initialized. Esto resuelve el caso donde NavigationStartedEvent
+            //    llegaba antes de que Start() completara: el worker ya estaba ejecutando inferencias
+            //    pero PollResult() nunca se llamaba por el guard !_initialized previo.
+            //
+            //    Se mantiene la verificación de _worker != null para evitar NullReferenceException
+            //    en el caso extremo de race condition durante el primer frame.
+            if (!_segmentationActive || _worker == null) return;
 
             bool resultReady = _worker.PollResult();
 
@@ -515,7 +591,10 @@ namespace IndoorNavAR.Segmentation
             if (_cpuFallbackActive) return;
             Debug.LogWarning("[SegCtrl] 🔄 GPU timeout — reinicializando con CPU...");
 
-            _cameraManager.frameReceived -= OnCameraFrameReceived;
+            // ✅ v10.2: Desuscribir siempre antes de disponer el worker
+            if (_cameraManager != null)
+                _cameraManager.frameReceived -= OnCameraFrameReceived;
+
             _worker?.Dispose();
 
             _worker = new ObstacleSegmentationWorker(
@@ -525,8 +604,8 @@ namespace IndoorNavAR.Segmentation
 
             _worker.OnInferenceComplete += HandleInferenceComplete;
             
-            // ✅ OPTIMIZACIÓN: Solo suscribirse si segmentación está activa
-            if (_segmentationActive)
+            // ✅ v10.2: Re-suscribir exactamente una vez si segmentación está activa
+            if (_segmentationActive && _cameraManager != null)
                 _cameraManager.frameReceived += OnCameraFrameReceived;
             
             _cpuFallbackActive = true;
@@ -561,12 +640,13 @@ namespace IndoorNavAR.Segmentation
         public void SetOverlayVisible(bool visible)
         {
             _showOverlay = visible;
-            
-            // ✅ OPTIMIZACIÓN: Solo afectar overlay si segmentación está activa
-            if (_segmentationActive || !visible)
-                _overlayRenderer?.SetVisible(visible);
-            
-            Debug.Log($"[SegCtrl] 🎭 Overlay → {(visible ? "VISIBLE" : "OCULTO")}");
+
+            bool shouldShow = visible && (!_onlyDuringNavigation || _segmentationActive);
+
+            _overlayRenderer?.SetVisible(shouldShow);
+
+            Debug.Log($"[SegCtrl] 🎭 Overlay → {(shouldShow ? "VISIBLE" : "OCULTO")} " +
+                    $"(requested={visible}, active={_segmentationActive})");
         }
 
         // ── Debug ─────────────────────────────────────────────────────────
@@ -610,6 +690,7 @@ namespace IndoorNavAR.Segmentation
         private void DbgStats()
         {
             Debug.Log($"[SegCtrl] Active={_segmentationActive} " +
+                      $"Initialized={_initialized} PendingActivation={_pendingActivation} " +
                       $"Obstacle={_worker?.ObstacleRatio:P1} Floor={_worker?.FloorRatio:P1} " +
                       $"Wall={_worker?.WallRatio:P1} " +
                       $"Busy={_worker?.IsBusy} Frames={_totalFramesReceived} Rot={_tensorRotation}° " +

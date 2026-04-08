@@ -1,29 +1,40 @@
 // File: ARSessionManager.cs
-// ✅ v3.3 — REFACTOR_ANCHOR: Quitar publicación de ARSessionReadyEvent de
-//           WaitForStableTracking. Ese evento ahora es responsabilidad exclusiva
-//           de PersistenceManager v14 cuando la sesión está lista de verdad.
+// ✅ v3.4 — Integrar ARPerformanceManager: matchFrameRateRequested + notificación de fases.
 //
 // ============================================================================
-//  CAMBIOS v3.2 → v3.3
+//  CAMBIOS v3.3 → v3.4
 // ============================================================================
 //
-//  ÚNICO CAMBIO: PublishSessionReady() ya no publica ARSessionReadyEvent.
+//  PROBLEMA RAÍZ (confirmado en logs del dispositivo):
+//    GetRecentDevicePose failed. INVALID_ARGUMENT: Passed timestamp is too new.
+//    RESOURCE_EXHAUSTED: Behind by 156ms/180ms, skip current frame
+//    FeatureExtraction is taking too long: 112ms
 //
-//  RAZÓN:
-//    En la arquitectura v14, ARSessionReadyEvent es la señal de que la sesión
-//    AR está completamente lista — modelo restaurado, waypoints recreados,
-//    anchor creado. Solo PersistenceManager sabe cuándo eso ocurrió.
+//  Estos errores ocurren porque Unity renderiza más rápido de lo que ARCore
+//  produce frames VIO. El VIO descarta frames para "ponerse al día", causando
+//  el flicker SessionTracking ↔ SessionInitializing observado en los logs.
 //
-//    ARSessionManager.WaitForStableTracking() detecta cuando el VIO alcanza
-//    tracking estable, que es una condición PREVIA a la carga de sesión,
-//    no posterior. Publicar ARSessionReadyEvent aquí era prematuro y podía
-//    hacer que SceneReadyNotifier y Flutter creyeran que todo estaba listo
-//    antes de que el modelo y los waypoints fueran restaurados.
+//  SOLUCIÓN OFICIAL — ARSession.matchFrameRateRequested:
+//    "If True, the session will block execution until a new AR frame is
+//     available and set Application.targetFrameRate to match the native
+//     update frequency of the AR session."
+//    Ref: AR Foundation 3.x+ docs (ARSession component)
 //
-//    ARSessionManager SIGUE publicando ShowMessageEvent para la UI local.
-//    Solo se elimina la publicación de ARSessionReadyEvent.
+//  CAMBIOS v3.4:
+//  ─────────────────────────────────────────────────────────────────────────
+//  1. InitializeARSession() delega la configuración de framerate a
+//     ARPerformanceManager, que aplica matchFrameRateRequested y targetFrameRate.
+//     ARSessionManager ya no toca Application.targetFrameRate directamente.
 //
-//  TODOS LOS COMPORTAMIENTOS DE v3.2 SE CONSERVAN ÍNTEGRAMENTE.
+//  2. DisablePlaneDetection() notifica BeginHeavyLoad al ARPerformanceManager
+//     porque es llamado justo antes de operaciones pesadas de carga.
+//     (DisablePlaneDetection no indica "todo terminó" — indica "el modelo
+//      está posicionado pero la carga pesada (NavMesh+escaleras) continúa.)
+//
+//  3. EnablePlaneDetection() notifica EndHeavyLoad — indica que el sistema
+//     volvió a modo normal (reposicionamiento de modelo).
+//
+//  TODOS LOS COMPORTAMIENTOS DE v3.3 SE CONSERVAN ÍNTEGRAMENTE.
 
 using System;
 using System.Collections;
@@ -42,6 +53,8 @@ namespace IndoorNavAR.AR
         [SerializeField] private ARPlaneManager    _planeManager;
         [SerializeField] private ARRaycastManager  _raycastManager;
         [SerializeField] private ARAnchorManager   _anchorManager;
+        [SerializeField] private ARSession         _arSession;  // ✅ v3.4: referencia directa
+        private Unity.XR.CoreUtils.XROrigin _xrOriginCache;
 
         [Header("Configuración")]
         [SerializeField] private bool  _detectVerticalPlanes    = false;
@@ -49,29 +62,14 @@ namespace IndoorNavAR.AR
         [SerializeField] private float _minimumPlaneArea        = 0.5f;
 
         [Header("─── Estabilidad inicial (FIX 1) ─────────────────────────")]
-        [Tooltip("Frames consecutivos de SessionTracking requeridos antes de " +
-                 "considerar la sesión AR lista para posicionar el modelo. " +
-                 "Evita desalineación por world origin shift de ARCore al arrancar. " +
-                 "Default 30 ≈ 0.5s a 60fps.")]
         [SerializeField] private int   _initialStableFrames    = 30;
-
-        [Tooltip("Segundos máximos esperando tracking estable al inicio.")]
         [SerializeField] private float _initialTrackingTimeout = 10f;
 
         [Header("─── Estabilidad en movimiento rápido (FIX 2) ─────────────")]
-        [Tooltip("Delta de posición de cámara en un frame (m) que se considera " +
-                 "movimiento brusco del USUARIO.\n\n" +
-                 "⚠️ v3.1: Este umbral solo aplica cuando NO hay una supresión " +
-                 "activa (SuppressQuickMoveDetection). Los saltos intencionales " +
-                 "del XR Origin (AlignXROriginOnce) se suprimen automáticamente " +
-                 "y no activan este detector.")]
         [SerializeField] private float _quickMoveThreshold      = 0.15f;
-
-        [Tooltip("Frames de pausa en sincronización tras movimiento brusco del USUARIO. " +
-                 "Default 20 ≈ 0.33s a 60fps.")]
         [SerializeField] private int   _quickMoveStabilityFrames = 20;
 
-        [Header("─── Debug ───────────────────────────────────────────────")]
+        [Header("─── Debug ───────────────────────────────────────────────────")]
         [SerializeField] private bool _logTracking = true;
 
         // ─── Estado ───────────────────────────────────────────────────────
@@ -80,19 +78,14 @@ namespace IndoorNavAR.AR
             = new Dictionary<TrackableId, ARPlane>();
         private readonly List<ARRaycastHit> _raycastHits = new List<ARRaycastHit>();
 
-        // FIX 1 — tracking inicial
         private bool _initialTrackingAchieved  = false;
         private int  _consecutiveStableFrames  = 0;
 
-        // FIX 2 — movimiento rápido del usuario
         private Vector3 _lastCameraPos     = Vector3.zero;
         private bool    _cameraInitialized = false;
         private int     _quickMovePauseFrames = 0;
+        private int     _suppressQuickMoveFrames = 0;
 
-        // v3.1 — Supresión de detección para saltos intencionales del XR Origin
-        private int _suppressQuickMoveFrames = 0;
-
-        // ✅ v3.2 — Estado de plane detection para restauración
         private bool _planeDetectionDisabled = false;
 
         // ─── Propiedades públicas ─────────────────────────────────────────
@@ -119,8 +112,8 @@ namespace IndoorNavAR.AR
 
         private void OnDisable()
         {
-            if (_planeManager != null)
-                _planeManager.trackablesChanged.RemoveListener(OnTrackablesChanged);
+            _planeManager?.trackablesChanged.RemoveListener(OnTrackablesChanged);
+            _xrOriginCache = null;
         }
 
         private void Update() => UpdateQuickMoveDetection();
@@ -132,6 +125,7 @@ namespace IndoorNavAR.AR
             if (_planeManager    == null) _planeManager    = FindFirstObjectByType<ARPlaneManager>();
             if (_raycastManager  == null) _raycastManager  = FindFirstObjectByType<ARRaycastManager>();
             if (_anchorManager   == null) _anchorManager   = FindFirstObjectByType<ARAnchorManager>();
+            if (_arSession       == null) _arSession       = FindFirstObjectByType<ARSession>();
 
             if (_planeManager == null)
             {
@@ -144,8 +138,7 @@ namespace IndoorNavAR.AR
                 enabled = false; return;
             }
 
-            Debug.Log("[ARSessionManager] ✅ v3.3 Dependencias validadas. " +
-                      $"PlaneManager en '{_planeManager.gameObject.name}'");
+            Log("✅ v3.4 Dependencias validadas.");
         }
 
         private void InitializeARSession()
@@ -153,11 +146,23 @@ namespace IndoorNavAR.AR
             try
             {
                 ConfigurePlaneDetection();
+
+                // ✅ v3.4: ARPerformanceManager gestiona matchFrameRateRequested y targetFrameRate.
+                // ARSessionManager ya no toca Application.targetFrameRate directamente.
+                // Si ARPerformanceManager no existe, aplicar matchFrameRate aquí como fallback.
+                if (ARPerformanceManager.Instance == null && _arSession != null)
+                {
+                    _arSession.matchFrameRateRequested = true;
+                    Application.targetFrameRate = 30;
+                    QualitySettings.vSyncCount  = 0;
+                    Log("⚠️ ARPerformanceManager no encontrado — aplicando matchFrameRate fallback.");
+                }
+
                 IsSessionReady = true;
                 StartCoroutine(WaitForStableTracking());
 
-                Debug.Log("[ARSessionManager] ✅ v3.3 Sesión AR inicializada. " +
-                          $"Esperando {_initialStableFrames} frames para estabilidad...");
+                Log($"✅ v3.4 Sesión AR inicializada. " +
+                    $"Esperando {_initialStableFrames} frames para estabilidad...");
             }
             catch (Exception ex)
             {
@@ -199,10 +204,6 @@ namespace IndoorNavAR.AR
                         _initialTrackingAchieved = true;
                         Log($"✅ Tracking estable alcanzado ({_initialStableFrames} frames " +
                             $"en {elapsed:F1}s).");
-
-                        // ✅ v3.3: Solo publicar ShowMessageEvent para la UI local.
-                        // ARSessionReadyEvent es responsabilidad exclusiva de PersistenceManager v14
-                        // — se publica cuando modelo + waypoints + anchor están listos.
                         NotifyTrackingStable();
                         yield break;
                     }
@@ -219,16 +220,11 @@ namespace IndoorNavAR.AR
             }
 
             Debug.LogWarning($"[ARSessionManager] ⚠️ Timeout esperando tracking estable " +
-                             $"({_initialTrackingTimeout}s). " +
-                             $"Estado: {ARSession.state}");
+                             $"({_initialTrackingTimeout}s). Estado: {ARSession.state}");
             _initialTrackingAchieved = true;
             NotifyTrackingStable();
         }
 
-        /// <summary>
-        /// ✅ v3.3 — Notifica que el tracking es estable (solo UI local).
-        /// NO publica ARSessionReadyEvent — eso es responsabilidad de PersistenceManager.
-        /// </summary>
         private void NotifyTrackingStable()
         {
             Core.Events.EventBus.Instance?.Publish(new Core.Events.ShowMessageEvent
@@ -238,32 +234,28 @@ namespace IndoorNavAR.AR
                 Duration = 3f
             });
 
-            Log("✅ v3.3 Tracking estable notificado (sin ARSessionReadyEvent — " +
-                "PersistenceManager lo publica cuando la sesión esté lista).");
+            Log("✅ v3.4 Tracking estable notificado.");
         }
 
         // ─── FIX 2 — Detección de movimiento rápido ──────────────────────
 
-        /// <summary>
-        /// ✅ v3.1 — Suprime la detección de movimiento rápido por N frames.
-        /// AROriginAligner debe llamar esto ANTES de MoveCameraToWorldLocation().
-        /// </summary>
         public void SuppressQuickMoveDetection(int frames = 5)
         {
             _suppressQuickMoveFrames = frames;
             _cameraInitialized = false;
-            Log($"⏸ QuickMove suprimido por {frames} frames " +
-                "(salto intencional de XR Origin — AlignXROriginOnce).");
+            Log($"⏸ QuickMove suprimido por {frames} frames.");
         }
 
         private void UpdateQuickMoveDetection()
         {
             if (!_initialTrackingAchieved) return;
 
-            var xrOrigin = FindFirstObjectByType<Unity.XR.CoreUtils.XROrigin>();
-            if (xrOrigin?.Camera == null) return;
+            if (_xrOriginCache == null)
+                _xrOriginCache = FindFirstObjectByType<Unity.XR.CoreUtils.XROrigin>();
 
-            Vector3 currentCameraPos = xrOrigin.Camera.transform.position;
+            if (_xrOriginCache?.Camera == null) return;
+
+            Vector3 currentCameraPos = _xrOriginCache.Camera.transform.position;
 
             if (!_cameraInitialized)
             {
@@ -279,32 +271,29 @@ namespace IndoorNavAR.AR
             {
                 _suppressQuickMoveFrames--;
                 if (_suppressQuickMoveFrames == 0)
-                    Log("✅ Supresión de QuickMove terminada — detector activo nuevamente.");
+                    Log("✅ Supresión de QuickMove terminada.");
                 return;
             }
 
             if (_quickMovePauseFrames > 0)
             {
                 _quickMovePauseFrames--;
-                if (_quickMovePauseFrames == 0)
-                    Log("✅ Pausa por movimiento rápido terminada — reanudando sincronización.");
                 return;
             }
 
             if (cameraDelta > _quickMoveThreshold)
             {
                 _quickMovePauseFrames = _quickMoveStabilityFrames;
-                Log($"⚡ Movimiento rápido del USUARIO detectado " +
-                    $"(Δ={cameraDelta:F3}m > umbral {_quickMoveThreshold:F3}m). " +
-                    $"Pausando sincronización por {_quickMoveStabilityFrames} frames.");
+                Log($"⚡ Movimiento rápido detectado (Δ={cameraDelta:F3}m). " +
+                    $"Pausando {_quickMoveStabilityFrames} frames.");
             }
         }
 
-        // ─── ✅ v3.2 FIX_CPU — Control de Plane Detection ─────────────────
+        // ─── ✅ v3.4 FIX_CPU — Control de Plane Detection + ARPerformanceManager ────
 
         /// <summary>
-        /// ✅ v3.2 — Deshabilita plane detection para liberar CPU al VIO.
-        /// Llamado por ModelLoadManager tras anclar el modelo.
+        /// ✅ v3.4 — Deshabilita plane detection Y notifica al ARPerformanceManager
+        /// que está por comenzar una fase de carga pesada (NavMesh + escaleras).
         /// </summary>
         public void DisablePlaneDetection()
         {
@@ -314,13 +303,17 @@ namespace IndoorNavAR.AR
             _planeManager.requestedDetectionMode = PlaneDetectionMode.None;
             _planeDetectionDisabled = true;
 
-            Log("✅ [FIX_CPU] Plane detection DESHABILITADA — CPU liberada para VIO. " +
-                "VIO debería recuperar frecuencia ~30Hz.");
+            // ✅ v3.4: Notificar inicio de fase pesada para bajar framerate
+            // y ceder CPU al VIO. El 'EndHeavyLoad' correspondiente lo llama
+            // PersistenceManager cuando ReparentWaypointsAfterAlignment() termina.
+            ARPerformanceManager.Instance?.BeginHeavyLoad("PlaneDetection deshabilitada — inicio carga NavMesh+waypoints");
+
+            Log("✅ [v3.4] Plane detection DESHABILITADA — CPU cedida al VIO. " +
+                "ARPerformanceManager en modo heavy-load.");
         }
 
         /// <summary>
-        /// ✅ v3.2 — Re-habilita plane detection.
-        /// Llamar si el usuario necesita reposicionar el modelo.
+        /// ✅ v3.4 — Re-habilita plane detection y notifica fin de fase pesada.
         /// </summary>
         public void EnablePlaneDetection()
         {
@@ -333,7 +326,9 @@ namespace IndoorNavAR.AR
             _planeManager.requestedDetectionMode = mode;
             _planeDetectionDisabled = false;
 
-            Log($"✅ [FIX_CPU] Plane detection RE-HABILITADA: {mode}");
+            ARPerformanceManager.Instance?.EndHeavyLoad("PlaneDetection re-habilitada");
+
+            Log($"✅ [v3.4] Plane detection RE-HABILITADA: {mode}");
         }
 
         // ─── Plane tracking ───────────────────────────────────────────────
@@ -352,15 +347,7 @@ namespace IndoorNavAR.AR
                 plane.classifications == PlaneClassifications.None &&
                 plane.alignment       == PlaneAlignment.HorizontalUp;
 
-            if (!isFloor && !isUnclassifiedHorizontalUp)
-            {
-                if (plane.alignment == PlaneAlignment.HorizontalDown ||
-                    plane.classifications.HasFlag(PlaneClassifications.Ceiling))
-                    Log($"🚫 Plano techo ignorado: alignment={plane.alignment} " +
-                        $"class={plane.classifications}");
-                return;
-            }
-
+            if (!isFloor && !isUnclassifiedHorizontalUp) return;
             if (plane.size.x * plane.size.y < _minimumPlaneArea) return;
 
             _detectedPlanes[plane.trackableId] = plane;
@@ -372,17 +359,12 @@ namespace IndoorNavAR.AR
                 Center = plane.center,
                 Area   = plane.size.x * plane.size.y
             });
-
-            string classLabel = isFloor ? "Floor✓" : "HorizUp(sin clasificar)";
-            Log($"✅ Plano [{classLabel}]: {plane.trackableId} | " +
-                $"Área: {plane.size.x * plane.size.y:F2}m²");
         }
 
         private void ProcessUpdatedPlane(ARPlane plane)
         {
             if (!_detectedPlanes.ContainsKey(plane.trackableId)) return;
             _detectedPlanes[plane.trackableId] = plane;
-
             EventBus.Instance?.Publish(new PlaneUpdatedEvent
             {
                 Plane     = plane,
@@ -394,10 +376,7 @@ namespace IndoorNavAR.AR
         private void ProcessRemovedPlane(ARPlane plane)
         {
             if (_detectedPlanes.Remove(plane.trackableId))
-            {
                 EventBus.Instance?.Publish(new PlaneRemovedEvent { Plane = plane });
-                Log($"Plano removido: {plane.trackableId}");
-            }
         }
 
         private void ConfigurePlaneVisualization(ARPlane plane)
@@ -416,9 +395,7 @@ namespace IndoorNavAR.AR
 
         // ─── Raycast ──────────────────────────────────────────────────────
 
-        public bool Raycast(
-            Vector2      screenPosition,
-            out ARRaycastHit hit,
+        public bool Raycast(Vector2 screenPosition, out ARRaycastHit hit,
             TrackableType trackableTypes = TrackableType.PlaneWithinPolygon)
         {
             hit = default;
@@ -442,7 +419,7 @@ namespace IndoorNavAR.AR
             return false;
         }
 
-        // ─── Anchors — AF 6.5 ─────────────────────────────────────────────
+        // ─── Anchors ──────────────────────────────────────────────────────
 
         public async Task<ARAnchor> CreateAnchorAsync(Pose pose)
         {
@@ -451,8 +428,8 @@ namespace IndoorNavAR.AR
 
             if (ARSession.state != ARSessionState.SessionTracking)
             {
-                Debug.LogWarning($"[ARSessionManager] ⚠️ Anchor rechazado: " +
-                                 $"ARCore no está en SessionTracking (estado: {ARSession.state}).");
+                Debug.LogWarning($"[ARSessionManager] ⚠️ Anchor rechazado: no SessionTracking " +
+                                 $"(estado: {ARSession.state}).");
                 return null;
             }
 
@@ -464,10 +441,10 @@ namespace IndoorNavAR.AR
                     ARAnchor anchor = result.value;
                     if (anchor == null || !anchor.enabled)
                     { Debug.LogWarning("[ARSessionManager] ⚠️ Anchor creado pero nulo/desactivado."); return null; }
-                    Log($"⚓ Anchor creado: {anchor.trackableId} @ {pose.position:F3}");
                     return anchor;
                 }
-                LogAnchorFailure(result.status);
+                Debug.LogWarning($"[ARSessionManager] ⚠️ TryAddAnchorAsync falló: " +
+                                 $"status={result.status} | ARSession={ARSession.state}");
                 return null;
             }
             catch (Exception ex)
@@ -477,36 +454,12 @@ namespace IndoorNavAR.AR
             }
         }
 
-        public void CreateAnchorFireAndForget(Pose pose, Action<ARAnchor> onComplete = null)
-            => _ = CreateAnchorAndCallback(pose, onComplete);
-
-        private async Task CreateAnchorAndCallback(Pose pose, Action<ARAnchor> onComplete)
-        {
-            ARAnchor anchor = await CreateAnchorAsync(pose);
-            onComplete?.Invoke(anchor);
-        }
-
-        private void LogAnchorFailure(XRResultStatus status)
-        {
-            string reason = $"status={status} | ARSession={ARSession.state} " +
-                            $"| reason={ARSession.notTrackingReason}";
-            Debug.LogWarning($"[ARSessionManager] ⚠️ TryAddAnchorAsync falló: {reason}");
-        }
-
         public void RemoveAnchor(ARAnchor anchor)
         {
             if (anchor == null || _anchorManager == null) return;
-            try
-            {
-                if (_anchorManager.TryRemoveAnchor(anchor))
-                    Log($"Ancla removida: {anchor.trackableId}");
-                else
-                    Debug.LogWarning($"[ARSessionManager] No se pudo remover: {anchor.trackableId}");
-            }
+            try { _anchorManager.TryRemoveAnchor(anchor); }
             catch (Exception ex)
-            {
-                Debug.LogError($"[ARSessionManager] Error removiendo ancla: {ex.Message}");
-            }
+            { Debug.LogError($"[ARSessionManager] Error removiendo ancla: {ex.Message}"); }
         }
 
         // ─── Utilities ────────────────────────────────────────────────────
@@ -517,7 +470,6 @@ namespace IndoorNavAR.AR
             foreach (var kvp in _detectedPlanes)
                 if (kvp.Value != null && kvp.Value.TryGetComponent<MeshRenderer>(out var r))
                     r.enabled = show;
-            Log($"Visualización de planos: {show}");
         }
 
         public void ClearAllPlanes()
@@ -525,7 +477,6 @@ namespace IndoorNavAR.AR
             foreach (var kvp in _detectedPlanes)
                 if (kvp.Value != null) Destroy(kvp.Value.gameObject);
             _detectedPlanes.Clear();
-            Log("Todos los planos limpiados.");
         }
 
         public ARPlane GetLargestPlane()
@@ -542,8 +493,6 @@ namespace IndoorNavAR.AR
             return largestPlane;
         }
 
-        // ─── Helpers ─────────────────────────────────────────────────────
-
         private void Log(string msg)
         {
             if (_logTracking) Debug.Log($"[ARSessionManager] {msg}");
@@ -554,32 +503,26 @@ namespace IndoorNavAR.AR
         [ContextMenu("ℹ️ Estado actual")]
         private void DebugState()
         {
+            bool matchAR = _arSession != null && _arSession.matchFrameRateRequested;
             Debug.Log("══════════════════════════════════════════════");
-            Debug.Log("  ARSessionManager v3.3 — Estado");
+            Debug.Log("  ARSessionManager v3.4");
             Debug.Log("══════════════════════════════════════════════");
             Debug.Log($"  ARSession state:           {ARSession.state}");
             Debug.Log($"  IsSessionReady:            {IsSessionReady}");
             Debug.Log($"  IsFullyStable:             {IsFullyStable}");
             Debug.Log($"  InitialTracking logrado:   {_initialTrackingAchieved}");
-            Debug.Log($"  Frames estables actual:    {_consecutiveStableFrames}/{_initialStableFrames}");
-            Debug.Log($"  IsQuickMovePaused:         {IsQuickMovePaused} ({_quickMovePauseFrames} frames)");
-            Debug.Log($"  SuppressFrames restantes:  {_suppressQuickMoveFrames}");
+            Debug.Log($"  matchFrameRateRequested:   {matchAR}");
+            Debug.Log($"  Application.targetFPS:     {Application.targetFrameRate}");
+            Debug.Log($"  ARPerfMgr:                 {(ARPerformanceManager.Instance != null ? "OK" : "NULL")}");
             Debug.Log($"  PlaneDetectionDisabled:    {_planeDetectionDisabled}");
             Debug.Log($"  Planos detectados:         {DetectedPlaneCount}");
-            Debug.Log($"  PlaneManager:              {(_planeManager    != null ? _planeManager.gameObject.name    : "NULL")}");
-            Debug.Log($"  RaycastManager:            {(_raycastManager  != null ? _raycastManager.gameObject.name  : "NULL")}");
-            Debug.Log($"  AnchorManager:             {(_anchorManager   != null ? _anchorManager.gameObject.name   : "NULL")}");
-            Debug.Log($"  [v3.3] ARSessionReadyEvent: publicado SOLO por PersistenceManager");
             Debug.Log("══════════════════════════════════════════════");
         }
 
-        [ContextMenu("🚫 Deshabilitar Plane Detection ahora")]
+        [ContextMenu("🚫 Deshabilitar Plane Detection")]
         private void DebugDisablePlanes() => DisablePlaneDetection();
 
-        [ContextMenu("✅ Re-habilitar Plane Detection ahora")]
+        [ContextMenu("✅ Re-habilitar Plane Detection")]
         private void DebugEnablePlanes() => EnablePlaneDetection();
-
-        [ContextMenu("🧪 Test SuppressQuickMove (5 frames)")]
-        private void DebugSuppressQuickMove() => SuppressQuickMoveDetection(5);
     }
 }

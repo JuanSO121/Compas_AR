@@ -61,6 +61,8 @@ namespace IndoorNavAR.Navigation
         private bool _modelPositionConfirmed = false;
         private Coroutine _teleportCoroutine = null;
 
+        private bool _blockTeleportForSessionRestore = false;
+
         // ─── Properties ───────────────────────────────────────────────────
 
         public int     Level             => _level;
