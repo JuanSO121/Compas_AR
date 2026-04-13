@@ -1564,6 +1564,67 @@ MonoBehaviour:
     m_VarianceClampScale: 0.9
     m_ContrastAdaptiveSharpening: 0
   m_Version: 2
+--- !u!1001 &1254679683
+PrefabInstance:
+  m_ObjectHideFlags: 0
+  serializedVersion: 2
+  m_Modification:
+    serializedVersion: 3
+    m_TransformParent: {fileID: 0}
+    m_Modifications:
+    - target: {fileID: 6742753104178309886, guid: 18975bf6d45234e4385250463a608e8a, type: 3}
+      propertyPath: m_LocalPosition.x
+      value: -3.76954
+      objectReference: {fileID: 0}
+    - target: {fileID: 6742753104178309886, guid: 18975bf6d45234e4385250463a608e8a, type: 3}
+      propertyPath: m_LocalPosition.y
+      value: 0
+      objectReference: {fileID: 0}
+    - target: {fileID: 6742753104178309886, guid: 18975bf6d45234e4385250463a608e8a, type: 3}
+      propertyPath: m_LocalPosition.z
+      value: -1.13569
+      objectReference: {fileID: 0}
+    - target: {fileID: 6742753104178309886, guid: 18975bf6d45234e4385250463a608e8a, type: 3}
+      propertyPath: m_LocalRotation.w
+      value: 1
+      objectReference: {fileID: 0}
+    - target: {fileID: 6742753104178309886, guid: 18975bf6d45234e4385250463a608e8a, type: 3}
+      propertyPath: m_LocalRotation.x
+      value: 0
+      objectReference: {fileID: 0}
+    - target: {fileID: 6742753104178309886, guid: 18975bf6d45234e4385250463a608e8a, type: 3}
+      propertyPath: m_LocalRotation.y
+      value: 0
+      objectReference: {fileID: 0}
+    - target: {fileID: 6742753104178309886, guid: 18975bf6d45234e4385250463a608e8a, type: 3}
+      propertyPath: m_LocalRotation.z
+      value: 0
+      objectReference: {fileID: 0}
+    - target: {fileID: 6742753104178309886, guid: 18975bf6d45234e4385250463a608e8a, type: 3}
+      propertyPath: m_LocalEulerAnglesHint.x
+      value: 0
+      objectReference: {fileID: 0}
+    - target: {fileID: 6742753104178309886, guid: 18975bf6d45234e4385250463a608e8a, type: 3}
+      propertyPath: m_LocalEulerAnglesHint.y
+      value: 0
+      objectReference: {fileID: 0}
+    - target: {fileID: 6742753104178309886, guid: 18975bf6d45234e4385250463a608e8a, type: 3}
+      propertyPath: m_LocalEulerAnglesHint.z
+      value: 0
+      objectReference: {fileID: 0}
+    - target: {fileID: 9197943431309610152, guid: 18975bf6d45234e4385250463a608e8a, type: 3}
+      propertyPath: m_Name
+      value: Biblioteca_F_V2 1
+      objectReference: {fileID: 0}
+    - target: {fileID: 9197943431309610152, guid: 18975bf6d45234e4385250463a608e8a, type: 3}
+      propertyPath: m_IsActive
+      value: 0
+      objectReference: {fileID: 0}
+    m_RemovedComponents: []
+    m_RemovedGameObjects: []
+    m_AddedGameObjects: []
+    m_AddedComponents: []
+  m_SourcePrefab: {fileID: 100100000, guid: 18975bf6d45234e4385250463a608e8a, type: 3}
 --- !u!1 &1357824780
 GameObject:
   m_ObjectHideFlags: 0
@@ -1593,7 +1654,7 @@ MonoBehaviour:
   m_Script: {fileID: 11500000, guid: d86188585c75d7f43accbc7d5b54f8c5, type: 3}
   m_Name: 
   m_EditorClassIdentifier: Assembly-CSharp::SegmentationController
-  _modelAsset: {fileID: 5022602860645237092, guid: 6a24957cea06a52408ab4c68a1775482, type: 3}
+  _modelAsset: {fileID: 5022602860645237092, guid: 12c3dd08f0e063d4daaf219abb98df10, type: 3}
   _backend: 256
   _tensorRotation: 90
   _flipInputY: 1
@@ -2549,3 +2610,4 @@ SceneRoots:
   - {fileID: 953552584}
   - {fileID: 1862595140}
   - {fileID: 1375737372}
+  - {fileID: 1254679683}
