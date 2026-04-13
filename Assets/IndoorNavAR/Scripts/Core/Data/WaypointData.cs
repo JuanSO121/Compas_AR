@@ -1,13 +1,18 @@
+// File: WaypointData.cs
+// ✅ v7-fix — No sobreescribir transform cuando hasLocalSpace=true en LoadFromSaveData().
+//
+// CAMBIO RESPECTO A v7:
+//   LoadFromSaveData() ya NO asigna transform.position/rotation cuando
+//   data.hasLocalSpace=true, porque CreateWaypointLocal() ya los asignó
+//   en espacio local antes de llamar a este método.
+//   Sobreescribir con data.position (world legacy) destruiría el local space.
+
 using System;
 using UnityEngine;
 using IndoorNavAR.Core.Events;
 
 namespace IndoorNavAR.Core.Data
 {
-    /// <summary>
-    /// Componente que almacena y gestiona los datos de un waypoint individual.
-    /// Se adjunta al GameObject del waypoint para mantener su configuración.
-    /// </summary>
     [RequireComponent(typeof(MeshRenderer))]
     public class WaypointData : MonoBehaviour
     {
@@ -24,7 +29,7 @@ namespace IndoorNavAR.Core.Data
         [Header("Configuración")]
         [SerializeField] private string _description;
         [SerializeField] private bool _isNavigable = true;
-        
+
         private MeshRenderer _meshRenderer;
         private MaterialPropertyBlock _propertyBlock;
 
@@ -102,17 +107,12 @@ namespace IndoorNavAR.Core.Data
 
         private void Awake()
         {
-            // Generar ID único si no existe
             if (string.IsNullOrEmpty(_waypointId))
-            {
                 _waypointId = Guid.NewGuid().ToString();
-            }
 
-            // Inicializar componentes
             _meshRenderer = GetComponent<MeshRenderer>();
             _propertyBlock = new MaterialPropertyBlock();
 
-            // Aplicar configuración inicial
             UpdateVisuals();
             UpdateScale();
         }
@@ -121,9 +121,6 @@ namespace IndoorNavAR.Core.Data
 
         #region Configuration Methods
 
-        /// <summary>
-        /// Configura el waypoint con todos los parámetros de una vez.
-        /// </summary>
         public void Configure(string name, WaypointType type, Color color, string description = "")
         {
             WaypointName = name;
@@ -131,58 +128,45 @@ namespace IndoorNavAR.Core.Data
             Description = description;
             Color = color;
 
-            // Publicar evento de configuración
             EventBus.Instance.Publish(new WaypointConfiguredEvent
             {
-                WaypointId = _waypointId,
+                WaypointId   = _waypointId,
                 WaypointName = name,
-                Type = type,
-                Color = color
+                Type         = type,
+                Color        = color
             });
         }
 
-        /// <summary>
-        /// Actualiza las propiedades visuales del waypoint.
-        /// </summary>
         public void UpdateVisuals()
         {
-            if (_meshRenderer == null || _propertyBlock == null)
-                return;
-
-            // Usar MaterialPropertyBlock para eficiencia (no crea instancias de material)
+            if (_meshRenderer == null || _propertyBlock == null) return;
             _meshRenderer.GetPropertyBlock(_propertyBlock);
             _propertyBlock.SetColor("_BaseColor", _color);
-            _propertyBlock.SetColor("_Color", _color); // Fallback para shaders legacy
+            _propertyBlock.SetColor("_Color", _color);
             _meshRenderer.SetPropertyBlock(_propertyBlock);
         }
 
-        /// <summary>
-        /// Actualiza la escala basada en height y radius.
-        /// </summary>
         private void UpdateScale()
         {
             transform.localScale = new Vector3(_radius * 2f, _height, _radius * 2f);
         }
 
-        /// <summary>
-        /// Obtiene el color predeterminado según el tipo de waypoint.
-        /// </summary>
         public static Color GetDefaultColorForType(WaypointType type)
         {
             return type switch
             {
-                WaypointType.Entrance => new Color(0f, 1f, 0f, 0.8f),      // Verde
-                WaypointType.Exit => new Color(1f, 0f, 0f, 0.8f),          // Rojo
-                WaypointType.Kitchen => new Color(1f, 0.65f, 0f, 0.8f),    // Naranja
-                WaypointType.Bathroom => new Color(0f, 0.75f, 1f, 0.8f),   // Azul claro
-                WaypointType.Bedroom => new Color(0.8f, 0.4f, 0.8f, 0.8f), // Púrpura
-                WaypointType.LivingRoom => new Color(1f, 1f, 0f, 0.8f),    // Amarillo
-                WaypointType.DiningRoom => new Color(1f, 0.5f, 0f, 0.8f),  // Naranja oscuro
-                WaypointType.Office => new Color(0f, 0f, 1f, 0.8f),        // Azul
-                WaypointType.Hallway => new Color(0.7f, 0.7f, 0.7f, 0.8f), // Gris
-                WaypointType.Stairs => new Color(0.6f, 0.3f, 0f, 0.8f),    // Marrón
-                WaypointType.Elevator => new Color(0.5f, 0.5f, 0.5f, 0.8f),// Gris oscuro
-                _ => new Color(0f, 1f, 1f, 0.8f)                           // Cyan (Generic/Custom)
+                WaypointType.Entrance   => new Color(0f, 1f, 0f, 0.8f),
+                WaypointType.Exit       => new Color(1f, 0f, 0f, 0.8f),
+                WaypointType.Kitchen    => new Color(1f, 0.65f, 0f, 0.8f),
+                WaypointType.Bathroom   => new Color(0f, 0.75f, 1f, 0.8f),
+                WaypointType.Bedroom    => new Color(0.8f, 0.4f, 0.8f, 0.8f),
+                WaypointType.LivingRoom => new Color(1f, 1f, 0f, 0.8f),
+                WaypointType.DiningRoom => new Color(1f, 0.5f, 0f, 0.8f),
+                WaypointType.Office     => new Color(0f, 0f, 1f, 0.8f),
+                WaypointType.Hallway    => new Color(0.7f, 0.7f, 0.7f, 0.8f),
+                WaypointType.Stairs     => new Color(0.6f, 0.3f, 0f, 0.8f),
+                WaypointType.Elevator   => new Color(0.5f, 0.5f, 0.5f, 0.8f),
+                _                       => new Color(0f, 1f, 1f, 0.8f)
             };
         }
 
@@ -190,41 +174,52 @@ namespace IndoorNavAR.Core.Data
 
         #region Serialization Support
 
-        /// <summary>
-        /// Serializa el waypoint a formato guardable.
-        /// </summary>
         public WaypointSaveData ToSaveData()
         {
             return new WaypointSaveData
             {
-                id = _waypointId,
-                name = _waypointName,
-                type = _type,
-                position = transform.position,
-                rotation = transform.rotation,
-                color = _color,
-                height = _height,
-                radius = _radius,
+                id          = _waypointId,
+                name        = _waypointName,
+                type        = _type,
+                position    = transform.position,
+                rotation    = transform.rotation,
+                color       = _color,
+                height      = _height,
+                radius      = _radius,
                 description = _description,
                 isNavigable = _isNavigable
             };
         }
 
         /// <summary>
-        /// Carga configuración desde datos serializados.
+        /// ✅ v7-fix — Carga configuración desde datos serializados.
+        ///
+        /// IMPORTANTE: Cuando data.hasLocalSpace=true, CreateWaypointLocal() ya asignó
+        /// transform.localPosition/localRotation antes de llamar aquí.
+        /// NO sobreescribir con data.position/rotation (world space de sesión anterior)
+        /// porque destruiría el posicionamiento correcto en local space.
+        ///
+        /// Cuando data.hasLocalSpace=false (sesiones pre-v7), usar data.position como antes.
         /// </summary>
         public void LoadFromSaveData(WaypointSaveData data)
         {
-            _waypointId = data.id;
+            _waypointId  = data.id;
             _waypointName = data.name;
-            _type = data.type;
-            transform.position = data.position;
-            transform.rotation = data.rotation;
-            _color = data.color;
-            _height = data.height;
-            _radius = data.radius;
+            _type        = data.type;
+            _color       = data.color;
+            _height      = data.height;
+            _radius      = data.radius;
             _description = data.description;
             _isNavigable = data.isNavigable;
+
+            // ✅ FIX: Solo asignar posición world si NO viene de local space.
+            // Si hasLocalSpace=true, la posición ya fue asignada correctamente
+            // por CreateWaypointLocal() — tocar transform aquí sería un bug.
+            if (!data.hasLocalSpace)
+            {
+                transform.position = data.position;
+                transform.rotation = data.rotation;
+            }
 
             gameObject.name = $"Waypoint_{_waypointName}";
             UpdateVisuals();
@@ -239,8 +234,6 @@ namespace IndoorNavAR.Core.Data
         {
             Gizmos.color = _color;
             Gizmos.DrawWireSphere(transform.position, _radius);
-            
-            // Dibuja línea vertical para indicar altura
             Gizmos.DrawLine(transform.position, transform.position + Vector3.up * _height);
         }
 
@@ -249,19 +242,25 @@ namespace IndoorNavAR.Core.Data
 
     /// <summary>
     /// Estructura serializable para guardar/cargar waypoints.
+    /// ✅ v7: Incluye localPosition/localRotation/hasLocalSpace para local space nativo.
     /// </summary>
     [Serializable]
-    public struct WaypointSaveData
+    public class WaypointSaveData
     {
-        public string id;
-        public string name;
+        public string      id;
+        public string      name;
         public WaypointType type;
-        public Vector3 position;
-        public Quaternion rotation;
-        public Color color;
-        public float height;
-        public float radius;
-        public string description;
-        public bool isNavigable;
+        public Vector3     position;    // world space — legacy, se conserva
+        public Quaternion  rotation;    // world space — legacy, se conserva
+        public Color       color;
+        public float       height;
+        public float       radius;
+        public string      description;
+        public bool        isNavigable;
+
+        // ✅ v7: Espacio local del modelo — elimina drift entre sesiones VIO
+        public Vector3    localPosition; // posición relativa al modelo
+        public Quaternion localRotation; // rotación relativa al modelo
+        public bool       hasLocalSpace; // true = usar local, false = usar world (legacy)
     }
 }

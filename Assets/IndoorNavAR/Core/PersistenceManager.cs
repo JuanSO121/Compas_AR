@@ -1,37 +1,56 @@
 // File: PersistenceManager.cs
-// ✅ FIX v6 — Recrea geometría física de escaleras al restaurar sesión.
+// ✅ v14.3 — FIX: IsSessionLoadCompleted nunca se ponía en true.
 //
-//  BUG CORREGIDO (v5 → v6):
-//    Al cargar sesión desde disco, LoadNavMeshFromFile() inyectaba el NavMesh
-//    correctamente (los vértices de rampa están en el .bin unificado), pero
-//    los GameObjects físicos de StairWithLandingHelper (MeshCollider, MeshFilter)
-//    NO existían en escena porque _createOnStart = false.
-//    Resultado: el NavMesh tenía la geometría correcta pero el agente no podía
-//    atravesar la escalera físicamente (sin colliders, caía o se bloqueaba).
+// ============================================================================
+//  CAMBIOS v14.2 → v14.3
+// ============================================================================
 //
-//  SOLUCIÓN v6:
-//    LoadNavMeshFromFile() ahora llama RecreateStairGeometryAsync() justo antes
-//    de NotifyNavMeshReady(). Esto garantiza:
-//      1) Los NavigationStartPoints ya están registrados (2x Task.Yield)
-//         → SnapYToFloorLevel() calcula la Y correcta de cada extremo.
-//      2) Los MeshCollider de rampa existen ANTES de que el agente se teleporte.
-//      3) Task.Delay(150ms) da tiempo a Unity para procesar los nuevos colliders.
+//  PROBLEMA RAÍZ:
+//  ─────────────────────────────────────────────────────────────────────────
+//  IsSessionLoadCompleted = _autoLoadAttempted && _autoLoadCompleted
 //
-//  TODOS los fixes anteriores se mantienen:
-//    v5: hasNavMesh doble escritura + auto-corrección discrepancia session.json
-//    v4: _loadedInstances (lista para múltiples NavMeshDataInstance)
-//    v3: _navMeshWasBaked (previene ciclo de degradación)
+//  En v14.x se eliminó el auto-load del Start(), pero los flags
+//  _autoLoadAttempted y _autoLoadCompleted NUNCA se ponían en true
+//  en ninguna ruta de código. NavigationManager llama LoadSession()
+//  directamente pero esos flags eran letra muerta.
+//
+//  Consecuencia en cadena:
+//    1. FlutterUnityBridge.NotifySubsystemsReady() ve IsSessionLoadCompleted=false
+//       → siempre transiciona a SessionLoading (nunca a Ready).
+//    2. SceneReadyNotifier.WaitForSessionLoad() espera IsSessionLoadCompleted=true
+//       → espera forever hasta el timeout de 20s (_sessionLoadTimeout).
+//    3. Solo tras el timeout de 20s se llama NotifySceneReady() y el bridge
+//       llega a Ready. Por eso "[Bridge] ✅ → Ready" aparecía con 20s de delay
+//       o directamente no aparecía si el timeout era el problema.
+//
+//  SOLUCIÓN v14.3:
+//  ─────────────────────────────────────────────────────────────────────────
+//  1. LoadSession() setea _autoLoadAttempted=true y _autoLoadCompleted=true
+//     en el bloque finally (siempre, independientemente del resultado).
+//  2. HasSavedSession()==false path también marca los flags como completados
+//     (no hay nada que cargar → la "carga" terminó inmediatamente).
+//  3. ReparentWaypointsAfterAlignment() llama
+//     FlutterUnityBridge.NotifySceneReady() directamente porque es el punto
+//     real de finalización de toda la carga. Esto elimina la dependencia del
+//     polling de SceneReadyNotifier y funciona incluso si SceneReadyNotifier
+//     no está en la escena.
+//
+//  TODOS LOS COMPORTAMIENTOS DE v14.2 SE CONSERVAN ÍNTEGRAMENTE.
 
 using System;
 using System.Collections.Generic;
 using System.IO;
+using System.Linq;
 using System.Threading.Tasks;
 using UnityEngine;
 using UnityEngine.AI;
+using UnityEngine.XR.ARFoundation;
+using IndoorNavAR.AR;
 using IndoorNavAR.Core.Data;
 using IndoorNavAR.Core.Events;
 using IndoorNavAR.Core.Managers;
 using IndoorNavAR.Navigation;
+using IndoorNavAR.Integration;
 
 namespace IndoorNavAR.Core
 {
@@ -50,6 +69,16 @@ namespace IndoorNavAR.Core
         [SerializeField] private ModelLoadManager           _modelLoadManager;
         [SerializeField] private MultiLevelNavMeshGenerator _navMeshGenerator;
 
+        [Header("─── FIX_CPU — Timing de carga ────────────────────────────")]
+        [SerializeField] private int _stairRecreateDelayFrames  = 10;
+        [SerializeField] private int _stairRecreateInterFrameMs = 0;
+        [SerializeField] private int _postNavMeshDelayMs        = 500;
+        [SerializeField] private int _postStairsDelayMs         = 300;
+
+        [Header("─── v14 — Espera de tracking ────────────────────────────")]
+        [Tooltip("Tiempo máximo (s) esperando ARSession.SessionTracking antes de intentar cargar sesión.")]
+        [SerializeField] private float _trackingWaitTimeout = 15f;
+
         [Header("🐛 Debug")]
         [SerializeField] private bool _logOperations = true;
 
@@ -57,23 +86,180 @@ namespace IndoorNavAR.Core
         private string SaveFilePath => _saveFilePath;
         private float  _timeSinceLastAutoSave;
 
-        // ✅ FIX v4: Lista de instancias (una por nivel en NavMeshSerializer v5.0)
-        private List<NavMeshDataInstance> _loadedInstances  = new List<NavMeshDataInstance>();
-        private bool                      _navMeshInstanceActive = false;
+        private bool _streamingAssetsCopied = false;
+        private bool _firstFrameReady       = false;
 
-        // ✅ FIX v3: Indica si el NavMesh activo proviene de un bake real.
-        private bool _navMeshWasBaked = false;
+        // ✅ v14.3 FIX: estos flags ahora se ponen en true correctamente en LoadSession()
+        private bool _autoLoadAttempted = false;
+        private bool _autoLoadCompleted = false;
+        private bool _autoLoadResult    = false;
+
+        private bool _alignmentCompleted = false;
+        private List<WaypointSaveData> _pendingWaypointData = null;
+
+        private bool _sessionWasRestored = false;
+        private Vector3 _savedModelPosition = Vector3.zero;
+
+        /// <summary>
+        /// ✅ v14.3 FIX: Retorna true cuando LoadSession() ha terminado (con o sin éxito).
+        /// Anteriormente _autoLoadAttempted/_autoLoadCompleted nunca se ponían en true
+        /// porque el auto-load fue eliminado en v14.x pero los flags quedaron huérfanos.
+        /// </summary>
+        public bool IsSessionLoadCompleted => _autoLoadAttempted && _autoLoadCompleted;
+        public bool AutoLoadResult         => _autoLoadResult;
+        public bool SessionWasRestored     => _sessionWasRestored;
+        public bool IsFullyReady => _streamingAssetsCopied && _firstFrameReady;
+
+        private bool _isLoading = false;
+        private bool _isSaving  = false;
+
+        private System.Threading.Tasks.TaskCompletionSource<bool> _loadingTcs = null;
+
+        private List<NavMeshDataInstance> _loadedInstances      = new List<NavMeshDataInstance>();
+        private bool                      _navMeshInstanceActive = false;
+        private bool                      _navMeshWasBaked       = false;
 
         // ─── Lifecycle ────────────────────────────────────────────────────
 
-        private void Awake()  => FindDependencies();
+        private async void Awake()
+        {
+            FindDependencies();
+            await CopyStreamingAssetsToPersistent();
+            _streamingAssetsCopied = true;
+        }
+
+        private void Start()
+        {
+            // PersistenceManager no auto-carga.
+            // NavigationManager decide cuándo cargar.
+            Log("[v14.3] PersistenceManager listo — esperando NavigationManager.");
+
+            // ✅ v14.3 FIX: Si no hay sesión guardada, marcar como completado de inmediato.
+            // Esto permite que FlutterUnityBridge y SceneReadyNotifier avancen sin esperar
+            // una carga que nunca ocurrirá.
+            if (!HasSavedSession())
+            {
+                _autoLoadAttempted = true;
+                _autoLoadCompleted = true;
+                _autoLoadResult    = false;
+                Log("[v14.3] Sin sesión guardada → IsSessionLoadCompleted=true (no hay nada que cargar).");
+            }
+        }
+
+        // ─── API para NavigationManager ───────────────────────────────────
+
+        public async Task ReparentWaypointsAfterAlignment()
+        {
+            if (_alignmentCompleted)
+            {
+                Log("[v14.3] ReparentWaypointsAfterAlignment ya completado — ignorando.");
+                return;
+            }
+
+            Log("[v14.3] ▶️ ReparentWaypointsAfterAlignment — modelo alineado al VIO.");
+
+            if (_waypointManager != null && _pendingWaypointData != null
+                && _pendingWaypointData.Count > 0)
+            {
+                await Task.Yield();
+                await Task.Yield();
+                await Task.Delay(100);
+
+                Transform modelRoot = _modelLoadManager?.CurrentModel?.transform?.parent
+                                   ?? _modelLoadManager?.CurrentModel?.transform;
+
+                Log($"[v14.3] Re-anclando {_pendingWaypointData.Count} waypoints " +
+                    $"bajo '{modelRoot?.name ?? "auto"}' (post-VIO)...");
+
+                _waypointManager.ForceReparentToModel(modelRoot);
+                _waypointManager.LoadWaypoints(_pendingWaypointData);
+
+                Log($"[v14.3] ✅ Waypoints re-creados: {_waypointManager.WaypointCount}");
+            }
+
+            _alignmentCompleted  = true;
+            _pendingWaypointData = null;
+
+            // ✅ v14.2: Notificar fin de fase pesada al ARPerformanceManager.
+            ARPerformanceManager.Instance?.EndHeavyLoad("ReparentWaypointsAfterAlignment completado");
+            Log("[v14.3] ✅ ARPerformanceManager.EndHeavyLoad() — VIO puede recuperar frecuencia.");
+
+            NotifySessionLoadedToFlutter(sessionWasRestored: _sessionWasRestored);
+            EventBus.Instance?.Publish(new Events.ARSessionReadyEvent());
+
+            // ✅ v14.3 FIX: Notificar al bridge directamente desde aquí.
+            // ReparentWaypointsAfterAlignment() es el punto REAL de finalización
+            // de toda la carga. Llamar NotifySceneReady() aquí garantiza que el
+            // bridge transite a Ready sin depender del polling de SceneReadyNotifier
+            // sobre IsSessionLoadCompleted.
+            //
+            // NotifySceneReady() es idempotente — si SceneReadyNotifier ya lo llamó
+            // antes (vía timeout o polling exitoso), el segundo llamado es ignorado.
+            FlutterUnityBridge.NotifySceneReady(
+                $"ReparentWaypointsAfterAlignment completado — sessionRestored={_sessionWasRestored}");
+
+            Log($"✅ [v14.3] Flutter notificado con sessionWasRestored={_sessionWasRestored}.");
+        }
+
+        // ─── Notificación a Flutter ───────────────────────────────────────
+
+        private void NotifySessionLoadedToFlutter(bool sessionWasRestored)
+        {
+            var api = VoiceCommandAPI.Instance;
+            if (api == null)
+            {
+                Log("⚠️ VoiceCommandAPI no disponible para enviar session_loaded.");
+                return;
+            }
+
+            int  wpCount = _waypointManager?.WaypointCount ?? 0;
+            bool hasNM   = HasSavedNavMesh;
+
+            string message = sessionWasRestored
+                ? (wpCount > 0
+                    ? $"Sesión restaurada — {wpCount} baliza(s)"
+                    : "Sesión restaurada — sin balizas")
+                : "Sin sesión previa guardada";
+
+            string json = $"{{\"action\":\"session_loaded\"," +
+                          $"\"ok\":true," +
+                          $"\"loaded\":{(sessionWasRestored ? "true" : "false")}," +
+                          $"\"waypointCount\":{wpCount}," +
+                          $"\"hasNavMesh\":{(hasNM ? "true" : "false")}," +
+                          $"\"message\":\"{message}\"}}";
+
+            api.ReplyPublic(json);
+
+            if (sessionWasRestored && wpCount > 0)
+            {
+                api.MarkWaypointCacheDirty();
+                api.ListWaypoints();
+            }
+
+            Log($"✅ [v14.3] session_loaded enviado: {json}");
+        }
+
+        // ─── Update ───────────────────────────────────────────────────────
+
         private void Update()
         {
+            if (!_firstFrameReady)
+            {
+                _firstFrameReady = true;
+                Log("✅ Primer frame completo.");
+            }
+
+            if (!_streamingAssetsCopied) return;
             if (!_autoSaveEnabled) return;
+
             _timeSinceLastAutoSave += Time.deltaTime;
             if (_timeSinceLastAutoSave >= _autoSaveInterval)
-            { _ = SaveSession(); _timeSinceLastAutoSave = 0f; }
+            {
+                _ = SaveSession();
+                _timeSinceLastAutoSave = 0f;
+            }
         }
+
         private void OnDestroy() => RemoveLoadedNavMesh();
 
         // ─── Inicialización ───────────────────────────────────────────────
@@ -84,96 +270,49 @@ namespace IndoorNavAR.Core
             _waypointManager  ??= FindFirstObjectByType<WaypointManager>();
             _modelLoadManager ??= FindFirstObjectByType<ModelLoadManager>();
             _navMeshGenerator ??= FindFirstObjectByType<MultiLevelNavMeshGenerator>();
-
-            if (_waypointManager  == null) Debug.LogWarning("[PersistenceManager] ⚠️ WaypointManager no encontrado");
-            if (_modelLoadManager == null) Debug.LogWarning("[PersistenceManager] ⚠️ ModelLoadManager no encontrado");
-            if (_navMeshGenerator == null) Debug.LogWarning("[PersistenceManager] ⚠️ MultiLevelNavMeshGenerator no encontrado");
-
-            Log($"📂 Ruta: {SaveFilePath}");
-            Log($"📐 NavMesh guardado: {NavMeshSerializer.HasSavedNavMesh}");
-        }
-
-        // ─── API pública ──────────────────────────────────────────────────
-
-        /// <summary>
-        /// Llamado por NavMeshAgentCoordinator.GenerateAndSave() después de un bake exitoso.
-        /// Activa el flag que permite a SaveSession() sobreescribir los archivos .bin.
-        /// </summary>
-        public void NotifyNavMeshBaked()
-        {
-            _navMeshWasBaked = true;
-            Log("✅ NavMesh marcado como BAKEADO — próximo SaveSession() guardará archivos .bin");
         }
 
         // ─── Guardar ──────────────────────────────────────────────────────
 
-        /// <summary>
-        /// Guarda la sesión (JSON de waypoints) y opcionalmente los archivos NavMesh.
-        ///
-        /// ✅ FIX v5: session.json se re-escribe DESPUÉS de guardar el NavMesh
-        ///   para que hasNavMesh refleje el estado real del .bin en disco.
-        /// </summary>
         public async Task<bool> SaveSession()
         {
+            if (_isSaving) return false;
+            _isSaving = true;
+
+            while (!_streamingAssetsCopied) await Task.Yield();
+            while (!_firstFrameReady)       await Task.Yield();
+
             try
             {
                 Log("💾 Guardando sesión...");
-
-                // ── Primera escritura del session.json (sin NavMesh aún) ──────
-                // Se hace aquí para preservar waypoints/modelo aunque el NavMesh falle.
                 SessionData data = CreateSessionData(navMeshConfirmed: false);
                 await WriteSessionJson(data);
 
                 if (_navMeshWasBaked)
                 {
-                    Log("🔥 NavMesh bakeado → guardando archivos .bin por nivel...");
                     Transform modelTf    = _modelLoadManager?.CurrentModel?.transform;
                     int       levelCount = _navMeshGenerator?.DetectedLevelCount ?? 1;
-
                     bool navMeshSaved = await NavMeshSerializer.Save(modelTf, levelCount: levelCount);
 
                     if (navMeshSaved)
                     {
-                        // ✅ FIX v5: Re-escribir session.json con hasNavMesh = true
-                        // AHORA que los .bin están en disco y HasSavedNavMesh devuelve true.
                         data.hasNavMesh = true;
                         await WriteSessionJson(data);
-
-                        LogNavMeshSaveVerification(levelCount);
-                        string msg = $"Sesión guardada: {data.waypointCount} baliza(s) + NavMesh ({levelCount} nivel(es))";
-                        PublishMessage(msg, MessageType.Success);
-                        Log($"✅ {msg}");
-                        Log("✅ session.json re-escrito con hasNavMesh: true");
+                        PublishMessage($"Sesión guardada: {data.waypointCount} baliza(s) + NavMesh", MessageType.Success);
                     }
                     else
                     {
-                        Debug.LogWarning("[PersistenceManager] ⚠️ NavMesh no guardado — ¿fue generado?");
-                        // data.hasNavMesh ya es false desde CreateSessionData → no re-escribir
-                        string msg = $"Sesión guardada: {data.waypointCount} baliza(s) (sin NavMesh)";
-                        PublishMessage(msg, MessageType.Warning);
-                        Log($"⚠️ {msg}");
+                        PublishMessage($"Sesión guardada: {data.waypointCount} baliza(s) (sin NavMesh)", MessageType.Warning);
                     }
                 }
                 else
                 {
-                    // No hubo bake → preservar .bin existentes.
-                    // Si ya había NavMesh en disco, el session.json debe decir true.
                     if (NavMeshSerializer.HasSavedNavMesh && !data.hasNavMesh)
                     {
                         data.hasNavMesh = true;
                         await WriteSessionJson(data);
-                        Log("✅ session.json actualizado: hasNavMesh: true (preservando .bin existentes)");
                     }
-
-                    string existingInfo = NavMeshSerializer.HasSavedNavMesh
-                        ? "preservando archivos .bin existentes (del último bake)"
-                        : "sin archivos .bin disponibles";
-
-                    Log($"📐 NavMesh cargado desde disco → {existingInfo}");
-                    string msg = $"Sesión guardada: {data.waypointCount} baliza(s) " +
-                                 "(NavMesh del bake preservado sin cambios)";
-                    PublishMessage(msg, MessageType.Success);
-                    Log($"✅ {msg}");
+                    PublishMessage($"Sesión guardada: {data.waypointCount} baliza(s)", MessageType.Success);
                 }
 
                 return true;
@@ -184,11 +323,9 @@ namespace IndoorNavAR.Core
                 PublishMessage("Error al guardar sesión", MessageType.Error);
                 return false;
             }
+            finally { _isSaving = false; }
         }
 
-        /// <summary>
-        /// Escribe el session.json de forma async. Separado para poder llamarlo dos veces.
-        /// </summary>
         private async Task WriteSessionJson(SessionData data)
         {
             string json = JsonUtility.ToJson(data, true);
@@ -198,10 +335,6 @@ namespace IndoorNavAR.Core
                 await Task.Run(() => File.WriteAllText(SaveFilePath, json));
         }
 
-        /// <summary>
-        /// ✅ FIX v5: Parámetro navMeshConfirmed para separar el estado "pendiente" del "confirmado".
-        /// HasSavedNavMesh puede devolver false si los .bin aún no existen (primera sesión).
-        /// </summary>
         private SessionData CreateSessionData(bool navMeshConfirmed = false)
         {
             var data = new SessionData
@@ -237,108 +370,171 @@ namespace IndoorNavAR.Core
 
         // ─── Cargar ───────────────────────────────────────────────────────
 
-        /// <summary>
-        /// Carga sesión con flujo garantizado:
-        ///   Paso 1 → RestoreModelTransform
-        ///   Paso 2 → Task.Yield x2 + Delay(100ms)
-        ///   Paso 3 → LoadNavMeshFromFile  ← ignora data.hasNavMesh, usa HasSavedNavMesh directamente
-        ///   Paso 4 → RecreateStairGeometryAsync  ← ✅ FIX v6: recrea colliders de escalera
-        ///   Paso 5 → NotifyNavMeshReady   ← desbloquea teleport de StartPoints
-        ///   Paso 6 → LoadWaypoints
-        /// </summary>
         public async Task<bool> LoadSession()
         {
+            if (_isLoading)
+            {
+                Log("⏳ LoadSession ya en progreso — esperando...");
+                return await _loadingTcs.Task;
+            }
+
+            _isLoading  = true;
+            _loadingTcs = new System.Threading.Tasks.TaskCompletionSource<bool>();
+
+            while (!_streamingAssetsCopied) await Task.Yield();
+            while (!_firstFrameReady)       await Task.Yield();
+
+            bool sessionResult = false;
             try
             {
                 Log("📂 Cargando sesión...");
 
-                if (!HasSavedSession()) { Log("⚠️ No hay sesión guardada"); return false; }
+                if (!HasSavedSession())
+                {
+                    Log("⚠️ No hay sesión guardada");
+                    // ✅ v14.3 FIX: marcar como completado aunque no haya sesión.
+                    // Esto permite que IsSessionLoadCompleted=true y el bridge avance.
+                    _autoLoadAttempted = true;
+                    _autoLoadCompleted = true;
+                    _autoLoadResult    = false;
+                    // Sin sesión → bridge puede pasar a Ready ahora mismo
+                    FlutterUnityBridge.NotifySceneReady("LoadSession: sin sesión guardada");
+                    return false;
+                }
 
                 string json = _usePlayerPrefs
                     ? await Task.Run(() => PlayerPrefs.GetString("SessionData", ""))
                     : await Task.Run(() => File.ReadAllText(SaveFilePath));
 
-                if (string.IsNullOrEmpty(json)) { Debug.LogWarning("[PersistenceManager] Archivo vacío"); return false; }
+                if (string.IsNullOrEmpty(json)) return false;
 
                 SessionData data = JsonUtility.FromJson<SessionData>(json);
-                if (data == null) { Debug.LogError("[PersistenceManager] Error deserializando"); return false; }
+                if (data == null) return false;
 
-                // ✅ FIX v5: Loguear si hay discrepancia entre session.json y la realidad
+                if (data.waypoints != null && data.waypointCount != data.waypoints.Count)
+                    data.waypointCount = data.waypoints.Count;
+
                 bool navMeshActuallyExists = NavMeshSerializer.HasSavedNavMesh;
                 if (data.hasNavMesh != navMeshActuallyExists)
                 {
-                    Debug.LogWarning($"[PersistenceManager] ⚠️ Discrepancia: session.json dice hasNavMesh={data.hasNavMesh} " +
-                                     $"pero HasSavedNavMesh={navMeshActuallyExists}. " +
-                                     $"Usando el estado real del disco.");
                     data.hasNavMesh = navMeshActuallyExists;
                     await WriteSessionJson(data);
-                    Log("✅ session.json auto-corregido con hasNavMesh real");
                 }
 
                 await LoadSessionData(data);
 
-                string resultMsg = $"Sesión cargada: {data.waypointCount} baliza(s)" +
-                                   (_navMeshInstanceActive ? " + NavMesh ✓" : " (sin NavMesh)");
-                PublishMessage(resultMsg, MessageType.Success);
-                Log($"✅ {resultMsg}");
+                _sessionWasRestored = true;
+                sessionResult = true;
                 return true;
             }
             catch (Exception ex)
             {
-                Debug.LogError($"[PersistenceManager] ❌ Error cargando: {ex.Message}");
-                PublishMessage("Error al cargar sesión", MessageType.Error);
+                Debug.LogError($"[PersistenceManager] ❌ Error cargando: {ex.Message}\n{ex.StackTrace}");
+                _sessionWasRestored = false;
+                sessionResult       = false;
                 return false;
+            }
+            finally
+            {
+                // ✅ v14.3 FIX: marcar SIEMPRE como completado al salir de LoadSession().
+                // Independientemente de si tuvo éxito o no, la "carga" terminó.
+                // Esto desbloquea IsSessionLoadCompleted para FlutterUnityBridge
+                // y SceneReadyNotifier, que hacen polling sobre esta propiedad.
+                _autoLoadAttempted = true;
+                _autoLoadCompleted = true;
+                _autoLoadResult    = sessionResult;
+
+                _loadingTcs?.TrySetResult(sessionResult);
+                _loadingTcs = null;
+                _isLoading  = false;
+
+                Log($"[v14.3] LoadSession finalizado — resultado={sessionResult} " +
+                    $"IsSessionLoadCompleted={IsSessionLoadCompleted}");
             }
         }
 
         private async Task LoadSessionData(SessionData data)
         {
-            // ── PASO 1: Restaurar modelo ──────────────────────────────────────
+            await Task.Yield();
+            await Task.Yield();
+            await Task.Delay(200);
+
+            _savedModelPosition = data.modelPosition;
+
+            // ✅ v14.2: BeginHeavyLoad antes de RestoreModelTransform.
+            ARPerformanceManager.Instance?.BeginHeavyLoad("LoadSessionData — RestoreModel inicio");
+
             if (data.hasModel && _modelLoadManager != null)
             {
                 Log($"📦 Restaurando modelo: {data.modelName}");
-                bool modelOk = await _modelLoadManager.RestoreModelTransform(
+
+                var restoreTask = _modelLoadManager.RestoreModelTransform(
                     data.modelPosition, data.modelRotation, data.modelScale);
 
-                if (!modelOk)
-                    Debug.LogWarning("[PersistenceManager] ⚠️ No se pudo restaurar modelo");
-
+#if UNITY_EDITOR
+                bool modelOk = await restoreTask;
+                if (!modelOk) Debug.LogWarning("[PersistenceManager] ⚠️ RestoreModelTransform falló.");
+#else
+                var timeoutTask = Task.Delay(11000);
+                var winner      = await Task.WhenAny(restoreTask, timeoutTask);
+                if (winner == timeoutTask)
+                    Debug.LogError("[PersistenceManager] ❌ TIMEOUT RestoreModelTransform.");
+                else
+                {
+                    bool modelOk = await restoreTask;
+                    if (!modelOk) Debug.LogWarning("[PersistenceManager] ⚠️ RestoreModelTransform falló.");
+                }
+#endif
                 await Task.Yield();
                 await Task.Yield();
-                await Task.Delay(100);
+                await Task.Yield();
+                await Task.Delay(500);
             }
 
-            // ── PASO 2: NavMesh desde binario ─────────────────────────────────
-            // ✅ FIX v5: Intentar cargar NavMesh si EXISTE en disco,
-            // independientemente de lo que diga data.hasNavMesh.
-            // ✅ FIX v6: RecreateStairGeometryAsync se llama dentro de LoadNavMeshFromFile()
+            Log("🔧 Llamando LoadNavMeshFromFile...");
             await LoadNavMeshFromFile();
 
-            // ── PASO 3: Waypoints ─────────────────────────────────────────────
-            if (_waypointManager != null && data.waypoints?.Count > 0)
+            Log($"🔧 Esperando {_postNavMeshDelayMs}ms post-NavMesh...");
+            await Task.Delay(_postNavMeshDelayMs);
+
+            if (_waypointManager != null)
             {
-                Log($"📍 Cargando {data.waypoints.Count} waypoints");
-                _waypointManager.LoadWaypoints(data.waypoints);
+                Transform modelRoot = _modelLoadManager?.CurrentModel?.transform?.parent
+                                   ?? _modelLoadManager?.CurrentModel?.transform;
+                _waypointManager.ReparentToModel(modelRoot);
             }
+
+            if (_waypointManager != null && data.waypoints != null && data.waypoints.Count > 0)
+            {
+                var validWaypoints = data.waypoints
+                    .Where(w => w != null
+                                && !string.IsNullOrEmpty(w.id)
+                                && !string.IsNullOrEmpty(w.name)
+                                && !float.IsNaN(w.position.x)
+                                && !float.IsNaN(w.position.y)
+                                && !float.IsNaN(w.position.z))
+                    .ToList();
+
+                _waypointManager.LoadWaypoints(validWaypoints);
+                _pendingWaypointData = validWaypoints;
+                Log($"[v14.3] {validWaypoints.Count} waypoints provisionales cargados.");
+            }
+            else
+            {
+                _alignmentCompleted = false;
+            }
+
+            // ✅ v14.2: EndHeavyLoad después de la carga de datos.
+            ARPerformanceManager.Instance?.EndHeavyLoad("LoadSessionData completado — esperando alineación VIO");
         }
 
         // ─── NavMesh ──────────────────────────────────────────────────────
 
-        /// <summary>
-        /// Carga NavMesh desde disco y recrea la geometría física de escaleras.
-        ///
-        /// ✅ FIX v6: Llama RecreateStairGeometryAsync() ANTES de NotifyNavMeshReady()
-        ///   para que los MeshCollider de rampa existan cuando el agente se teleporte.
-        ///
-        /// ✅ FIX v4: Usa NavMeshSerializer.LoadMulti() para obtener TODAS las
-        ///   instancias (una por nivel). Las almacena en _loadedInstances.
-        ///
-        /// ✅ FIX v3: Desactiva _navMeshWasBaked al cargar desde disco.
-        ///
-        /// ✅ FIX v5: No depende de data.hasNavMesh — usa HasSavedNavMesh directamente.
-        /// </summary>
         public async Task<bool> LoadNavMeshFromFile()
         {
+            while (!_streamingAssetsCopied) await Task.Yield();
+            while (!_firstFrameReady)       await Task.Yield();
+
             if (!NavMeshSerializer.HasSavedNavMesh)
             {
                 Log("⚠️ No hay NavMesh guardado en disco.");
@@ -346,29 +542,26 @@ namespace IndoorNavAR.Core
             }
 
             RemoveLoadedNavMesh();
-
             Transform modelTf = _modelLoadManager?.CurrentModel?.transform;
 
-            // ✅ FIX v4: LoadMulti devuelve todas las instancias
+            for (int i = 0; i < 3; i++) await Task.Yield();
+
+            // ✅ v14.2: BeginHeavyLoad para operación de restauración de NavMesh.
+            ARPerformanceManager.Instance?.BeginHeavyLoad("LoadNavMeshFromFile — BuildNavMeshData");
+
             var (success, firstInstance, allInstances) =
                 await NavMeshSerializer.LoadMulti(modelTf);
+
+            ARPerformanceManager.Instance?.EndHeavyLoad("LoadNavMeshFromFile completado");
 
             if (success)
             {
                 _loadedInstances       = allInstances;
                 _navMeshInstanceActive = true;
+                _navMeshWasBaked       = false;
 
-                // ✅ FIX v3: desactivar flag para no sobreescribir .bin con datos re-voxelizados
-                _navMeshWasBaked = false;
-                Log($"📐 NavMesh restaurado: {allInstances.Count} instancia(s). " +
-                    "_navMeshWasBaked = false (SaveSession preservará los .bin del bake original)");
-
-                // ✅ FIX v6: Recrear geometría física de escaleras ANTES del teleport del agente.
-                // Sin esto, los MeshCollider de las rampas no existen → el agente no puede
-                // atravesar la escalera aunque el NavMesh tenga la geometría correcta en el .bin.
+                await Task.Delay(_postNavMeshDelayMs);
                 await RecreateStairGeometryAsync();
-
-                NavigationStartPointManager.NotifyNavMeshReady();
             }
             else
             {
@@ -378,96 +571,69 @@ namespace IndoorNavAR.Core
             return success;
         }
 
-        /// <summary>
-        /// ✅ FIX v6: Recrea la geometría física de todas las escaleras al cargar sesión.
-        ///
-        /// PROBLEMA: StairWithLandingHelper tiene _createOnStart = false para evitar
-        ///   que se regeneren durante el bake (el baker ya los recolecta manualmente).
-        ///   Al restaurar sesión, los GameObjects de rampa (MeshCollider, MeshFilter)
-        ///   no existen → el agente no puede cruzar la escalera físicamente.
-        ///
-        /// SOLUCIÓN: Llamar CreateStairSystem() en cada StairWithLandingHelper.
-        ///   El NavMesh ya fue inyectado desde el .bin (geometría correcta).
-        ///   Solo necesitamos los colliders físicos para que el agente pueda moverse.
-        ///
-        /// ORDEN CRÍTICO:
-        ///   1) Task.Yield x2 → NavigationStartPoints ya registrados en Manager
-        ///      → SnapYToFloorLevel() calcula Y correctamente
-        ///   2) CreateStairSystem() → crea MeshCollider, MeshFilter, NavMeshLink
-        ///   3) Task.Delay(150ms) → Unity procesa colliders antes del teleport del agente
-        /// </summary>
         private async Task RecreateStairGeometryAsync()
         {
             var stairHelpers = FindObjectsByType<StairWithLandingHelper>(FindObjectsSortMode.None);
 
             if (stairHelpers.Length == 0)
             {
-                Log("ℹ️ No hay StairWithLandingHelper en escena — sin escaleras que recrear.");
+                NavigationStartPointManager.ConfirmModelPositioned();
+                NavigationStartPointManager.NotifyNavMeshReadyAfterSessionRestore();
                 return;
             }
 
-            Log($"🪜 Recreando geometría física de {stairHelpers.Length} escalera(s) (sesión restaurada)...");
+            Log($"🪜 [v14.3] Recreando geometría de {stairHelpers.Length} escalera(s)...");
 
-            // Yield para asegurar que NavigationStartPointManager tiene todos los StartPoints
-            // registrados antes de que SnapYToFloorLevel() intente leer su FloorHeight.
-            // Sin esto, el Manager puede devolver false y las rampas usan la Y del inspector.
-            await Task.Yield();
-            await Task.Yield();
+            ARPerformanceManager.Instance?.BeginHeavyLoad($"RecreateStairs — {stairHelpers.Length} helper(s)");
 
-            int recreated = 0;
-            int failed    = 0;
+            for (int i = 0; i < _stairRecreateDelayFrames; i++)
+                await Task.Yield();
+
+            int recreated = 0, failed = 0;
 
             foreach (var helper in stairHelpers)
             {
                 if (helper == null) continue;
-
                 try
                 {
                     helper.CreateStairSystem();
                     recreated++;
-                    Log($"  ✅ Escalera '{helper.name}' recreada.");
+
+                    await Task.Yield();
+                    await Task.Yield();
+
+                    if (_stairRecreateInterFrameMs > 0)
+                        await Task.Delay(_stairRecreateInterFrameMs);
                 }
                 catch (Exception ex)
                 {
                     failed++;
-                    Debug.LogWarning($"[PersistenceManager] ⚠️ Error recreando escalera '{helper.name}': " +
-                                     $"{ex.Message}");
+                    Debug.LogWarning($"[PersistenceManager] ⚠️ Error escalera '{helper.name}': {ex.Message}");
                 }
             }
 
             Log($"🪜 Escaleras: {recreated} recreadas, {failed} con error.");
 
             if (recreated > 0)
-            {
-                // Dar tiempo a Unity para procesar los nuevos colliders en el árbol de física
-                // antes de que NotifyNavMeshReady() desencadene el teleport del agente.
-                // Sin este delay, el agente puede caer o atravesar la rampa en el primer frame.
-                await Task.Delay(150);
-                Log("🪜 Colliders de escalera listos para el agente.");
-            }
+                await Task.Delay(_postStairsDelayMs);
+
+            ARPerformanceManager.Instance?.EndHeavyLoad("RecreateStairs completado");
+
+            NavigationStartPointManager.ConfirmModelPositioned();
+            NavigationStartPointManager.NotifyNavMeshReadyAfterSessionRestore();
         }
 
-        /// <summary>
-        /// Elimina TODAS las instancias NavMesh cargadas desde disco.
-        /// ✅ FIX v4: itera sobre _loadedInstances en lugar de una sola instancia.
-        /// </summary>
         public void RemoveLoadedNavMesh()
         {
             if (_navMeshInstanceActive)
             {
                 int removed = 0;
                 foreach (var inst in _loadedInstances)
-                {
-                    if (inst.valid)
-                    {
-                        NavMesh.RemoveNavMeshData(inst);
-                        removed++;
-                    }
-                }
+                    if (inst.valid) { NavMesh.RemoveNavMeshData(inst); removed++; }
                 _loadedInstances.Clear();
                 _navMeshInstanceActive = false;
                 _navMeshWasBaked       = false;
-                Log($"🗑️ {removed} instancia(s) NavMesh runtime eliminadas.");
+                Log($"🗑️ {removed} instancia(s) NavMesh eliminadas.");
             }
         }
 
@@ -478,17 +644,18 @@ namespace IndoorNavAR.Core
             if (_usePlayerPrefs) return PlayerPrefs.HasKey("SessionData");
 
             if (string.IsNullOrEmpty(_saveFilePath))
-            {
                 _saveFilePath = Path.Combine(Application.persistentDataPath, _saveFileName);
-                Debug.LogWarning($"[PersistenceManager] _saveFilePath reconstruido: {_saveFilePath}");
-            }
 
-            bool exists = File.Exists(_saveFilePath);
-            Debug.Log($"[PersistenceManager] HasSavedSession → {_saveFilePath} | existe: {exists}");
-            return exists;
+            return File.Exists(_saveFilePath);
         }
 
         public bool HasSavedNavMesh => NavMeshSerializer.HasSavedNavMesh;
+
+        public void NotifyNavMeshBaked()
+        {
+            _navMeshWasBaked = true;
+            Log("✅ NavMesh marcado como BAKEADO.");
+        }
 
         public void ClearSavedData()
         {
@@ -496,11 +663,9 @@ namespace IndoorNavAR.Core
             {
                 if (_usePlayerPrefs) { PlayerPrefs.DeleteKey("SessionData"); PlayerPrefs.Save(); }
                 else if (File.Exists(SaveFilePath)) File.Delete(SaveFilePath);
-
                 NavMeshSerializer.DeleteSaved();
                 RemoveLoadedNavMesh();
                 PublishMessage("Datos eliminados", MessageType.Info);
-                Log("🗑️ Todos los datos eliminados.");
             }
             catch (Exception ex) { Debug.LogError($"[PersistenceManager] ❌ Error limpiando: {ex.Message}"); }
         }
@@ -515,10 +680,10 @@ namespace IndoorNavAR.Core
                     : File.ReadAllText(SaveFilePath);
                 var d = JsonUtility.FromJson<SessionData>(json);
                 return $"Guardado: {d.timestamp}\nBalizas: {d.waypointCount}\n" +
-                       $"Modelo: {(d.hasModel ? d.modelName : "Ninguno")}\n" +
                        $"NavMesh: {(d.hasNavMesh ? "✓" : "no")}\n" +
-                       $"NavMesh bakeado en memoria: {_navMeshWasBaked}\n" +
-                       $"Instancias activas: {_loadedInstances.Count}\n" +
+                       $"SessionWasRestored: {_sessionWasRestored}\n" +
+                       $"IsSessionLoadCompleted: {IsSessionLoadCompleted}\n" +
+                       $"ARPerfMgr: {(ARPerformanceManager.Instance != null ? "OK" : "NULL")}\n" +
                        NavMeshSerializer.GetSavedInfo();
             }
             catch { return "Error leyendo guardado"; }
@@ -526,15 +691,7 @@ namespace IndoorNavAR.Core
 
         public SessionStats GetSessionStats()
         {
-            var stats = new SessionStats
-            {
-                hasSession    = HasSavedSession(),
-                waypointCount = 0,
-                hasModel      = false,
-                modelName     = "None",
-                timestamp     = "N/A",
-                hasNavMesh    = HasSavedNavMesh
-            };
+            var stats = new SessionStats { hasSession = HasSavedSession(), hasNavMesh = HasSavedNavMesh };
             if (!stats.hasSession) return stats;
             try
             {
@@ -555,38 +712,28 @@ namespace IndoorNavAR.Core
             return stats;
         }
 
-        // ─── Diagnóstico ──────────────────────────────────────────────────
+        // ─── StreamingAssets ─────────────────────────────────────────────
 
-        private void LogNavMeshSaveVerification(int expectedLevelCount)
+        private async Task CopyStreamingAssetsToPersistent()
         {
-            string info = NavMeshSerializer.GetSavedInfo();
-            Log($"📐 Verificación NavMesh guardado:\n{info}");
+            string[] files = { "navigation_session.json", "navmesh_header.json", "navmesh_unified.bin" };
 
-            if (expectedLevelCount > 1)
+            foreach (string file in files)
             {
-                NavMeshTriangulation tri = NavMesh.CalculateTriangulation();
-                if (tri.vertices.Length == 0)
-                {
-                    Debug.LogWarning("[PersistenceManager] ⚠️ CalculateTriangulation vacía durante verificación.");
-                    return;
-                }
+                string destPath = Path.Combine(Application.persistentDataPath, file);
+                if (File.Exists(destPath)) continue;
 
-                float minY = float.MaxValue, maxY = float.MinValue;
-                foreach (var v in tri.vertices)
-                {
-                    if (v.y < minY) minY = v.y;
-                    if (v.y > maxY) maxY = v.y;
-                }
+                string srcPath = Path.Combine(Application.streamingAssetsPath, file);
 
-                float yRange = maxY - minY;
-                if (yRange < 1.0f)
-                    Debug.LogWarning(
-                        $"[PersistenceManager] ⚠️ NavMesh guardado puede ser incompleto: " +
-                        $"rango Y={yRange:F2}m para {expectedLevelCount} nivel(es). " +
-                        $"Se esperan >2m. Regenera y guarda de nuevo.");
-                else
-                    Log($"✅ NavMesh verificado: Y=[{minY:F2}, {maxY:F2}] rango={yRange:F2}m — " +
-                        $"cubre {expectedLevelCount} nivel(es).");
+#if UNITY_ANDROID && !UNITY_EDITOR
+                using var req = UnityEngine.Networking.UnityWebRequest.Get(srcPath);
+                await req.SendWebRequest();
+                if (req.result == UnityEngine.Networking.UnityWebRequest.Result.Success)
+                    await Task.Run(() => File.WriteAllBytes(destPath, req.downloadHandler.data));
+#else
+                if (File.Exists(srcPath))
+                    await Task.Run(() => File.Copy(srcPath, destPath));
+#endif
             }
         }
 
@@ -600,55 +747,27 @@ namespace IndoorNavAR.Core
 
         // ─── ContextMenu ──────────────────────────────────────────────────
 
-        [ContextMenu("💾 Save Session")]       private void DbgSave()    => _ = SaveSession();
-        [ContextMenu("📂 Load Session")]       private void DbgLoad()    => _ = LoadSession();
-        [ContextMenu("🗺️ Load NavMesh Only")]  private void DbgNavMesh() => _ = LoadNavMeshFromFile();
-        [ContextMenu("🗑️ Clear All Data")]     private void DbgClear()   => ClearSavedData();
-        [ContextMenu("ℹ️ Show Info")]           private void DbgInfo()    => Debug.Log(GetLastSaveInfo());
-        [ContextMenu("📐 NavMesh Info")]        private void DbgNavInfo() => Debug.Log(NavMeshSerializer.GetSavedInfo());
-        [ContextMenu("🔍 Verify NavMesh Save")] private void DbgVerify()  => LogNavMeshSaveVerification(_navMeshGenerator?.DetectedLevelCount ?? 1);
-        [ContextMenu("🔥 Force Baked Flag")]   private void DbgBakedFlag() { NotifyNavMeshBaked(); Log("🔥 _navMeshWasBaked forzado a true (usa solo para testing)"); }
-        [ContextMenu("📊 Instance Count")]     private void DbgInstances() => Debug.Log($"[PersistenceManager] Instancias activas: {_loadedInstances.Count}");
-
-        /// <summary>
-        /// ✅ FIX v6: Recrea escaleras manualmente desde el ContextMenu (útil para debugging).
-        /// </summary>
-        [ContextMenu("🪜 Recrear Escaleras Manualmente")]
-        private void DbgRecreateStairs() => _ = RecreateStairGeometryAsync();
-
-        /// <summary>
-        /// ✅ FIX v5: Auto-repara el session.json si hasNavMesh no coincide con la realidad.
-        /// </summary>
-        [ContextMenu("🔧 Reparar hasNavMesh en session.json")]
-        private void DbgRepairSessionJson()
-        {
-            if (!HasSavedSession()) { Log("No hay session.json para reparar"); return; }
-            _ = RepairSessionJson();
-        }
-
-        private async Task RepairSessionJson()
-        {
-            try
-            {
-                string json = _usePlayerPrefs
-                    ? PlayerPrefs.GetString("SessionData", "")
-                    : await Task.Run(() => File.ReadAllText(SaveFilePath));
-
-                var data = JsonUtility.FromJson<SessionData>(json);
-                if (data == null) { Log("❌ No se pudo leer el session.json"); return; }
-
-                bool realState = NavMeshSerializer.HasSavedNavMesh;
-                bool wasBroken = data.hasNavMesh != realState;
-
-                data.hasNavMesh = realState;
-                await WriteSessionJson(data);
-
-                Log(wasBroken
-                    ? $"✅ session.json reparado: hasNavMesh corregido a {realState}"
-                    : $"ℹ️ session.json ya estaba correcto: hasNavMesh = {realState}");
-            }
-            catch (Exception ex) { Debug.LogError($"[PersistenceManager] Error reparando: {ex.Message}"); }
-        }
+        [ContextMenu("💾 Save Session")]        private void DbgSave()    => _ = SaveSession();
+        [ContextMenu("📂 Load Session")]        private void DbgLoad()    => _ = LoadSession();
+        [ContextMenu("🗑️ Clear All Data")]      private void DbgClear()   => ClearSavedData();
+        [ContextMenu("ℹ️ Show Info")]            private void DbgInfo()    => Debug.Log(GetLastSaveInfo());
+        [ContextMenu("✅ Ver flags")]
+        private void DbgFlags() => Debug.Log(
+            $"[PersistenceManager] v14.3 flags:\n" +
+            $"  streaming={_streamingAssetsCopied}\n" +
+            $"  firstFrame={_firstFrameReady}\n" +
+            $"  autoLoadAttempted={_autoLoadAttempted}\n" +
+            $"  autoLoadCompleted={_autoLoadCompleted}\n" +
+            $"  autoLoadResult={_autoLoadResult}\n" +
+            $"  IsSessionLoadCompleted={IsSessionLoadCompleted}\n" +
+            $"  sessionWasRestored={_sessionWasRestored}\n" +
+            $"  alignmentCompleted={_alignmentCompleted}\n" +
+            $"  pendingWaypoints={_pendingWaypointData?.Count ?? 0}\n" +
+            $"  isLoading={_isLoading}\n" +
+            $"  isSaving={_isSaving}\n" +
+            $"  ARPerfMgr={ARPerformanceManager.Instance != null}\n" +
+            $"  Application.targetFPS={Application.targetFrameRate}\n" +
+            $"  ARSession.state={ARSession.state}");
     }
 
     // ─── Data Structures ──────────────────────────────────────────────────

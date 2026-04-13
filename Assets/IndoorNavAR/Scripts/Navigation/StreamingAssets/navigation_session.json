@@ -1,0 +1,152 @@
+{
+    "version": "2.0",
+    "timestamp": "2026-02-28 21:14:24",
+    "waypointCount": 5,
+    "waypoints": [
+        {
+            "id": "d0454ebd-f2c3-407b-8ed7-f2ec8ab83491",
+            "name": "Recepcion",
+            "type": 0,
+            "position": {
+                "x": -2.5899999141693117,
+                "y": 0.5,
+                "z": 0.03999999910593033
+            },
+            "rotation": {
+                "x": 0.0,
+                "y": 0.0,
+                "z": 0.0,
+                "w": 1.0
+            },
+            "color": {
+                "r": 0.0,
+                "g": 1.0,
+                "b": 1.0,
+                "a": 1.0
+            },
+            "height": 0.5,
+            "radius": 0.15000000596046449,
+            "description": "",
+            "isNavigable": true
+        },
+        {
+            "id": "c172e8dc-0dc9-42d0-9b16-c189d9af9fc8",
+            "name": "Estanterias",
+            "type": 0,
+            "position": {
+                "x": -7.909999847412109,
+                "y": 0.5,
+                "z": -1.2000000476837159
+            },
+            "rotation": {
+                "x": 0.0,
+                "y": 0.0,
+                "z": 0.0,
+                "w": 1.0
+            },
+            "color": {
+                "r": 0.0,
+                "g": 1.0,
+                "b": 1.0,
+                "a": 1.0
+            },
+            "height": 0.5,
+            "radius": 0.15000000596046449,
+            "description": "",
+            "isNavigable": true
+        },
+        {
+            "id": "262a86c6-6d68-4c95-a2ae-91439fdfba77",
+            "name": "Zona descanso",
+            "type": 0,
+            "position": {
+                "x": -5.960000038146973,
+                "y": 0.5,
+                "z": 4.929999828338623
+            },
+            "rotation": {
+                "x": 0.0,
+                "y": 0.0,
+                "z": 0.0,
+                "w": 1.0
+            },
+            "color": {
+                "r": 0.0,
+                "g": 1.0,
+                "b": 1.0,
+                "a": 1.0
+            },
+            "height": 0.5,
+            "radius": 0.15000000596046449,
+            "description": "",
+            "isNavigable": true
+        },
+        {
+            "id": "e8f398b7-69b8-4fc4-84f4-18eb405e4565",
+            "name": "recepcion 2",
+            "type": 0,
+            "position": {
+                "x": -2.2300000190734865,
+                "y": 3.809999942779541,
+                "z": -2.609999895095825
+            },
+            "rotation": {
+                "x": 0.0,
+                "y": 0.0,
+                "z": 0.0,
+                "w": 1.0
+            },
+            "color": {
+                "r": 0.0,
+                "g": 1.0,
+                "b": 1.0,
+                "a": 1.0
+            },
+            "height": 0.5,
+            "radius": 0.15000000596046449,
+            "description": "",
+            "isNavigable": true
+        },
+        {
+            "id": "ee0bcdae-18ba-41b4-8570-d490ef198e4b",
+            "name": "Puffs",
+            "type": 0,
+            "position": {
+                "x": 1.3300000429153443,
+                "y": 3.6500000953674318,
+                "z": 5.389999866485596
+            },
+            "rotation": {
+                "x": 0.0,
+                "y": 0.0,
+                "z": 0.0,
+                "w": 1.0
+            },
+            "color": {
+                "r": 0.0,
+                "g": 1.0,
+                "b": 1.0,
+                "a": 1.0
+            },
+            "height": 0.5,
+            "radius": 0.15000000596046449,
+            "description": "",
+            "isNavigable": true
+        }
+    ],
+    "hasModel": true,
+    "modelName": "Biblioteca_F_V2",
+    "modelPosition": {
+        "x": 0.0,
+        "y": 0.0,
+        "z": 0.0
+    },
+    "modelRotation": {
+        "x": 0.0,
+        "y": 0.0,
+        "z": 0.0,
+        "w": 1.0
+    },
+    "modelScale": 1.0,
+    "hasNavMesh": true
+}

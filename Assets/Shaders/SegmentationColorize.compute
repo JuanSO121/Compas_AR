@@ -1,0 +1,53 @@
+// File: SegmentationColorize.compute
+// Compute Shader para colorizar la máscara de segmentación directamente en GPU.
+//
+// SETUP EN UNITY:
+//   1. Crear archivo: Assets/Shaders/SegmentationColorize.compute
+//   2. Asignarlo al campo "Colorize Shader" de SegmentationOverlayRenderer en el Inspector.
+//   3. Si el dispositivo no soporta compute shaders (SystemInfo.supportsComputeShaders == false),
+//      el renderer usa automáticamente el fallback CPU.
+//
+// NOTAS DE RENDIMIENTO:
+//   - numthreads(16,16,1) = 256 threads por grupo.
+//   - Para 256×256: dispatch(16,16,1) → 256 grupos = 65536 threads en total.
+//   - Para 312×312: dispatch(20,20,1) → 400 grupos (CeilToInt(312/16)=20).
+//   - La escritura en RWTexture2D<float4> es directo, sin transferencia CPU→GPU.
+
+#pragma kernel ColorizeSegmentation
+
+// Buffer de entrada: índice de clase por píxel (0=Background,1=Floor,2=Obstacle,3=Wall)
+StructuredBuffer<int> MaskData;
+
+// Textura de salida: RGBA float4 [0..1]
+RWTexture2D<float4> OutputTex;
+
+// Parámetros
+float Alpha;      // Multiplicador de transparencia global (0..1)
+int   MaskWidth;  // Ancho de la máscara en píxeles (ej: 256 o 312)
+
+// ── Colores por clase ─────────────────────────────────────────────────────────
+// Deben coincidir con SegmentationOverlayRenderer.CLASS_COLORS
+// Alpha ya está incorporado como cuarto componente antes de multiplicar por Alpha
+static const float4 BASE_COLORS[4] = {
+    float4(0.000, 0.000, 0.000, 0.000),   // 0 Background — transparente
+    float4(0.000, 0.784, 0.000, 0.314),   // 1 Floor       — verde     (a=80/255)
+    float4(1.000, 0.196, 0.196, 0.706),   // 2 Obstacle    — rojo      (a=180/255)
+    float4(0.314, 0.314, 0.863, 0.392),   // 3 Wall        — azul      (a=100/255)
+};
+
+[numthreads(16, 16, 1)]
+void ColorizeSegmentation(uint3 id : SV_DispatchThreadID)
+{
+    // Índice lineal en el buffer: fila * ancho + columna
+    int idx = (int)id.y * MaskWidth + (int)id.x;
+
+    // Leer clase, clampear a [0,3] por seguridad
+    int cls = clamp(MaskData[idx], 0, 3);
+
+    // Obtener color base y aplicar alpha global
+    float4 col = BASE_COLORS[cls];
+    col.a *= Alpha;
+
+    // Escribir en la RenderTexture
+    OutputTex[id.xy] = col;
+}

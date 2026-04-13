@@ -1,34 +1,23 @@
 // File: NavigationStartPoint.cs
-// ✅ FIX v3 — SamplePosition filtrado por desviación vertical máxima.
+// ✅ FIX v8.1 — Corrección de bug de interpolación de string en
+//              NotifyNavMeshReadyAfterSessionRestore() (FloorHeight no se mostraba).
 //
-//  PROBLEMA CORREGIDO:
-//    TeleportAgent() usaba NavMesh.SamplePosition con radio 3D esférico de 5m.
-//    En un edificio de 2 pisos separados ~3m, ese radio captura ambos pisos.
-//    SamplePosition devuelve el punto NavMesh MÁS CERCANO en distancia 3D,
-//    lo que puede ser el piso equivocado si el StartPoint no está exactamente
-//    a la altura del NavMesh de su nivel.
+// ============================================================================
+//  CAMBIOS → v8.1
+// ============================================================================
 //
-//    Ejemplo: StartPoint Level1 colocado en Y=3.0, NavMesh Level1 en Y=3.12,
-//    NavMesh Level0 en Y=0.04. Radio 5m incluye ambos. En distancia 3D el
-//    Level1 gana (0.12m vs 2.96m), pero si el StartPoint está en Y=1.5
-//    (mitad del edificio) el Level0 gana incorrectamente (1.46m vs 1.62m).
+//  BUG: En NotifyNavMeshReadyAfterSessionRestore(), el log que muestra
+//  FloorHeight usaba un string literal en lugar de un string interpolado:
 //
-//  SOLUCIÓN:
-//    SamplePositionOnCorrectFloor() prueba radios crecientes en XZ pero
-//    valida que el hit esté dentro de _maxVerticalDeviation en Y.
-//    Si el SamplePosition devuelve un punto del piso equivocado (|hitY - myY| > umbral),
-//    se descarta y se amplía el radio hasta encontrar uno del piso correcto.
-//    Esto garantiza que cada StartPoint siempre teleporta al NavMesh de SU piso,
-//    independientemente de cuán exacto sea su posicionamiento vertical manual.
+//    ANTES (bug):
+//      "teleport omitido. Este StartPoint define FloorHeight={FloorHeight:F3}m ..."
+//      → Imprime literalmente "{FloorHeight:F3}m" en el log.
 //
-//  DISEÑO (por qué los StartPoints son hijos del Empty del modelo):
-//    El Empty raíz del modelo se posiciona en AR donde la cámara detecta el suelo.
-//    Los StartPoints son hijos de ese Empty, así su world Y = posición AR + offset local.
-//    Cuando el modelo se reposiciona (RestoreModelTransform), los StartPoints heredan
-//    el transform y su world Y sigue siendo correcto sin ningún cálculo adicional.
-//    El NavMesh serializado también se remapea a las mismas coordenadas world.
-//    Por eso NO se usa una altura global predefinida: en AR móvil esa altura
-//    cambia cada vez que se carga la sesión según dónde detecte el suelo la cámara.
+//    DESPUÉS (fix):
+//      $"teleport omitido. Este StartPoint define FloorHeight={FloorHeight:F3}m ..."
+//      → Imprime el valor real, ej: "FloorHeight=3.480m"
+//
+//  Todos los demás comportamientos se conservan íntegramente.
 
 using System.Collections;
 using UnityEngine;
@@ -38,58 +27,81 @@ namespace IndoorNavAR.Navigation
 {
     public class NavigationStartPoint : MonoBehaviour
     {
-        [Header("🎯 Nivel y Altura")]
+        [Header("─── Nivel y Altura ─────────────────────────────────────────")]
         [SerializeField] private int  _level                = 0;
         [SerializeField] private bool _useThisAsFloorHeight = true;
 
-        [Header("⚙️ Teleport")]
+        [Header("─── Teleport ────────────────────────────────────────────────")]
         [SerializeField] private bool  _waitForNavMesh      = true;
         [SerializeField] private float _initialDelay        = 0.5f;
         [SerializeField] private float _navMeshTimeout      = 30f;
 
-        [Header("📐 Búsqueda de NavMesh")]
+        [Tooltip("Si true, el agente se teleporta aquí automáticamente al iniciar la escena.\n" +
+                 "Debe estar activo SOLO en el nivel de entrada (normalmente nivel 0).\n" +
+                 "Desactívalo en los niveles superiores para evitar teleports no deseados.\n\n" +
+                 "⚠️ Este flag es respetado por TODOS los caminos de teleport,\n" +
+                 "incluyendo NotifyNavMeshReady y NotifyNavMeshReadyAfterSessionRestore.")]
+        [SerializeField] private bool _autoTeleportOnStart = true;
+
+        [Header("─── Búsqueda de NavMesh ─────────────────────────────────────")]
         [Tooltip("Desviación vertical máxima permitida al buscar NavMesh. " +
                  "Debe ser menor que la mitad de la separación entre pisos.")]
         [SerializeField] private float _maxVerticalDeviation = 1.0f;
         [Tooltip("Radio horizontal máximo para buscar NavMesh en el piso correcto.")]
         [SerializeField] private float _maxHorizontalRadius  = 5.0f;
 
-        [Header("🐛 Debug")]
+        [Header("─── Debug ───────────────────────────────────────────────────")]
         [SerializeField] private bool  _showGizmo   = true;
         [SerializeField] private Color _gizmoColor  = Color.green;
         [SerializeField] private float _gizmoRadius = 0.3f;
 
         private NavigationAgent _agent;
-        private bool _hasTeleported           = false;
-        private bool _navMeshSignaled         = false;
-        private bool _modelPositionConfirmed  = false;
+        private bool _hasTeleported          = false;
+        private bool _navMeshSignaled        = false;
+        private bool _modelPositionConfirmed = false;
+        private Coroutine _teleportCoroutine = null;
 
-        // ─── Properties ──────────────────────────────────────────────────
+        private bool _blockTeleportForSessionRestore = false;
+
+        // ─── Properties ───────────────────────────────────────────────────
 
         public int     Level             => _level;
         public float   FloorHeight       => transform.position.y;
         public Vector3 Position          => transform.position;
         public bool    DefinesFloorHeight => _useThisAsFloorHeight;
 
-        // ─── Lifecycle ────────────────────────────────────────────────────
+        public bool AutoTeleportOnStart
+        {
+            get => _autoTeleportOnStart;
+            set => _autoTeleportOnStart = value;
+        }
+
+        // ─── Lifecycle ─────────────────────────────────────────────────────
 
         private void Awake()
         {
-            // Si NO es hijo del modelo dinámico, confirmar posición inmediatamente.
-            // Si ES hijo del modelo, NavigationManager llama ConfirmModelPositioned()
-            // después de RestoreModelTransform(), garantizando que transform.position
-            // ya está en world space correcto antes de leer FloorHeight.
             if (!IsChildOfDynamicModel())
             {
                 _modelPositionConfirmed = true;
-                Debug.Log($"[StartPoint Level{_level}] Posición auto-confirmada (no es hijo de modelo dinámico).");
+                Debug.Log($"[StartPoint Level{_level}] Posición auto-confirmada " +
+                          "(no es hijo de modelo dinámico).");
             }
         }
 
         private void Start()
         {
             NavigationStartPointManager.RegisterStartPoint(this);
-            StartCoroutine(TeleportAgentWhenReady());
+
+            if (_autoTeleportOnStart)
+            {
+                _teleportCoroutine = StartCoroutine(TeleportAgentWhenReady());
+                Debug.Log($"[StartPoint Level{_level}] 🚀 Corrutina de teleport automático iniciada.");
+            }
+            else
+            {
+                Debug.Log($"[StartPoint Level{_level}] ⏸ autoTeleportOnStart=false — " +
+                          "este StartPoint define FloorHeight pero NO teleporta al agente.");
+            }
         }
 
         private void OnDestroy()
@@ -97,13 +109,8 @@ namespace IndoorNavAR.Navigation
             NavigationStartPointManager.UnregisterStartPoint(this);
         }
 
-        // ─── API pública ──────────────────────────────────────────────────
+        // ─── API pública ───────────────────────────────────────────────────
 
-        /// <summary>
-        /// Llamado por NavigationManager después de RestoreModelTransform().
-        /// En ese momento transform.position ya está en world space correcto
-        /// porque el modelo padre fue reposicionado y Unity propagó el transform.
-        /// </summary>
         public void ConfirmModelPositioned()
         {
             _modelPositionConfirmed = true;
@@ -112,27 +119,83 @@ namespace IndoorNavAR.Navigation
         }
 
         /// <summary>
-        /// Llamado por NavigationStartPointManager.NotifyNavMeshReady()
-        /// cuando el NavMesh está disponible.
+        /// Notifica que el NavMesh está listo. Uso normal (inicio de escena).
+        /// ✅ v8 FIX: respeta _autoTeleportOnStart.
         /// </summary>
         public void NotifyNavMeshReady()
         {
             _navMeshSignaled = true;
             Debug.Log($"[StartPoint Level{_level}] 📡 NavMesh listo (notificación directa).");
+
+            if (!_autoTeleportOnStart)
+            {
+                Debug.Log($"[StartPoint Level{_level}] ⏸ autoTeleportOnStart=false — " +
+                          "NavMesh señalado pero teleport omitido.");
+                return;
+            }
+
+            if (_teleportCoroutine == null && !_hasTeleported)
+            {
+                Debug.Log($"[StartPoint Level{_level}] 🚀 Relanzando corrutina de teleport " +
+                          "(no estaba activa).");
+                _teleportCoroutine = StartCoroutine(TeleportAgentWhenReady());
+            }
+        }
+
+        /// <summary>
+        /// ✅ v7: Versión de NotifyNavMeshReady para uso durante restauración de sesión.
+        /// ✅ v8 FIX: respeta _autoTeleportOnStart en TODOS los casos.
+        /// ✅ v8.1 FIX: corregido bug de interpolación de string en el log de FloorHeight.
+        /// </summary>
+        public void NotifyNavMeshReadyAfterSessionRestore()
+        {
+            _navMeshSignaled = true;
+            Debug.Log($"[StartPoint Level{_level}] 📡 NavMesh listo (restauración de sesión).");
+
+            if (!_autoTeleportOnStart)
+            {
+                // ✅ FIX v8.1: agregado $ para interpolación correcta de FloorHeight
+                Debug.Log($"[StartPoint Level{_level}] ⏸ [SessionRestore] autoTeleportOnStart=false — " +
+                          $"teleport omitido. Este StartPoint define FloorHeight={FloorHeight:F3}m " +
+                          $"para cálculos de distancia multi-piso.");
+                return;
+            }
+
+            if (_hasTeleported)
+            {
+                Debug.Log($"[StartPoint Level{_level}] ✅ [SessionRestore] Agente ya fue teleportado — " +
+                          "NO se re-teleporta. XR Origin permanece intacto.");
+                return;
+            }
+
+            Debug.Log($"[StartPoint Level{_level}] 🚀 [SessionRestore] Primer teleport — ejecutando.");
+            if (_teleportCoroutine != null)
+                StopCoroutine(_teleportCoroutine);
+            _teleportCoroutine = StartCoroutine(TeleportAgentWhenReady());
         }
 
         [ContextMenu("🔄 Re-teleportar Agente")]
         public void ReteleportAgent()
         {
+            if (_teleportCoroutine != null)
+            {
+                StopCoroutine(_teleportCoroutine);
+                _teleportCoroutine = null;
+                Debug.Log($"[StartPoint Level{_level}] 🛑 Corrutina anterior cancelada.");
+            }
+
             _hasTeleported          = false;
             _navMeshSignaled        = IsNavMeshAvailable();
             _modelPositionConfirmed = true;
 
             if (_agent == null)
-                _agent = FindFirstObjectByType<NavigationAgent>();
+                _agent = FindFirstObjectByType<NavigationAgent>(FindObjectsInactive.Include);
 
             if (_agent != null)
-                StartCoroutine(TeleportAgentWhenReady());
+                _teleportCoroutine = StartCoroutine(TeleportAgentWhenReady());
+            else
+                Debug.LogWarning($"[StartPoint Level{_level}] ⚠️ ReteleportAgent: " +
+                                 "NavigationAgent no encontrado (ni activo ni inactivo).");
         }
 
         public NavigationStartPointInfo GetInfo() => new NavigationStartPointInfo
@@ -145,22 +208,25 @@ namespace IndoorNavAR.Navigation
             DefinesFloorHeight = _useThisAsFloorHeight
         };
 
-        // ─── Teleport Logic ───────────────────────────────────────────────
+        // ─── Teleport Logic ────────────────────────────────────────────────
 
         private IEnumerator TeleportAgentWhenReady()
         {
             if (_initialDelay > 0)
                 yield return new WaitForSeconds(_initialDelay);
 
-            _agent = FindFirstObjectByType<NavigationAgent>();
+            _agent = FindFirstObjectByType<NavigationAgent>(FindObjectsInactive.Include);
+
             if (_agent == null)
             {
-                Debug.LogError($"[StartPoint Level{_level}] ❌ NavigationAgent no encontrado.");
+                Debug.LogError($"[StartPoint Level{_level}] ❌ NavigationAgent no encontrado " +
+                               "(buscado en activos e inactivos).");
                 yield break;
             }
 
-            // Esperar a que el modelo padre esté en su posición world correcta.
-            // Sin esto, transform.position.y podría ser el valor local sin transformar.
+            Debug.Log($"[StartPoint Level{_level}] ✅ NavigationAgent encontrado: " +
+                      $"'{_agent.gameObject.name}' (activo={_agent.gameObject.activeInHierarchy})");
+
             if (!_modelPositionConfirmed)
             {
                 Debug.Log($"[StartPoint Level{_level}] ⏳ Esperando confirmación de posición del modelo...");
@@ -172,11 +238,9 @@ namespace IndoorNavAR.Navigation
                 }
 
                 if (!_modelPositionConfirmed)
-                    Debug.LogWarning($"[StartPoint Level{_level}] ⚠️ Timeout esperando posición del modelo. " +
-                                     $"Usando transform.position actual: Y={transform.position.y:F3}m");
+                    Debug.LogWarning($"[StartPoint Level{_level}] ⚠️ Timeout esperando posición del modelo.");
             }
 
-            // Esperar NavMesh disponible
             if (_waitForNavMesh)
             {
                 float elapsed = 0f;
@@ -188,13 +252,24 @@ namespace IndoorNavAR.Navigation
                         Debug.Log($"[StartPoint Level{_level}] ⏳ Esperando NavMesh... {elapsed:F0}s");
                 }
 
-                string source = _navMeshSignaled ? "señal directa"
-                              : (elapsed >= _navMeshTimeout ? "timeout" : "polling");
+                string source = _navMeshSignaled          ? "señal directa"
+                              : elapsed >= _navMeshTimeout ? "timeout"
+                                                           : "polling";
                 Debug.Log($"[StartPoint Level{_level}] NavMesh detectado vía: {source}");
             }
 
-            // Frame extra para propagación
             yield return new WaitForSeconds(0.3f);
+
+            float activationWait = 0f;
+            while (!_agent.gameObject.activeInHierarchy && activationWait < 5f)
+            {
+                yield return new WaitForSeconds(0.1f);
+                activationWait += 0.1f;
+            }
+
+            if (!_agent.gameObject.activeInHierarchy)
+                Debug.LogWarning($"[StartPoint Level{_level}] ⚠️ NavigationAgent sigue inactivo tras 5s. " +
+                                 "Intentando teleport de todas formas...");
 
             LogDiagnostics();
 
@@ -210,24 +285,15 @@ namespace IndoorNavAR.Navigation
                                $"StartPoint Y={transform.position.y:F3}m, " +
                                $"maxVerticalDeviation={_maxVerticalDeviation}m");
             }
+
+            _teleportCoroutine = null;
         }
 
-        /// <summary>
-        /// Busca el punto NavMesh más cercano que pertenezca al piso correcto.
-        ///
-        /// Estrategia: prueba radios XZ crecientes pero valida que el hit esté
-        /// dentro de _maxVerticalDeviation en Y respecto a transform.position.y.
-        /// Esto evita capturar el NavMesh de otro piso aunque esté más cerca en 3D.
-        ///
-        /// _maxVerticalDeviation debe ser menor que la mitad de la separación
-        /// entre pisos (ej: pisos a 3m de separación → usar 1.0m o 1.2m).
-        /// </summary>
         private bool TeleportToCorrectFloor()
         {
             Vector3 myPos = transform.position;
-            float myY     = myPos.y;
+            float   myY   = myPos.y;
 
-            // Radios crecientes para búsqueda horizontal
             float[] radii = { 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, _maxHorizontalRadius };
 
             foreach (float radius in radii)
@@ -239,7 +305,6 @@ namespace IndoorNavAR.Navigation
 
                 if (verticalDelta <= _maxVerticalDeviation)
                 {
-                    // Hit dentro del rango vertical correcto — este es nuestro piso
                     float horizontalDist = Vector2.Distance(
                         new Vector2(myPos.x, myPos.z),
                         new Vector2(hit.position.x, hit.position.z));
@@ -255,18 +320,14 @@ namespace IndoorNavAR.Navigation
                 }
                 else
                 {
-                    // Hit encontrado pero en el piso equivocado — ignorar y ampliar radio
                     Debug.Log($"[StartPoint Level{_level}] ⏭️ Hit en radio {radius}m descartado: " +
                               $"Y={hit.position.y:F3} está a {verticalDelta:F3}m de mi Y={myY:F3} " +
                               $"(máx permitido: {_maxVerticalDeviation:F2}m) — piso equivocado.");
                 }
             }
 
-            // Ningún radio encontró NavMesh en el piso correcto.
-            // Intentar búsqueda ajustando la posición de origen hacia abajo/arriba
-            // para compensar si el StartPoint está algo desplazado verticalmente.
             Debug.LogWarning($"[StartPoint Level{_level}] 🔍 Búsqueda estándar fallida. " +
-                             $"Intentando búsqueda con offsets verticales...");
+                             "Intentando búsqueda con offsets verticales...");
 
             float[] verticalOffsets = { -0.1f, 0.1f, -0.3f, 0.3f, -0.5f, 0.5f };
             foreach (float yOffset in verticalOffsets)
@@ -277,38 +338,28 @@ namespace IndoorNavAR.Navigation
                     float verticalDelta = Mathf.Abs(hit2.position.y - myY);
                     if (verticalDelta <= _maxVerticalDeviation)
                     {
-                        Debug.Log($"[StartPoint Level{_level}] 📍 Encontrado con offset Y={yOffset:+0.0;-0.0}m: " +
-                                  $"hit={hit2.position:F3}");
+                        Debug.Log($"[StartPoint Level{_level}] 📍 Encontrado con offset " +
+                                  $"Y={yOffset:+0.0;-0.0}m: hit={hit2.position:F3}");
                         return _agent.TeleportTo(hit2.position);
                     }
                 }
             }
 
-            // Último recurso: usar el punto más cercano independientemente del piso,
-            // con advertencia explícita
             if (NavMesh.SamplePosition(myPos, out NavMeshHit fallback, _maxHorizontalRadius * 2f, NavMesh.AllAreas))
             {
                 float verticalDelta = Mathf.Abs(fallback.position.y - myY);
-                Debug.LogWarning($"[StartPoint Level{_level}] ⚠️ FALLBACK: usando NavMesh en Y={fallback.position.y:F3} " +
-                                 $"(ΔY={verticalDelta:F3}m — puede ser el piso equivocado). " +
-                                 $"Ajusta la posición Y del StartPoint Level{_level} para que esté " +
-                                 $"más cerca del piso ({myY:F3}m ± {_maxVerticalDeviation:F2}m).");
+                Debug.LogWarning($"[StartPoint Level{_level}] ⚠️ FALLBACK: usando NavMesh en " +
+                                 $"Y={fallback.position.y:F3} (ΔY={verticalDelta:F3}m — puede ser el " +
+                                 $"piso equivocado). Ajusta la posición Y del StartPoint Level{_level}.");
                 return _agent.TeleportTo(fallback.position);
             }
 
-            Debug.LogError($"[StartPoint Level{_level}] ❌ Sin NavMesh accesible desde Y={myY:F3}m " +
-                           $"con radio máximo {_maxHorizontalRadius * 2f}m. " +
-                           $"Verifica que el NavMesh fue bakeado correctamente para este nivel.");
+            Debug.LogError($"[StartPoint Level{_level}] ❌ Sin NavMesh accesible desde Y={myY:F3}m.");
             return false;
         }
 
-        // ─── Helpers ─────────────────────────────────────────────────────
+        // ─── Helpers ──────────────────────────────────────────────────────
 
-        /// <summary>
-        /// El StartPoint es hijo del modelo dinámico si tiene un ancestro con tag "3DModel".
-        /// En ese caso su world position depende del modelo padre, y se necesita
-        /// ConfirmModelPositioned() antes de leer transform.position.
-        /// </summary>
         private bool IsChildOfDynamicModel()
         {
             Transform current = transform.parent;
@@ -325,11 +376,10 @@ namespace IndoorNavAR.Navigation
         {
             NavMeshTriangulation tri = NavMesh.CalculateTriangulation();
             if (tri.vertices.Length == 0) return false;
-            // Verificar que hay NavMesh cerca de ESTE piso específicamente
             return NavMesh.SamplePosition(transform.position, out _, _maxHorizontalRadius, NavMesh.AllAreas);
         }
 
-        // ─── Diagnóstico ──────────────────────────────────────────────────
+        // ─── Diagnóstico ───────────────────────────────────────────────────
 
         private void LogDiagnostics()
         {
@@ -342,7 +392,6 @@ namespace IndoorNavAR.Navigation
                 return;
             }
 
-            // Encontrar el vértice NavMesh más cercano en Y (mismo piso)
             float minYDist  = float.MaxValue;
             float minDist3D = float.MaxValue;
             Vector3 closestSameFloor = Vector3.zero;
@@ -353,52 +402,53 @@ namespace IndoorNavAR.Navigation
                 float yDist  = Mathf.Abs(v.y - myPos.y);
                 float dist3D = Vector3.Distance(v, myPos);
 
-                if (yDist < minYDist) { minYDist = yDist; closestSameFloor = v; }
-                if (dist3D < minDist3D) { minDist3D = dist3D; closest3D = v; }
+                if (yDist  < minYDist)  { minYDist  = yDist;  closestSameFloor = v; }
+                if (dist3D < minDist3D) { minDist3D = dist3D; closest3D        = v; }
             }
 
             Debug.Log($"[StartPoint Level{_level}] 📊 Diagnóstico:" +
-                      $"\n  Mi posición: {myPos:F3} (Y={myPos.y:F3}m)" +
-                      $"\n  NavMesh total: {tri.vertices.Length} vértices" +
-                      $"\n  Más cercano en Y: {closestSameFloor:F3} (ΔY={minYDist:F3}m)" +
-                      $"\n  Más cercano 3D:   {closest3D:F3} (dist3D={minDist3D:F3}m)" +
+                      $"\n  Mi posición:          {myPos:F3} (Y={myPos.y:F3}m)" +
+                      $"\n  NavMesh total:        {tri.vertices.Length} vértices" +
+                      $"\n  Más cercano en Y:     {closestSameFloor:F3} (ΔY={minYDist:F3}m)" +
+                      $"\n  Más cercano 3D:       {closest3D:F3} (dist3D={minDist3D:F3}m)" +
                       $"\n  maxVerticalDeviation: {_maxVerticalDeviation:F2}m" +
                       $"\n  {(minYDist <= _maxVerticalDeviation ? "✅ NavMesh de este piso alcanzable" : "❌ NavMesh más cercano en Y está fuera del umbral")}");
         }
 
-        // ─── Gizmos ───────────────────────────────────────────────────────
+        // ─── Gizmos ────────────────────────────────────────────────────────
 
         private void OnDrawGizmos()
         {
             if (!_showGizmo) return;
 
-            Gizmos.color = _hasTeleported ? Color.green : _gizmoColor;
+            Gizmos.color = _hasTeleported ? Color.green
+                         : _autoTeleportOnStart ? _gizmoColor
+                         : new Color(_gizmoColor.r, _gizmoColor.g, _gizmoColor.b, 0.4f);
+
             Gizmos.DrawWireSphere(transform.position, _gizmoRadius);
 
-            // Cruz de posición
             Vector3 pos = transform.position;
             float   cs  = _gizmoRadius * 0.5f;
-            Gizmos.DrawLine(pos + Vector3.left * cs,    pos + Vector3.right * cs);
-            Gizmos.DrawLine(pos + Vector3.forward * cs, pos + Vector3.back * cs);
+            Gizmos.DrawLine(pos + Vector3.left    * cs, pos + Vector3.right * cs);
+            Gizmos.DrawLine(pos + Vector3.forward * cs, pos + Vector3.back  * cs);
 
-            // Plano horizontal de altura (referencia del piso)
             if (_useThisAsFloorHeight)
             {
                 Gizmos.color = new Color(_gizmoColor.r, _gizmoColor.g, _gizmoColor.b, 0.1f);
                 Gizmos.DrawCube(pos, new Vector3(5f, 0.02f, 5f));
             }
 
-            // Zona de búsqueda vertical (cilindro aproximado con dos esferas)
             Gizmos.color = new Color(_gizmoColor.r, _gizmoColor.g, _gizmoColor.b, 0.15f);
-            Gizmos.DrawWireSphere(pos + Vector3.up    * _maxVerticalDeviation, _maxHorizontalRadius * 0.5f);
-            Gizmos.DrawWireSphere(pos + Vector3.down  * _maxVerticalDeviation, _maxHorizontalRadius * 0.5f);
+            Gizmos.DrawWireSphere(pos + Vector3.up   * _maxVerticalDeviation, _maxHorizontalRadius * 0.5f);
+            Gizmos.DrawWireSphere(pos + Vector3.down * _maxVerticalDeviation, _maxHorizontalRadius * 0.5f);
 
 #if UNITY_EDITOR
             UnityEditor.Handles.Label(transform.position + Vector3.up * 0.5f,
-                $"Start Level {_level}\nY={transform.position.y:F2}m\n±{_maxVerticalDeviation:F1}m",
+                $"Start Level {_level}\nY={transform.position.y:F2}m\n±{_maxVerticalDeviation:F1}m" +
+                $"\n{(_autoTeleportOnStart ? "AUTO ✅" : "FloorHeight only 📐")}",
                 new GUIStyle
                 {
-                    normal    = new GUIStyleState { textColor = Color.white },
+                    normal    = new GUIStyleState { textColor = _autoTeleportOnStart ? Color.white : Color.gray },
                     fontSize  = 11,
                     fontStyle = FontStyle.Bold,
                     alignment = TextAnchor.MiddleCenter
@@ -412,8 +462,6 @@ namespace IndoorNavAR.Navigation
 
             Vector3 myPos = transform.position;
 
-            // Mostrar el resultado de SamplePosition filtrado por Y
-            bool foundCorrectFloor = false;
             float[] radii = { 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, _maxHorizontalRadius };
             foreach (float r in radii)
             {
@@ -430,29 +478,14 @@ namespace IndoorNavAR.Navigation
                             $"NavMesh Y={hit.position.y:F2}m\n(ΔY={yDelta:F3}m, r={r}m)",
                             new GUIStyle { normal = new GUIStyleState { textColor = Color.cyan }, fontSize = 10 });
 #endif
-                        foundCorrectFloor = true;
                         break;
                     }
                 }
             }
-
-            if (!foundCorrectFloor)
-            {
-#if UNITY_EDITOR
-                UnityEditor.Handles.Label(myPos + Vector3.up * 0.7f,
-                    $"⚠️ Sin NavMesh en Y={myPos.y:F2}m\n±{_maxVerticalDeviation:F1}m",
-                    new GUIStyle
-                    {
-                        normal    = new GUIStyleState { textColor = Color.red },
-                        fontSize  = 11,
-                        fontStyle = FontStyle.Bold
-                    });
-#endif
-            }
         }
     }
 
-    // ─── Data Structures ──────────────────────────────────────────────────
+    // ─── Data Structures ───────────────────────────────────────────────────
 
     public struct NavigationStartPointInfo
     {
@@ -464,12 +497,22 @@ namespace IndoorNavAR.Navigation
         public bool    DefinesFloorHeight;
     }
 
-    // ─── Manager estático ─────────────────────────────────────────────────
+    // ─── Manager estático ──────────────────────────────────────────────────
 
     public static class NavigationStartPointManager
     {
         private static System.Collections.Generic.List<NavigationStartPoint> _startPoints =
             new System.Collections.Generic.List<NavigationStartPoint>();
+
+        private static bool _sessionRestoreInProgress = false;
+
+        public static bool IsSessionRestoreInProgress => _sessionRestoreInProgress;
+
+        public static void SetSessionRestoreInProgress(bool value)
+        {
+            _sessionRestoreInProgress = value;
+            Debug.Log($"[StartPointManager] 📡 SessionRestoreInProgress = {value}");
+        }
 
         public static void RegisterStartPoint(NavigationStartPoint p)
         {
@@ -477,31 +520,33 @@ namespace IndoorNavAR.Navigation
             {
                 _startPoints.Add(p);
                 Debug.Log($"[StartPointManager] ✅ Registrado Level {p.Level} " +
-                          $"en Y={p.FloorHeight:F3}m (world)");
+                          $"en Y={p.FloorHeight:F3}m (world) | autoTeleport={p.AutoTeleportOnStart}");
             }
         }
 
         public static void UnregisterStartPoint(NavigationStartPoint p) => _startPoints.Remove(p);
 
-        /// <summary>
-        /// Notifica a todos los StartPoints que el NavMesh está disponible.
-        /// </summary>
         public static void NotifyNavMeshReady()
         {
             _startPoints.RemoveAll(p => p == null);
-            Debug.Log($"[StartPointManager] 📡 Notificando NavMesh ready a {_startPoints.Count} StartPoint(s)");
+            Debug.Log($"[StartPointManager] 📡 NotifyNavMeshReady → {_startPoints.Count} StartPoint(s)");
             foreach (var p in _startPoints)
                 p.NotifyNavMeshReady();
         }
 
-        /// <summary>
-        /// Confirma a todos los StartPoints que el modelo está en su posición world final.
-        /// El world Y de cada StartPoint es válido a partir de este momento.
-        /// </summary>
+        public static void NotifyNavMeshReadyAfterSessionRestore()
+        {
+            _startPoints.RemoveAll(p => p == null);
+            Debug.Log($"[StartPointManager] 📡 NotifyNavMeshReadyAfterSessionRestore → " +
+                      $"{_startPoints.Count} StartPoint(s)");
+            foreach (var p in _startPoints)
+                p.NotifyNavMeshReadyAfterSessionRestore();
+        }
+
         public static void ConfirmModelPositioned()
         {
             _startPoints.RemoveAll(p => p == null);
-            Debug.Log($"[StartPointManager] 📍 Confirmando posición del modelo a {_startPoints.Count} StartPoint(s)");
+            Debug.Log($"[StartPointManager] 📍 ConfirmModelPositioned → {_startPoints.Count} StartPoint(s)");
             foreach (var p in _startPoints)
                 p.ConfirmModelPositioned();
         }
@@ -538,6 +583,10 @@ namespace IndoorNavAR.Navigation
             return u.Count;
         }
 
-        public static void ClearAll() => _startPoints.Clear();
+        public static void ClearAll()
+        {
+            _startPoints.Clear();
+            _sessionRestoreInProgress = false;
+        }
     }
 }

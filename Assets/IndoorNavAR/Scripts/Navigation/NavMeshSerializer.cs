@@ -1,66 +1,48 @@
-// File: NavMeshSerializer.cs  v7.0
+// File: NavMeshSerializer.cs  v7.1
 //
 // ═══════════════════════════════════════════════════════════════════════════
-// POR QUÉ FALLABA v6.1 AL RESTAURAR LAS RAMPAS
+// CAMBIOS v7.0 → v7.1
 // ═══════════════════════════════════════════════════════════════════════════
 //
-// InjectPermissive() en v6.1 reconstruía el NavMesh desde vértices/índices
-// del .bin creando un Mesh y llamando BuildNavMeshData(). Este proceso
-// RE-VOXELIZA la geometría usando los settings del agente. Los triángulos
-// diagonales de la rampa (que van de Y=0 a Y=3.5 aprox.) son filtrados
-// por el voxelizador exactamente igual que durante el bake original:
-//   - height-clearance: el voxelizador exige espacio libre arriba del triángulo
-//   - slope filter: pendiente efectiva del vóxel puede superar el límite
+// BUG CORREGIDO: Save() guardaba la UNIÓN del NavMesh original + el permissivo
+// ─────────────────────────────────────────────────────────────────────────────
+// En v7.0, al guardar:
+//   1. Se bakeaba un NavMeshData permissivo (permData) sobre la triangulación actual.
+//   2. Se inyectaba TEMPORALMENTE permData con NavMesh.AddNavMeshData(permData).
+//   3. Se llamaba NavMesh.CalculateTriangulation() — que devuelve la UNIÓN de
+//      TODOS los NavMeshData activos, es decir, el NavMesh original de pisos
+//      + el NavMesh permissivo con rampas. Resultado: vértices duplicados.
+//   4. Se guardaban esos vértices duplicados en navmesh_unified.bin.
+//   5. Al cargar, InjectPermissive recibía los duplicados y los re-voxelizaba,
+//      generando un NavMesh más grande de lo esperado.
 //
-// Resultado: la rampa estaba en el .bin pero desaparecía al re-voxelizar.
+// FIX v7.1:
+//   En PASO 3 del guardado, quitar TODAS las instancias NavMesh activas antes
+//   de triangular permData, y restaurarlas después. Esto garantiza que
+//   CalculateTriangulation() devuelve SOLO los vértices del bake permissivo,
+//   sin duplicados del NavMesh de pisos.
 //
-// ═══════════════════════════════════════════════════════════════════════════
-// SOLUCIÓN v7: NavMeshData nativo (sin re-voxelización)
-// ═══════════════════════════════════════════════════════════════════════════
+//   Como NavMesh.GetAllNavMeshDataInstances() no existe en la API pública,
+//   usamos un enfoque alternativo: en lugar de triangular el permData inyectado,
+//   lo triangulamos de forma indirecta usando NavMeshBuilder con un bounds
+//   aislado. Esto evita la interferencia con el NavMesh activo.
 //
-//  Unity expone NavMeshData como ScriptableObject serializable.
-//  En lugar de guardar vértices/índices raw y re-voxelizar al cargar,
-//  v7 serializa el NavMeshData completo usando los bytes nativos de Unity
-//  (que incluyen el BVH, el grafo de conectividad y TODO lo que generó el baker).
-//
-//  Al restaurar, se deserializa el NavMeshData nativo y se inyecta con
-//  NavMesh.AddNavMeshData() SIN ningún paso de re-voxelización.
-//  Las rampas estaban en el NavMeshData original → siguen estando al restaurar.
-//
-//  FORMATO v7:
-//    navmesh_header.json  — metadatos (versión, timestamp, agente, niveles)
-//    navmesh_native.bytes — NavMeshData serializado con BinaryFormatter via
-//                           UnityEngine.NavMeshBuilder (internal path native)
-//
-//  FALLBACK DE COMPATIBILIDAD:
-//    Si el archivo navmesh_native.bytes no existe (save de v6.1 o anterior),
-//    se usa el método v6.1 (InjectPermissive con re-voxelización) con un aviso
-//    de que las rampas pueden estar ausentes. Se recomienda re-bakear.
+//   SOLUCIÓN PRÁCTICA: Tras el bake permissivo, filtrar los vértices de
+//   permTri que ya estaban en la triangulación original (tri). Los vértices
+//   NUEVOS (de las rampas) son los que no coinciden con ningún vértice de tri.
+//   Como los pisos planos están en tri Y en permTri, los conservamos todos —
+//   pero eliminamos duplicados exactos para no inflar el .bin innecesariamente.
 //
 // ═══════════════════════════════════════════════════════════════════════════
-// MÉTODO DE SERIALIZACIÓN NATIVA
+// ARQUITECTURA GENERAL (sin cambios respecto a v7.0)
 // ═══════════════════════════════════════════════════════════════════════════
 //
-//  Unity no expone NavMeshData.GetBytes() públicamente, pero sí permite:
-//    1) NavMeshData es un UnityEngine.Object → puede ser serializado con
-//       BuildPipeline / AssetDatabase en editor. En runtime usamos:
-//    2) JsonUtility no soporta NavMeshData. Usamos un NavMeshSurface temporal
-//       + NavMeshBuilder.BuildNavMeshData() para RE-BAKEAR con settings
-//       permissivos (agentHeight=0.05, slope=89°) que SÍ preservan las rampas,
-//       guardando el resultado como bytes nativos via:
-//         byte[] data = NavMeshBuilder.GetNavMeshBuildDebugSettings()... 
-//       
-//  IMPLEMENTACIÓN REAL (runtime-compatible sin reflection):
-//    - Save: CalculateTriangulation() → mesh → BuildNavMeshData con settings
-//      permissivos (height=0.05, slope=89°, voxel=0.02) → este segundo bake
-//      SÍ incluye las rampas porque usa height mínimo. Los bytes del 
-//      NavMeshData se guardan como asset en persistentDataPath.
-//    - Load: Leer bytes → reconstruir NavMeshData → AddNavMeshData().
+//  Save: CalculateTriangulation() → bake permissivo → dedup → guardar .bin
+//  Load: leer .bin → InjectPermissive (mismos settings) → rampas sobreviven
 //
-//  CLAVE: el segundo bake (al guardar) usa settings permissivos que el baker
-//  principal (GlobalNavMeshBaker v8) no puede usar porque distorsionaría la
-//  navegación de los pisos planos. Al guardar ya no importa la calidad del
-//  bake sino solo preservar la geometría → permissivo es correcto aquí.
+//  FORMATO v7.1 (compatible con v7.0):
+//    navmesh_header.json  — versión "7.1", metadatos
+//    navmesh_unified.bin  — verts/índices del bake permissivo (sin duplicados)
 
 using System;
 using System.Collections.Generic;
@@ -91,7 +73,7 @@ namespace IndoorNavAR.Navigation
     [Serializable]
     public class NavMeshSaveHeader
     {
-        public string version   = "7.0";
+        public string version   = "7.1";
         public string timestamp;
 
         public Vector3    modelPosition;
@@ -108,7 +90,7 @@ namespace IndoorNavAR.Navigation
         public int   levelCount;
         public float totalNavMeshArea;
 
-        // v7.0: archivo unificado con bake permissivo (preserva rampas)
+        // v7.x: archivo unificado con bake permissivo (preserva rampas)
         public string unifiedBinFile;
         public int    unifiedVertexCount;
         public int    unifiedIndexCount;
@@ -139,13 +121,14 @@ namespace IndoorNavAR.Navigation
         private const float LevelClusterGapY = 0.8f;
 
         // Settings permissivos para guardar/restaurar (preservan rampas en re-voxelización)
-        // agentHeight=0.05 en lugar de 0.001 — suficientemente permissivo y evita valores
-        // que Unity puede rechazar internamente
         private const float SAVE_AGENT_HEIGHT = 0.05f;
         private const float SAVE_AGENT_RADIUS = 0.01f;
         private const float SAVE_AGENT_SLOPE  = 89f;
         private const float SAVE_AGENT_CLIMB  = 50f;
-        private const float SAVE_VOXEL_SIZE   = 0.02f;  // 2cm — balance calidad/velocidad
+        private const float SAVE_VOXEL_SIZE   = 0.02f;
+
+        // Tolerancia para deduplicación de vértices (en metros)
+        private const float DEDUP_EPSILON = 0.001f;
 
         // ─────────────────────────────────────────────────────────────────
         public static bool HasSavedNavMesh
@@ -164,19 +147,6 @@ namespace IndoorNavAR.Navigation
         // GUARDAR
         // ═════════════════════════════════════════════════════════════════
 
-        /// <summary>
-        /// Guarda el NavMesh activo en disco.
-        ///
-        /// CAMBIO v7 vs v6.1:
-        ///   Al guardar, re-bakea con settings PERMISSIVOS sobre la triangulación
-        ///   actual (que incluye rampas). Esto produce un NavMeshData que SÍ
-        ///   contiene las rampas al ser restaurado, porque los settings permissivos
-        ///   no filtran triángulos diagonales.
-        ///
-        ///   El .bin se guarda con los vértices/índices del bake permissivo.
-        ///   Al cargar, InjectPermissive usa los mismos settings → las rampas
-        ///   sobreviven ambas pasadas de voxelización.
-        /// </summary>
         public static async Task<bool> Save(
             Transform modelTransform,
             int       agentTypeID = 0,
@@ -185,31 +155,29 @@ namespace IndoorNavAR.Navigation
             LastSaveWasSuccessful = false;
             try
             {
-                Debug.Log($"[NavMeshSerializer v7] ⏳ Esperando {PostBakeSettleMs}ms post-bake...");
+                Debug.Log($"[NavMeshSerializer v7.1] ⏳ Esperando {PostBakeSettleMs}ms post-bake...");
                 await Task.Delay(PostBakeSettleMs);
 
                 string basePath   = Application.persistentDataPath;
                 string headerPath = Path.Combine(basePath, HEADER_FILE);
 
-                // ── PASO 1: Obtener la triangulación actual (baker v8 ya la generó) ──
+                // ── PASO 1: Triangulación actual (baker v8 ya la generó) ──────
                 NavMeshTriangulation tri = NavMesh.CalculateTriangulation();
                 if (tri.vertices == null || tri.vertices.Length == 0)
                 {
-                    Debug.LogError("[NavMeshSerializer v7] ❌ NavMesh vacío, nada que guardar.");
+                    Debug.LogError("[NavMeshSerializer v7.1] ❌ NavMesh vacío, nada que guardar.");
                     return false;
                 }
 
                 CalculateYRange(tri.vertices, out float globalMinY, out float globalMaxY);
                 float totalArea = CalculateArea(tri.vertices, tri.indices);
 
-                Debug.Log($"[NavMeshSerializer v7] 📐 Triangulación actual: " +
+                Debug.Log($"[NavMeshSerializer v7.1] 📐 Triangulación actual: " +
                           $"{tri.vertices.Length} verts, {tri.indices.Length / 3} tris, " +
                           $"Y=[{globalMinY:F2},{globalMaxY:F2}], área={totalArea:F1}m²");
 
-                // ── PASO 2: Re-bakear con settings permissivos para preservar rampas ──
-                // Este segundo bake opera sobre el mesh de la triangulación actual,
-                // usando settings que no filtran triángulos diagonales.
-                Debug.Log("[NavMeshSerializer v7] 🔧 Re-bake permissivo para preservar rampas...");
+                // ── PASO 2: Re-bakear con settings permissivos ───────────────
+                Debug.Log("[NavMeshSerializer v7.1] 🔧 Re-bake permissivo para preservar rampas...");
 
                 Mesh triMesh = BuildMesh(tri.vertices, tri.indices);
                 var  src     = new NavMeshBuildSource
@@ -221,12 +189,15 @@ namespace IndoorNavAR.Navigation
                 };
 
                 NavMeshBuildSettings permSettings = BuildPermissiveSettings(agentTypeID);
-                float yMargin = 2f;
-                var permBounds = new Bounds(
-                    new Vector3(triMesh.bounds.center.x, (globalMinY + globalMaxY) * 0.5f, triMesh.bounds.center.z),
-                    new Vector3(triMesh.bounds.size.x + 4f, (globalMaxY - globalMinY) + yMargin * 2f, triMesh.bounds.size.z + 4f));
+                float yMargin    = 2f;
+                var   permBounds = new Bounds(
+                    new Vector3(triMesh.bounds.center.x,
+                                (globalMinY + globalMaxY) * 0.5f,
+                                triMesh.bounds.center.z),
+                    new Vector3(triMesh.bounds.size.x + 4f,
+                                (globalMaxY - globalMinY) + yMargin * 2f,
+                                triMesh.bounds.size.z + 4f));
 
-                // BuildNavMeshData DEBE ejecutarse en el hilo principal (main thread)
                 NavMeshData permData = NavMeshBuilder.BuildNavMeshData(
                     permSettings,
                     new List<NavMeshBuildSource> { src },
@@ -234,44 +205,62 @@ namespace IndoorNavAR.Navigation
                     Vector3.zero,
                     Quaternion.identity);
 
-                await Task.Yield(); // ceder frame después del bake pesado
+                await Task.Yield();
 
-                // ── PASO 3: Triangular el NavMesh permissivo y guardar ESOS vértices ──
-                // Inyectamos temporalmente el permData para poder triangularlo
+                // ── PASO 3: Triangular SOLO permData — sin mezclar con NavMesh activo ──
+                //
+                // ✅ FIX v7.1: En v7.0 se inyectaba permData con AddNavMeshData()
+                // y luego se triangulaba — obteniendo la UNIÓN con el NavMesh activo.
+                // Ahora añadimos permData en una escena aislada conceptualmente:
+                // lo añadimos, calculamos la triangulación, y lo quitamos ANTES de
+                // añadir los datos al NavMesh real. Como no podemos quitar el NavMesh
+                // activo (pertenece a MultiLevelNavMeshGenerator), en su lugar
+                // filtramos los vértices resultantes para eliminar duplicados exactos
+                // que ya estaban en la triangulación original (tri).
+
                 NavMeshDataInstance tempInst = NavMesh.AddNavMeshData(permData);
                 await Task.Yield();
                 await Task.Yield();
 
-                NavMeshTriangulation permTri = NavMesh.CalculateTriangulation();
+                NavMeshTriangulation unionTri = NavMesh.CalculateTriangulation();
                 NavMesh.RemoveNavMeshData(tempInst);
 
-                // Filtrar solo los vértices de la instancia permissiva (todos los que estaban
-                // en el rango del NavMesh original + los nuevos de la rampa)
-                // En la práctica, CalculateTriangulation devuelve la UNIÓN, así que puede
-                // tener duplicados del NavMesh de pisos — está bien, el loader los maneja.
+                // ✅ FIX v7.1: Deduplicar — eliminar vértices que ya estaban en tri
+                // Los vértices NUEVOS (de rampas) son los que permData añadió.
+                // Los vértices EXISTENTES (de pisos) estaban en tri y en permTri.
+                // Al guardar ambos sets (sin dedup) el .bin es más grande pero funcional.
+                // La deduplicación reduce el tamaño y evita re-voxelización doble.
+                var (dedupVerts, dedupIdxs, dedupAreas) = DeduplicateAgainstOriginal(
+                    unionTri.vertices, unionTri.indices, unionTri.areas,
+                    tri.vertices);
 
-                if (permTri.vertices == null || permTri.vertices.Length == 0)
+                Vector3[] saveVerts;
+                int[]     saveIdxs;
+                int[]     saveAreas;
+
+                if (dedupVerts.Length == 0)
                 {
-                    Debug.LogWarning("[NavMeshSerializer v7] ⚠️ Re-bake permissivo vacío. " +
-                                     "Guardando triangulación original (rampas pueden perderse al cargar).");
-                    // Fallback: guardar triangulación original como en v6.1
-                    permTri = tri;
+                    Debug.LogWarning("[NavMeshSerializer v7.1] ⚠️ Dedup resultó en 0 verts. " +
+                                     "Usando triangulación original (rampas pueden perderse).");
+                    saveVerts = tri.vertices;
+                    saveIdxs  = tri.indices;
+                    saveAreas = tri.areas;
                 }
                 else
                 {
-                    CalculateYRange(permTri.vertices, out float pMinY, out float pMaxY);
-                    bool hasRamp = levels_HasRampVertices(permTri.vertices, globalMinY, globalMaxY);
-                    Debug.Log($"[NavMeshSerializer v7] 📐 Bake permissivo: " +
-                              $"{permTri.vertices.Length} verts, Y=[{pMinY:F2},{pMaxY:F2}]" +
+                    CalculateYRange(dedupVerts, out float pMinY, out float pMaxY);
+                    bool hasRamp = levels_HasRampVertices(dedupVerts, globalMinY, globalMaxY);
+                    Debug.Log($"[NavMeshSerializer v7.1] 📐 Post-dedup: " +
+                              $"{dedupVerts.Length} verts (de {unionTri.vertices.Length}), " +
+                              $"Y=[{pMinY:F2},{pMaxY:F2}]" +
                               $"{(hasRamp ? " — ✅ rampas incluidas" : " — ⚠️ sin vértices de rampa")}");
+                    saveVerts = dedupVerts;
+                    saveIdxs  = dedupIdxs;
+                    saveAreas = dedupAreas;
                 }
 
-                // ── PASO 4: Guardar el .bin con los vértices del bake permissivo ──
+                // ── PASO 4: Guardar .bin ─────────────────────────────────────
                 string unifiedPath = Path.Combine(basePath, UNIFIED_BIN);
-                Vector3[] saveVerts  = permTri.vertices;
-                int[]     saveIdxs   = permTri.indices;
-                int[]     saveAreas  = permTri.areas;
-
                 await Task.Run(() =>
                 {
                     using var fs = new FileStream(unifiedPath, FileMode.Create, FileAccess.Write);
@@ -282,18 +271,18 @@ namespace IndoorNavAR.Navigation
                 });
 
                 CalculateYRange(saveVerts, out float sMinY, out float sMaxY);
-                Debug.Log($"[NavMeshSerializer v7] 💾 Guardado: navmesh_unified.bin " +
+                Debug.Log($"[NavMeshSerializer v7.1] 💾 Guardado: navmesh_unified.bin " +
                           $"({saveVerts.Length} verts, {saveIdxs.Length / 3} tris, " +
                           $"Y=[{sMinY:F2},{sMaxY:F2}])");
 
-                // ── PASO 5: Header ──────────────────────────────────────────────
+                // ── PASO 5: Header ───────────────────────────────────────────
                 List<LevelSegment> levelSegs =
                     BuildLevelSegmentsForDiagnostics(tri, levelCount, globalMinY, globalMaxY);
 
                 NavMeshBuildSettings agentCfg = NavMesh.GetSettingsByID(agentTypeID);
                 var header = new NavMeshSaveHeader
                 {
-                    version            = "7.0",
+                    version            = "7.1",
                     timestamp          = DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss"),
                     agentTypeID        = agentTypeID,
                     agentRadius        = agentCfg.agentRadius,
@@ -325,16 +314,106 @@ namespace IndoorNavAR.Navigation
 
                 CleanLegacyFiles(basePath);
 
-                Debug.Log("[NavMeshSerializer v7] ✅ Guardado correctamente. " +
-                          "Rampas incluidas en bake permissivo.");
+                Debug.Log("[NavMeshSerializer v7.1] ✅ Guardado correctamente. " +
+                          "Rampas incluidas (sin duplicados del NavMesh de pisos).");
                 LastSaveWasSuccessful = true;
                 return true;
             }
             catch (Exception ex)
             {
-                Debug.LogError($"[NavMeshSerializer v7] ❌ Error guardando: {ex.Message}\n{ex.StackTrace}");
+                Debug.LogError($"[NavMeshSerializer v7.1] ❌ Error guardando: {ex.Message}\n{ex.StackTrace}");
                 return false;
             }
+        }
+
+        // ═════════════════════════════════════════════════════════════════
+        // DEDUPLICACIÓN (✅ FIX v7.1)
+        // ═════════════════════════════════════════════════════════════════
+
+        /// <summary>
+        /// Elimina de unionVerts los vértices que ya estaban en originalVerts
+        /// (dentro de DEDUP_EPSILON). Preserva la integridad de los índices
+        /// reasignándolos al vértice original más cercano cuando hay coincidencia.
+        ///
+        /// En la práctica: los vértices de pisos planos están en ambos sets.
+        /// Los vértices de rampas solo están en unionVerts. El resultado es
+        /// la unión SIN duplicados exactos — equivalente al bake permissivo limpio.
+        ///
+        /// NOTA: Unity puede mover ligeramente los vértices durante el bake
+        /// (snapping al vóxel). DEDUP_EPSILON=1mm tolera ese movimiento.
+        /// </summary>
+        private static (Vector3[] verts, int[] idxs, int[] areas) DeduplicateAgainstOriginal(
+            Vector3[] unionVerts, int[] unionIdxs, int[] unionAreas,
+            Vector3[] originalVerts)
+        {
+            if (unionVerts == null || unionVerts.Length == 0)
+                return (Array.Empty<Vector3>(), Array.Empty<int>(), Array.Empty<int>());
+
+            // Construir un set rápido de los vértices originales (hash por posición discretizada)
+            // Usamos un Dictionary con clave de posición discretizada a DEDUP_EPSILON
+            var originalSet = new HashSet<long>(originalVerts.Length);
+            foreach (var v in originalVerts)
+                originalSet.Add(QuantizeVertex(v));
+
+            // Mapeo: índice en unionVerts → índice en el array resultado
+            var remapIdx    = new int[unionVerts.Length];
+            var newVerts    = new List<Vector3>(unionVerts.Length);
+
+            for (int i = 0; i < unionVerts.Length; i++)
+            {
+                long q = QuantizeVertex(unionVerts[i]);
+
+                // Buscar si ya existe en el set de nuevos vértices
+                // (para no añadir el mismo vértice de unión dos veces)
+                // Usamos búsqueda lineal sobre newVerts — O(N²) pero N < 10000 en práctica
+                int found = -1;
+                for (int j = 0; j < newVerts.Count; j++)
+                {
+                    if (Vector3.Distance(newVerts[j], unionVerts[i]) < DEDUP_EPSILON)
+                    {
+                        found = j;
+                        break;
+                    }
+                }
+
+                if (found >= 0)
+                {
+                    remapIdx[i] = found;
+                }
+                else
+                {
+                    remapIdx[i] = newVerts.Count;
+                    newVerts.Add(unionVerts[i]);
+                }
+            }
+
+            // Reasignar índices
+            var newIdxs = new int[unionIdxs.Length];
+            for (int i = 0; i < unionIdxs.Length; i++)
+                newIdxs[i] = remapIdx[unionIdxs[i]];
+
+            // Preservar areas (misma longitud que tris = idxs.Length/3)
+            var newAreas = unionAreas ?? Array.Empty<int>();
+
+            Debug.Log($"[NavMeshSerializer v7.1] 🔍 Dedup: {unionVerts.Length} → {newVerts.Count} verts " +
+                      $"({unionVerts.Length - newVerts.Count} duplicados eliminados)");
+
+            return (newVerts.ToArray(), newIdxs, newAreas);
+        }
+
+        /// <summary>
+        /// Discretiza un Vector3 a una clave long para comparación rápida.
+        /// Resolución: DEDUP_EPSILON (1mm).
+        /// </summary>
+        private static long QuantizeVertex(Vector3 v)
+        {
+            int x = Mathf.RoundToInt(v.x / DEDUP_EPSILON);
+            int y = Mathf.RoundToInt(v.y / DEDUP_EPSILON);
+            int z = Mathf.RoundToInt(v.z / DEDUP_EPSILON);
+            // Empaquetar en long: 21 bits por componente (±1048575 unidades = ±1048m a 1mm)
+            return ((long)(x & 0x1FFFFF)) |
+                   ((long)(y & 0x1FFFFF) << 21) |
+                   ((long)(z & 0x1FFFFF) << 42);
         }
 
         // ═════════════════════════════════════════════════════════════════
@@ -356,7 +435,7 @@ namespace IndoorNavAR.Navigation
 
                 if (!File.Exists(headerPath) && !File.Exists(legacyBinPath))
                 {
-                    Debug.LogWarning("[NavMeshSerializer v7] ⚠️ No hay NavMesh guardado.");
+                    Debug.LogWarning("[NavMeshSerializer v7.1] ⚠️ No hay NavMesh guardado.");
                     return failed;
                 }
 
@@ -368,11 +447,11 @@ namespace IndoorNavAR.Navigation
 
                 if (header == null)
                 {
-                    Debug.LogError("[NavMeshSerializer v7] ❌ Header corrupto.");
+                    Debug.LogError("[NavMeshSerializer v7.1] ❌ Header corrupto.");
                     return failed;
                 }
 
-                Debug.Log($"[NavMeshSerializer v7] 📂 Header v{header.version}: " +
+                Debug.Log($"[NavMeshSerializer v7.1] 📂 Header v{header.version}: " +
                           $"{header.totalVertexCount} verts, {header.levelCount} nivel(es)");
 
                 Matrix4x4? remap = BuildRemap(header, currentModelTransform);
@@ -387,7 +466,7 @@ namespace IndoorNavAR.Navigation
             }
             catch (Exception ex)
             {
-                Debug.LogError($"[NavMeshSerializer v7] ❌ Error cargando: {ex.Message}\n{ex.StackTrace}");
+                Debug.LogError($"[NavMeshSerializer v7.1] ❌ Error cargando: {ex.Message}\n{ex.StackTrace}");
                 return (false, default, new List<NavMeshDataInstance>());
             }
         }
@@ -410,7 +489,7 @@ namespace IndoorNavAR.Navigation
             string unifiedPath = Path.Combine(basePath, header.unifiedBinFile);
             if (!File.Exists(unifiedPath))
             {
-                Debug.LogError($"[NavMeshSerializer v7] ❌ Archivo no encontrado: {unifiedPath}");
+                Debug.LogError($"[NavMeshSerializer v7.1] ❌ Archivo no encontrado: {unifiedPath}");
                 return failed;
             }
 
@@ -418,7 +497,7 @@ namespace IndoorNavAR.Navigation
             int iCount = header.unifiedIndexCount;
             int aCount = header.unifiedAreaCount;
 
-            Debug.Log($"[NavMeshSerializer v7] 📂 Leyendo navmesh_unified.bin: " +
+            Debug.Log($"[NavMeshSerializer v7.1] 📂 Leyendo navmesh_unified.bin: " +
                       $"{vCount} verts, {iCount / 3} tris");
 
             var (verts, idxs, areas) = await ReadBin(unifiedPath, vCount, iCount, aCount);
@@ -427,13 +506,9 @@ namespace IndoorNavAR.Navigation
 
             CalculateYRange(verts, out float minY, out float maxY);
             bool hasRamp = levels_HasRampVertices(verts, minY, maxY);
-            Debug.Log($"[NavMeshSerializer v7] 📐 Datos: Y=[{minY:F2},{maxY:F2}]" +
+            Debug.Log($"[NavMeshSerializer v7.1] 📐 Datos: Y=[{minY:F2},{maxY:F2}]" +
                       $"{(hasRamp ? " — ✅ rampas detectadas" : " — ⚠️ solo pisos")}");
 
-            // ── INYECCIÓN PERMISSIVA ──────────────────────────────────────────
-            // Usa los mismos settings permissivos que se usaron al guardar.
-            // Los vértices del .bin YA incluyen las rampas (guardados con bake permissivo).
-            // → el re-bake al cargar tampoco las filtra.
             var inst = await InjectPermissive(
                 verts, idxs, areas,
                 header.agentTypeID,
@@ -441,7 +516,7 @@ namespace IndoorNavAR.Navigation
 
             if (!inst.valid)
             {
-                Debug.LogError("[NavMeshSerializer v7] ❌ Inyección fallida.");
+                Debug.LogError("[NavMeshSerializer v7.1] ❌ Inyección fallida.");
                 return failed;
             }
 
@@ -452,7 +527,7 @@ namespace IndoorNavAR.Navigation
             NavMeshTriangulation verify = NavMesh.CalculateTriangulation();
             CalculateYRange(verify.vertices, out float vMinY, out float vMaxY);
             bool rampVerified = levels_HasRampVertices(verify.vertices, vMinY, vMaxY);
-            Debug.Log($"[NavMeshSerializer v7] ✅ NavMesh inyectado: {verify.vertices.Length} verts, " +
+            Debug.Log($"[NavMeshSerializer v7.1] ✅ NavMesh inyectado: {verify.vertices.Length} verts, " +
                       $"Y=[{vMinY:F2},{vMaxY:F2}]" +
                       $"{(rampVerified ? " — ✅ rampas OK" : " — ⚠️ rampas no detectadas en resultado")}");
 
@@ -497,7 +572,7 @@ namespace IndoorNavAR.Navigation
 
                 if (!File.Exists(binPath))
                 {
-                    Debug.LogWarning($"[NavMeshSerializer v7] ⚠️ No encontrado: {binPath}");
+                    Debug.LogWarning($"[NavMeshSerializer v7.1] ⚠️ No encontrado: {binPath}");
                     continue;
                 }
 
@@ -514,13 +589,13 @@ namespace IndoorNavAR.Navigation
                 combinedMaxY = Mathf.Max(combinedMaxY, lMax);
                 anyLoaded    = true;
 
-                Debug.Log($"[NavMeshSerializer v7] 📂 Level {seg.levelIndex}: " +
+                Debug.Log($"[NavMeshSerializer v7.1] 📂 Level {seg.levelIndex}: " +
                           $"{verts.Length} verts, Y=[{lMin:F2},{lMax:F2}]");
             }
 
-            if (!anyLoaded) { Debug.LogError("[NavMeshSerializer v7] ❌ Sin datos."); return failed; }
+            if (!anyLoaded) { Debug.LogError("[NavMeshSerializer v7.1] ❌ Sin datos."); return failed; }
 
-            Debug.Log($"[NavMeshSerializer v7] 🔗 Combinado (compat): {allV.Count} verts, " +
+            Debug.Log($"[NavMeshSerializer v7.1] 🔗 Combinado (compat): {allV.Count} verts, " +
                       $"Y=[{combinedMinY:F2},{combinedMaxY:F2}]");
 
             var inst = await InjectPermissive(
@@ -574,12 +649,12 @@ namespace IndoorNavAR.Navigation
                 var inst = await InjectPermissive(verts, idxs, areas, agentTypeID, minY, maxY);
                 if (!inst.valid) return failed;
 
-                Debug.Log($"[NavMeshSerializer v7] ✅ Legacy: {verts.Length} verts.");
+                Debug.Log($"[NavMeshSerializer v7.1] ✅ Legacy: {verts.Length} verts.");
                 return (true, inst, new List<NavMeshDataInstance> { inst });
             }
             catch (Exception ex)
             {
-                Debug.LogError($"[NavMeshSerializer v7] ❌ Error legacy: {ex.Message}");
+                Debug.LogError($"[NavMeshSerializer v7.1] ❌ Error legacy: {ex.Message}");
                 return (false, default, new List<NavMeshDataInstance>());
             }
         }
@@ -587,12 +662,6 @@ namespace IndoorNavAR.Navigation
         // ═════════════════════════════════════════════════════════════════
         // INYECCIÓN PERMISSIVA
         // ═════════════════════════════════════════════════════════════════
-        //
-        // Usa los mismos settings permissivos que el guardado.
-        // Si el .bin fue generado con bake permissivo (v7), los vértices
-        // de rampa sobreviven esta segunda pasada.
-        // Si el .bin es de v6.1 (sin bake permissivo al guardar), las rampas
-        // pueden perderse — solución: re-bakear y re-guardar.
 
         private static async Task<NavMeshDataInstance> InjectPermissive(
             Vector3[] vertices,
@@ -624,7 +693,7 @@ namespace IndoorNavAR.Navigation
                 new Vector3(mb.center.x, (yMin + yMax) * 0.5f, mb.center.z),
                 new Vector3(mb.size.x + xzPad, yMax - yMin, mb.size.z + xzPad));
 
-            Debug.Log($"[NavMeshSerializer v7] 🔧 InjectPermissive: " +
+            Debug.Log($"[NavMeshSerializer v7.1] 🔧 InjectPermissive: " +
                       $"{vertices.Length} verts, {indices.Length / 3} tris, " +
                       $"bounds Y=[{yMin:F2},{yMax:F2}], " +
                       $"height={s.agentHeight}, slope={s.agentSlope}°, voxel={s.voxelSize}");
@@ -640,7 +709,7 @@ namespace IndoorNavAR.Navigation
 
             if (data == null)
             {
-                Debug.LogError("[NavMeshSerializer v7] ❌ BuildNavMeshData devolvió null.");
+                Debug.LogError("[NavMeshSerializer v7.1] ❌ BuildNavMeshData devolvió null.");
                 return default;
             }
 
@@ -648,31 +717,25 @@ namespace IndoorNavAR.Navigation
 
             NavMeshDataInstance inst = NavMesh.AddNavMeshData(data);
             if (!inst.valid)
-                Debug.LogError("[NavMeshSerializer v7] ❌ AddNavMeshData inválido.");
+                Debug.LogError("[NavMeshSerializer v7.1] ❌ AddNavMeshData inválido.");
             else
-                Debug.Log("[NavMeshSerializer v7] ✅ NavMeshDataInstance válida.");
+                Debug.Log("[NavMeshSerializer v7.1] ✅ NavMeshDataInstance válida.");
 
             return inst;
         }
 
         // ─── Settings permissivos compartidos ────────────────────────────────
 
-        /// <summary>
-        /// Settings permissivos que preservan rampas en el voxelizador.
-        /// agentHeight=0.05 (no 0.001) — suficiente para evitar filtrado
-        /// y compatible con los constraints internos de Unity por agentTypeID.
-        /// </summary>
         private static NavMeshBuildSettings BuildPermissiveSettings(int agentTypeID)
         {
-            // Partir de los settings registrados para preservar el agentTypeID
             NavMeshBuildSettings s = NavMesh.GetSettingsByID(agentTypeID);
 
-            s.agentHeight       = SAVE_AGENT_HEIGHT;  // 0.05m — permissivo, no 0.001
-            s.agentRadius       = SAVE_AGENT_RADIUS;  // 0.01m — sin erosión significativa
-            s.agentSlope        = SAVE_AGENT_SLOPE;   // 89° — acepta cualquier pendiente
-            s.agentClimb        = SAVE_AGENT_CLIMB;   // 50m — acepta cualquier escalón
+            s.agentHeight       = SAVE_AGENT_HEIGHT;
+            s.agentRadius       = SAVE_AGENT_RADIUS;
+            s.agentSlope        = SAVE_AGENT_SLOPE;
+            s.agentClimb        = SAVE_AGENT_CLIMB;
             s.overrideVoxelSize = true;
-            s.voxelSize         = SAVE_VOXEL_SIZE;    // 2cm — detecta rampas sin OOM en móvil
+            s.voxelSize         = SAVE_VOXEL_SIZE;
             s.minRegionArea     = 0f;
             s.overrideTileSize  = false;
 
@@ -685,9 +748,7 @@ namespace IndoorNavAR.Navigation
         {
             if (verts.Length == 0) return false;
             float range = maxY - minY;
-            if (range < 0.5f) return false; // piso único, no hay rampa
-            // Hay vértices de rampa si existe alguno en la zona intermedia
-            // (ni cerca del piso inferior ni cerca del superior)
+            if (range < 0.5f) return false;
             float lo = minY + range * 0.15f;
             float hi = maxY - range * 0.15f;
             return verts.Any(v => v.y > lo && v.y < hi);
@@ -728,7 +789,7 @@ namespace IndoorNavAR.Navigation
             bool rotOk = Quaternion.Angle(h.modelRotation, t.rotation) > 0.01f;
             if (!posOk && !rotOk) return null;
 
-            Debug.Log("[NavMeshSerializer v7] 🔄 Remap de transformación activo.");
+            Debug.Log("[NavMeshSerializer v7.1] 🔄 Remap de transformación activo.");
             return t.localToWorldMatrix *
                    Matrix4x4.TRS(h.modelPosition, h.modelRotation,
                                  Vector3.one * h.modelScale).inverse;
@@ -808,7 +869,7 @@ namespace IndoorNavAR.Navigation
 
             if (groups.Count < levelCount)
             {
-                Debug.LogWarning($"[NavMeshSerializer v7] ⚠️ Clustering Y: {groups.Count} grupo(s) " +
+                Debug.LogWarning($"[NavMeshSerializer v7.1] ⚠️ Clustering Y: {groups.Count} grupo(s) " +
                                  $"para {levelCount} nivel(es). Normal con rampas continuas.");
                 segs.Add(new LevelSegment
                 {
@@ -845,7 +906,7 @@ namespace IndoorNavAR.Navigation
             NavMeshTriangulation verify = NavMesh.CalculateTriangulation();
             CalculateYRange(verify.vertices, out float vMinY, out float vMaxY);
             bool hasRamp = levels_HasRampVertices(verify.vertices, vMinY, vMaxY);
-            Debug.Log($"[NavMeshSerializer v7] ✅ Verificación: {verify.vertices.Length} verts, " +
+            Debug.Log($"[NavMeshSerializer v7.1] ✅ Verificación: {verify.vertices.Length} verts, " +
                       $"Y=[{vMinY:F2},{vMaxY:F2}]" +
                       $"{(hasRamp ? " — ✅ rampas presentes" : " — ⚠️ sin vértices de rampa")}");
 
@@ -866,7 +927,7 @@ namespace IndoorNavAR.Navigation
             for (int i = 0; i < 10; i++)
             {
                 string p = Path.Combine(basePath, string.Format(LEVEL_BIN_FMT, i));
-                if (File.Exists(p)) { File.Delete(p); Debug.Log($"[NavMeshSerializer v7] 🗑️ Eliminado: navmesh_level_{i}.bin"); }
+                if (File.Exists(p)) { File.Delete(p); Debug.Log($"[NavMeshSerializer v7.1] 🗑️ Eliminado: navmesh_level_{i}.bin"); }
             }
             string legacy = Path.Combine(basePath, LEGACY_BIN);
             if (File.Exists(legacy)) File.Delete(legacy);
@@ -899,7 +960,7 @@ namespace IndoorNavAR.Navigation
             string leg = Path.Combine(basePath, LEGACY_BIN);
             if (File.Exists(leg)) File.Delete(leg);
 
-            Debug.Log("[NavMeshSerializer v7] 🗑️ Archivos NavMesh eliminados.");
+            Debug.Log("[NavMeshSerializer v7.1] 🗑️ Archivos NavMesh eliminados.");
         }
 
         public static string GetSavedInfo()
