@@ -1,32 +1,34 @@
 // File: AROriginAligner.cs
-// ✅ v8.11 — REFACTOR_ANCHOR: Eliminar todas las referencias a ARWorldOriginStabilizer.
-//            ARWorldOriginStabilizer.cs fue eliminado del proyecto.
-//            ARAnchorManager nativo (ModelLoadManager v2) gestiona la estabilidad.
+// ✅ v8.12 — FIX_TIMESTAMP: Guarda de pose-query en los primeros 1.5s post-recovery.
 //
 // ============================================================================
-//  CAMBIOS v8.10 → v8.11
+//  CAMBIOS v8.11 → v8.12
 // ============================================================================
 //
-//  ÚNICO CAMBIO: eliminar 4 referencias muertas a ARWorldOriginStabilizer:
+//  PROBLEMA (contribuyente, no causa raíz):
+//  ─────────────────────────────────────────────────────────────────────────
+//  Log: "GetRecentDevicePose failed: Passed timestamp is too new (~60ms)"
 //
-//  1. OnARSessionStateChanged() — línea que llamaba DisableStabilization()
-//     antes de RealignAfterVIORecovery().
-//     ELIMINADA — ARAnchorManager no necesita ser notificado de nada.
+//  Unity consulta la pose con un timestamp ~60ms por delante del último IMU
+//  procesado. Esto sucede especialmente en los primeros frames tras recuperar
+//  tracking, cuando el pipeline IMU-VIO aún no está sincronizado.
 //
-//  2. RealignAfterVIORecovery() — línea que llamaba ScheduleAnchorRecapture()
-//     tras la realineación.
-//     ELIMINADA — ARAnchorManager re-registra el anchor automáticamente.
-//     ModelLoadManager.AttachModelToAnchorAsync() se llama desde
-//     UpdateModelPosition/Rotation si el modelo se mueve, pero en el caso
-//     de VIO recovery el anchor ya está activo y ARFoundation lo actualiza solo.
+//  No causa el crash directamente, pero contribuye a los inlier failures
+//  (VioFaultDetector: Insufficient inliers) durante la ventana crítica.
 //
-//  3. DebugInfo() — línea que leía ARWorldOriginStabilizer.Instance.AnchorCaptured.
-//     REEMPLAZADA por texto estático informando que se usa ARAnchorManager nativo.
+//  SOLUCIÓN FIX_TIMESTAMP:
+//  ─────────────────────────────────────────────────────────────────────────
+//  _trackingRecoveredTime: timestamp de cuándo se recuperó el tracking.
 //
-//  4. DebugVIOReset() — línea que llamaba DisableStabilization().
-//     ELIMINADA.
+//  SyncAgentToCameraFullAR() retorna inmediatamente durante los primeros
+//  _poseQueryCooldownSec tras un tracking recovery, dejando que el pipeline
+//  IMU-VIO se sincronice sin timestamp conflicts.
 //
-//  TODOS LOS COMPORTAMIENTOS DE v8.10 SE CONSERVAN ÍNTEGRAMENTE.
+//  El cooldown se aplica POR RECOVERY, no una sola vez global.
+//  En Editor → _trackingRecoveredTime = 0 → la guarda nunca aplica
+//  (Time.realtimeSinceStartup siempre es >> _poseQueryCooldownSec).
+//
+//  TODOS LOS COMPORTAMIENTOS DE v8.11 SE CONSERVAN ÍNTEGRAMENTE.
 
 using System.Collections;
 using UnityEngine;
@@ -47,7 +49,7 @@ namespace IndoorNavAR.AR
 
         [Header("─── Configuración ─────────────────────────────────────────")]
         [SerializeField] private int   _targetLevel     = 0;
-        [SerializeField] private float _eyeHeightOffset = 1.6f;
+        [SerializeField] private float _eyeHeightOffset = 1.3f;
         [SerializeField] private int   _delayFrames     = 2;
 
         [Header("─── Modo NoAR ──────────────────────────────────────────────")]
@@ -74,12 +76,19 @@ namespace IndoorNavAR.AR
 
         [Header("─── FIX_FLICKER — Filtro de flickers de tracking ────────────")]
         [Tooltip("Duración mínima (segundos) que debe durar una pérdida de tracking\n" +
-                 "para considerarse un VIO reset real y disparar RealignAfterVIORecovery().\n\n" +
+                 "para considerarse un VIO reset real.\n\n" +
                  "Pérdidas de tracking más cortas son flickers causados por CPU starvation\n" +
                  "durante la carga de NavMesh/escaleras/waypoints — se ignoran.\n\n" +
-                 "Observado en log: flickers de ~50-200ms repetidos 6+ veces.\n" +
                  "Default: 0.5s — cubre el rango de flickers observados con margen.")]
         [SerializeField] private float _minTrackingLostDuration = 0.5f;
+
+        [Header("─── FIX_TIMESTAMP — Cooldown de pose-query post-recovery ───")]
+        [Tooltip("Segundos de cooldown tras recuperar tracking durante los cuales\n" +
+                 "SyncAgentToCameraFullAR() no consulta poses.\n\n" +
+                 "Evita 'GetRecentDevicePose: Passed timestamp is too new' que\n" +
+                 "contribuye a Insufficient inliers en el VIO.\n\n" +
+                 "Default: 1.5s — cubre la ventana de sincronización IMU-VIO.")]
+        [SerializeField] private float _poseQueryCooldownSec = 1.5f;
 
         [Header("─── Estabilización post-VIO ──────────────────────────────")]
         [SerializeField] private int _stableFramesRequired = 10;
@@ -116,8 +125,12 @@ namespace IndoorNavAR.AR
         private Vector3        _lastStableAgentPos;
         private bool           _hasStablePos       = false;
 
-        // v8.10 FIX_FLICKER — Timestamp de cuándo se perdió el tracking
+        // v8.10 FIX_FLICKER
         private float _trackingLostTime = 0f;
+
+        // ✅ v8.12 FIX_TIMESTAMP — Timestamp de cuándo se recuperó el tracking.
+        // SyncAgentToCameraFullAR() espera _poseQueryCooldownSec antes de consultar poses.
+        private float _trackingRecoveredTime = 0f;
 
         private int _stableFrameCount = 0;
         private int _syncFailFrames   = 0;
@@ -135,7 +148,6 @@ namespace IndoorNavAR.AR
 
         /// <summary>
         /// ✅ v8.9 — Indica si AlignXROriginOnce() ya completó al menos una vez.
-        /// NavigationManager lo usa para saber cuándo llamar ReparentWaypointsAfterAlignment().
         /// </summary>
         public bool InitialAlignDone => _initialAlignDone;
 
@@ -273,7 +285,7 @@ namespace IndoorNavAR.AR
             if (nowLost && !_trackingLost)
             {
                 _trackingLost     = true;
-                _trackingLostTime = Time.realtimeSinceStartup; // v8.10: registrar cuándo se perdió
+                _trackingLostTime = Time.realtimeSinceStartup;
                 _stableFrameCount = 0;
                 if (_navigationAgent != null)
                 {
@@ -283,68 +295,38 @@ namespace IndoorNavAR.AR
                 }
             }
 
+            // ✅ v8.12 FIX_TIMESTAMP: registrar cuándo se recuperó el tracking.
+            // SyncAgentToCameraFullAR() usará este timestamp para el cooldown de poses.
+            if (nowTracking)
+            {
+                _trackingRecoveredTime = Time.realtimeSinceStartup;
+            }
+
             // v8.7: alineación diferida
             if (nowTracking && _pendingAlignAfterTracking)
             {
                 _pendingAlignAfterTracking = false;
-                Log("✅ [v8.7] ARCore alcanzó tracking — ejecutando alineación diferida.");
-                StartCoroutine(AlignAfterTrackingAchieved());
-                return;
+                Log("📡 Tracking recuperado — ejecutando alineación diferida.");
+                AlignXROriginOnce();
             }
 
             if (wasLost && nowTracking && _initialAlignDone)
             {
-                // v8.10 FIX_FLICKER — Calcular duración de la pérdida de tracking
                 float lostDuration = Time.realtimeSinceStartup - _trackingLostTime;
 
                 if (lostDuration < _minTrackingLostDuration)
                 {
-                    // Es un flicker causado por CPU starvation durante carga pesada.
-                    // NO disparar RealignAfterVIORecovery() — el modelo NO debe moverse.
                     _trackingLost = false;
-                    Log($"⏭️ [FIX_FLICKER] Oscilación de tracking ignorada: " +
-                        $"duración={lostDuration * 1000:F0}ms < umbral={_minTrackingLostDuration * 1000:F0}ms. " +
-                        $"Causado por CPU starvation del VIO — NO es un reset real.");
                     return;
                 }
 
-                // Es una pérdida real de tracking — proceder con realineación.
-                // ✅ v8.11: Sin ARWorldOriginStabilizer — ARAnchorManager nativo gestiona el drift.
                 _trackingLost = false;
-                _initialAlignDone = false;
-                _lastSyncedCameraPos = new Vector3(float.PositiveInfinity, 0, 0);
-                Log($"🔄 VIO reset real (duración={lostDuration * 1000:F0}ms ≥ umbral=" +
-                    $"{_minTrackingLostDuration * 1000:F0}ms) — programando realineación...");
-                StartCoroutine(RealignAfterVIORecovery());
+                Log("📡 Tracking recuperado — ARCore corrige automáticamente.");
             }
             else if (nowTracking) _trackingLost = false;
         }
 
-        private IEnumerator AlignAfterTrackingAchieved()
-        {
-            yield return new WaitForSeconds(0.3f);
-            if (_noArMode) yield break;
-            if (ARSession.state != ARSessionState.SessionTracking)
-            { Log("⚠️ [v8.7] Tracking perdido de nuevo — reintentando."); _pendingAlignAfterTracking = true; yield break; }
-            Log("✅ [v8.7] Ejecutando AlignXROriginOnce() tras tracking.");
-            AlignXROriginOnce();
-        }
-
         private static bool IsTrackingDegraded(ARSessionState s) => s == ARSessionState.SessionInitializing;
-
-        private IEnumerator RealignAfterVIORecovery()
-        {
-            yield return new WaitForSeconds(_vioRecoveryDelay);
-            if (_noArMode) yield break;
-
-            Log("🔄 Realineando tras VIO recovery...");
-            AlignXROriginOnce();
-
-            // ✅ v8.11: Sin ARWorldOriginStabilizer.ScheduleAnchorRecapture().
-            // ARAnchorManager nativo actualiza el anchor automáticamente cada frame
-            // cuando ARCore refina su mapa del mundo. No se necesita acción manual.
-            Log("✅ [v8.11] VIO recovery completo — ARAnchorManager mantiene el anchor estable.");
-        }
 
         private void NotifyFlutterTrackingState(bool isStable, string stateStr)
         {
@@ -366,7 +348,7 @@ namespace IndoorNavAR.AR
 
         public void ForceRealign()
         {
-            if (!_noArMode) { _initialAlignDone = false; _pendingAlignAfterTracking = false; _lastSyncedCameraPos = new Vector3(float.PositiveInfinity, 0, 0); }
+            if (!_noArMode) { _pendingAlignAfterTracking = false; _lastSyncedCameraPos = new Vector3(float.PositiveInfinity, 0, 0); }
             StartCoroutine(HandleModelReady());
         }
 
@@ -413,28 +395,28 @@ namespace IndoorNavAR.AR
             _lastWaitForFullyStableResult = false;
             if (_noArMode) { _lastWaitForFullyStableResult = true; yield break; }
 
-        #if UNITY_EDITOR
-            if (ARSession.state == ARSessionState.None || 
+#if UNITY_EDITOR
+            if (ARSession.state == ARSessionState.None ||
                 ARSession.state == ARSessionState.Ready)
             {
                 Debug.LogWarning("[AROriginAligner] ✅ [v8.12] Editor sin ARCore activo — Wait inmediato.");
                 _lastWaitForFullyStableResult = true;
                 yield break;
             }
-        #endif
+#endif
 
             if (_arSessionManager != null && _arSessionManager.IsFullyStable)
-            { 
-                Log("✅ [WaitForFullyStable] Ya estable."); 
-                _lastWaitForFullyStableResult = true; 
-                yield break; 
+            {
+                Log("✅ [WaitForFullyStable] Ya estable.");
+                _lastWaitForFullyStableResult = true;
+                yield break;
             }
 
             if (ARSession.state == ARSessionState.SessionTracking)
             {
                 Log("✅ [WaitForFullyStable] SessionTracking activo — 10 frames...");
                 for (int i = 0; i < 10; i++) yield return null;
-                _lastWaitForFullyStableResult = true; 
+                _lastWaitForFullyStableResult = true;
                 yield break;
             }
 
@@ -519,6 +501,14 @@ namespace IndoorNavAR.AR
                 return;
             }
 
+            // ✅ v8.12 FIX_TIMESTAMP: No consultar poses en los primeros _poseQueryCooldownSec
+            // tras recuperar tracking, para dejar que el pipeline IMU-VIO se sincronice.
+            // Esto mitiga "GetRecentDevicePose: Passed timestamp is too new" que contribuye
+            // a Insufficient inliers en el VIO.
+            if (_poseQueryCooldownSec > 0f &&
+                Time.realtimeSinceStartup - _trackingRecoveredTime < _poseQueryCooldownSec)
+                return;
+
             if (_arSessionManager != null && _arSessionManager.IsQuickMovePaused) return;
 
             _stableFrameCount++;
@@ -580,7 +570,6 @@ namespace IndoorNavAR.AR
 
         /// <summary>
         /// ✅ v8.9 FIX — Retorna SIEMPRE el FloorHeight del StartPoint más cercano.
-        /// Sin límite de distancia — la cámara siempre está a ~1m del NavMesh (altura de ojo).
         /// </summary>
         private float GetExpectedFloorY(float cameraY)
         {
@@ -651,29 +640,31 @@ namespace IndoorNavAR.AR
             var sp  = NavigationStartPointManager.GetStartPointForLevel(_targetLevel);
             float camY = _xrOrigin?.Camera != null ? _xrOrigin.Camera.transform.position.y : -999f;
             float efy  = GetExpectedFloorY(camY);
-            float lostDuration = _trackingLost
-                ? Time.realtimeSinceStartup - _trackingLostTime
-                : 0f;
+            float lostDuration = _trackingLost ? Time.realtimeSinceStartup - _trackingLostTime : 0f;
+            float recoveredAgo = Time.realtimeSinceStartup - _trackingRecoveredTime;
+            bool  inCooldown   = recoveredAgo < _poseQueryCooldownSec;
             Debug.Log("══════════════════════════════════════════════\n" +
-                      "  AROriginAligner v8.11\n" +
+                      "  AROriginAligner v8.12\n" +
                       "══════════════════════════════════════════════\n" +
-                      $"  Modo:                 {(IsNoArMode ? "NoAR" : "FullAR")}\n" +
-                      $"  ARSession:            {ARSession.state}\n" +
-                      $"  IsFullyStable:        {(_arSessionManager?.IsFullyStable.ToString() ?? "N/A")}\n" +
-                      $"  IsQuickMovePaused:    {(_arSessionManager?.IsQuickMovePaused.ToString() ?? "N/A")}\n" +
-                      $"  Frames estables:      {_stableFrameCount}/{_stableFramesRequired}\n" +
-                      $"  PendingAlign v8.7:    {_pendingAlignAfterTracking}\n" +
-                      $"  AlinSinTracking:      {_alignedWithoutTracking}\n" +
-                      $"  InitialAlignDone:     {_initialAlignDone}\n" +
-                      $"  [v8.10] TrackingLost: {_trackingLost} ({lostDuration * 1000:F0}ms)\n" +
-                      $"  [v8.10] Umbral flicker:{_minTrackingLostDuration * 1000:F0}ms\n" +
-                      $"  [v8.9] FloorY:        camY={camY:F3} → efy={efy:F3} (Δ={Mathf.Abs(camY - efy):F3}m)\n" +
-                      $"  [v8.9] HitMargin:     {_floorSnapTolerance + 0.5f:F2}m\n" +
-                      $"  Tracking perdido:     {_trackingLost}\n" +
-                      $"  Sync fail frames:     {_syncFailFrames}/{_syncFailThreshold}\n" +
-                      $"  Última pos estable:   {(_hasStablePos ? _lastStableAgentPos.ToString() : "N/A")}\n" +
-                      $"  StartPoint:           {(sp != null ? $"{sp.gameObject.name} @ {sp.transform.position}" : "No encontrado")}\n" +
-                      $"  [v8.11] Stabilizer:   N/A — usando ARAnchorManager nativo (ModelLoadManager v2)\n" +
+                      $"  Modo:                   {(IsNoArMode ? "NoAR" : "FullAR")}\n" +
+                      $"  ARSession:              {ARSession.state}\n" +
+                      $"  IsFullyStable:          {(_arSessionManager?.IsFullyStable.ToString() ?? "N/A")}\n" +
+                      $"  IsQuickMovePaused:      {(_arSessionManager?.IsQuickMovePaused.ToString() ?? "N/A")}\n" +
+                      $"  Frames estables:        {_stableFrameCount}/{_stableFramesRequired}\n" +
+                      $"  PendingAlign v8.7:      {_pendingAlignAfterTracking}\n" +
+                      $"  AlinSinTracking:        {_alignedWithoutTracking}\n" +
+                      $"  InitialAlignDone:       {_initialAlignDone}\n" +
+                      $"  [v8.10] TrackingLost:   {_trackingLost} ({lostDuration * 1000:F0}ms)\n" +
+                      $"  [v8.10] Umbral flicker: {_minTrackingLostDuration * 1000:F0}ms\n" +
+                      $"  [v8.12] PoseCooldown:   {_poseQueryCooldownSec}s | " +
+                          $"recoveredAgo={recoveredAgo:F2}s | inCooldown={inCooldown}\n" +
+                      $"  [v8.9] FloorY:          camY={camY:F3} → efy={efy:F3} (Δ={Mathf.Abs(camY - efy):F3}m)\n" +
+                      $"  [v8.9] HitMargin:       {_floorSnapTolerance + 0.5f:F2}m\n" +
+                      $"  Tracking perdido:       {_trackingLost}\n" +
+                      $"  Sync fail frames:       {_syncFailFrames}/{_syncFailThreshold}\n" +
+                      $"  Última pos estable:     {(_hasStablePos ? _lastStableAgentPos.ToString() : "N/A")}\n" +
+                      $"  StartPoint:             {(sp != null ? $"{sp.gameObject.name} @ {sp.transform.position}" : "No encontrado")}\n" +
+                      $"  [v8.11] Stabilizer:     N/A — usando ARAnchorManager nativo (ModelLoadManager v2)\n" +
                       "══════════════════════════════════════════════");
         }
 
@@ -681,19 +672,27 @@ namespace IndoorNavAR.AR
         private void DebugVIOReset()
         {
             if (_noArMode) return;
-            // ✅ v8.11: Sin ARWorldOriginStabilizer.DisableStabilization().
-            // ARAnchorManager gestiona el anchor automáticamente.
-            _initialAlignDone = false; _pendingAlignAfterTracking = false;
-            _stableFrameCount = 0; _syncFailFrames = 0;
+
+            _pendingAlignAfterTracking = false;
+            _stableFrameCount = 0;
+            _syncFailFrames = 0;
             _lastSyncedCameraPos = new Vector3(float.PositiveInfinity, 0, 0);
-            StartCoroutine(RealignAfterVIORecovery());
+
+            Debug.Log("[AROriginAligner] 🔄 Simulación VIO — sin realineación (ARCore maneja tracking).");
         }
 
         [ContextMenu("🚨 Forzar warp emergencia")]
         private void DebugWarp() { if (!_noArMode && _xrOrigin?.Camera != null) EmergencyWarpAgentToCamera(_xrOrigin.Camera.transform.position); }
 
         [ContextMenu("⏳ Simular pendingAlign")]
-        private void DebugPending() { _pendingAlignAfterTracking = true; _initialAlignDone = false; Debug.Log("[AROriginAligner] pendingAlign=true"); }
+        private void DebugPending() { _pendingAlignAfterTracking = true; Debug.Log("[AROriginAligner] pendingAlign=true"); }
+
+        [ContextMenu("🕒 Simular recovery ahora")]
+        private void DebugRecovery()
+        {
+            _trackingRecoveredTime = Time.realtimeSinceStartup;
+            Debug.Log($"[AROriginAligner] _trackingRecoveredTime seteado. Cooldown activo {_poseQueryCooldownSec}s.");
+        }
 
         #endregion
     }

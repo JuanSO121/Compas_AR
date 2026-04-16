@@ -1,40 +1,21 @@
 // File: ModelLoadManager.cs
-// ✅ v2 — REFACTOR_ANCHOR: Reemplazar ARWorldOriginStabilizer con ARAnchorManager nativo.
+// ✅ v2.1 — Sin cambios funcionales respecto a v2.
+//           Bump de versión para consistencia con el resto del sistema (FIX_VIO suite).
 //
 // ============================================================================
-//  CAMBIOS FIX_CPU → v2
+//  NOTA v2.1
 // ============================================================================
 //
-//  PROBLEMA RAÍZ (documentación oficial AR Foundation 6.1):
-//    "Without anchors, GameObjects in your scene can move uncontrollably when
-//    the AR session's tracking state changes."
-//    La solución correcta es parentar el contenido a un ARAnchor gestionado
-//    por ARAnchorManager — el sistema lo actualiza automáticamente en cada frame.
+//  ModelLoadManager no requiere cambios directos para el FIX_VIO.
+//  Los tres fixes principales se aplican en:
+//    - PersistenceManager.cs  v14.4 (FIX_VIO — WaitForVIOStableBeforeHeavyWork)
+//    - NavigationManager.cs   FIX#14 (FIX_RAM — ReleaseMemoryBeforeARStart)
+//    - AROriginAligner.cs     v8.12  (FIX_TIMESTAMP — cooldown de pose-query)
 //
-//    ARWorldOriginStabilizer era un sistema casero que introducía una ventana
-//    de tiempo donde el modelo ya se movió pero la corrección aún no se aplicó.
-//    ARAnchorManager hace esto en C++ nativo, por frame, sin esa ventana.
+//  DisablePlaneDetectionAfterPlacement() y AttachModelToAnchorAsync() de v2
+//  ya contribuyen a liberar CPU para el VIO y se conservan sin cambios.
 //
-//  CAMBIOS v2:
-//  ─────────────────────────────────────────────────────────────────────────
-//  1. SetupStabilizerAsync() y SetupStabilizerWithDelayAsync() → eliminados.
-//     Reemplazados por AttachModelToAnchorAsync().
-//
-//  2. AttachModelToAnchorAsync():
-//     - Crea un ARAnchor real en la posición del modelo via TryAddAnchorAsync.
-//     - Parentar el modelo al anchor → ARFoundation mantiene todo estable.
-//     - Las escaleras y waypoints son hijos del modelo → también se estabilizan.
-//
-//  3. RestoreModelTransform(), LoadModel():
-//     - Llaman AttachModelToAnchorAsync() en lugar de SetupStabilizerAsync().
-//
-//  4. UnloadCurrentModel():
-//     - Elimina el anchor via TryRemoveAnchor.
-//     - Sin llamadas a ARWorldOriginStabilizer.
-//
-//  5. FIX_CPU: DisablePlaneDetectionAfterPlacement() se conserva íntegramente.
-//
-//  TODO LO DEMÁS ES IDÉNTICO A FIX_CPU.
+//  TODO LO DEMÁS ES IDÉNTICO A v2.
 
 using System;
 using System.Collections.Generic;
@@ -111,7 +92,6 @@ namespace IndoorNavAR.Core.Managers
             InitializeModelParent();
             ValidateModelPrefab();
 
-            // Auto-encontrar ARAnchorManager si no está asignado en el Inspector
             if (_anchorManager == null)
                 _anchorManager = FindFirstObjectByType<ARAnchorManager>();
         }
@@ -455,16 +435,7 @@ namespace IndoorNavAR.Core.Managers
 
         /// <summary>
         /// ✅ v2 — Crea un ARAnchor real y parentar el modelo al anchor.
-        ///
-        /// ARAnchorManager gestiona el drift automáticamente a partir de aquí.
-        /// Las escaleras y waypoints son hijos del modelo → también se estabilizan.
-        ///
-        /// Documentación AR Foundation 6.1:
-        ///   "Parent your content to an ARAnchor managed by ARAnchorManager —
-        ///   the system updates it automatically every frame."
-        ///
-        /// ✅ FIX_CPU: Después de anclar el modelo, llamamos
-        /// ARSessionManager.DisablePlaneDetection() para liberar CPU al VIO.
+        /// ✅ FIX_CPU: Después de anclar el modelo, libera plane detection para el VIO.
         /// </summary>
         private async Task AttachModelToAnchorAsync(
             GameObject model,
@@ -474,14 +445,12 @@ namespace IndoorNavAR.Core.Managers
         {
             if (model == null) return;
 
-            // Delay antes de crear el anchor
             if (isRestore && _anchorRestoreDelayMs > 0)
                 await Task.Delay(_anchorRestoreDelayMs);
             else
                 for (int i = 0; i < _anchorCreateDelayFrames; i++)
                     await Task.Yield();
 
-            // Limpiar anchor anterior si existe
             if (_currentAnchor != null)
             {
                 if (_anchorManager != null)
@@ -497,12 +466,10 @@ namespace IndoorNavAR.Core.Managers
                 return;
             }
 
-            // Solo crear anchor con tracking estable
             if (ARSession.state != ARSessionState.SessionTracking)
             {
                 Debug.LogWarning($"[ModelLoadManager] ⚠️ ARSession en {ARSession.state} — " +
-                                 "modelo sin anchor (tracking no estable). " +
-                                 "ARFoundation no puede crear anchors sin SessionTracking.");
+                                 "modelo sin anchor (tracking no estable).");
                 DisablePlaneDetectionAfterPlacement();
                 return;
             }
@@ -514,10 +481,6 @@ namespace IndoorNavAR.Core.Managers
                 if (result.status.IsSuccess() && result.value != null && result.value.enabled)
                 {
                     _currentAnchor = result.value;
-
-                    // ✅ CLAVE: parentar el modelo al anchor.
-                    // ARFoundation mueve el ARAnchor cuando el VIO corrige —
-                    // todo lo de abajo (escaleras, waypoints) sigue automáticamente.
                     model.transform.SetParent(_currentAnchor.transform, worldPositionStays: true);
 
                     Debug.Log($"[ModelLoadManager] ⚓ Modelo anclado a ARAnchor nativo.\n" +
@@ -537,7 +500,6 @@ namespace IndoorNavAR.Core.Managers
                 Debug.LogError($"[ModelLoadManager] ❌ AttachModelToAnchorAsync: {ex.Message}");
             }
 
-            // ✅ FIX_CPU: Liberar CPU del plane subsystem ahora que el modelo está posicionado.
             DisablePlaneDetectionAfterPlacement();
         }
 
@@ -597,8 +559,7 @@ namespace IndoorNavAR.Core.Managers
                 if (obstacle != null)
                 {
                     obstacle.enabled = false;
-                    Debug.Log($"[ModelLoadManager]   🚫 '{child.name}' — NavMeshObstacle desactivado " +
-                              "(carving detenido, NavMesh intacto).");
+                    Debug.Log($"[ModelLoadManager]   🚫 '{child.name}' — NavMeshObstacle desactivado.");
                 }
 
                 if (_destroyObstacleColliders)
@@ -649,7 +610,6 @@ namespace IndoorNavAR.Core.Managers
             if (_currentModel == null) return;
             if (_autoConnectStairs) DisconnectNavigationSystems();
 
-            // ✅ v2: Eliminar anchor via ARAnchorManager nativo
             if (_currentAnchor != null)
             {
                 if (_anchorManager != null && _currentAnchor.enabled)
@@ -666,7 +626,6 @@ namespace IndoorNavAR.Core.Managers
             Debug.Log("[ModelLoadManager] 🗑️ Modelo descargado");
             PublishMessage("Modelo descargado", MessageType.Info);
 
-            // Re-habilitar plane detection cuando el modelo se descarga
             var arSessionManager = FindFirstObjectByType<AR.ARSessionManager>();
             arSessionManager?.EnablePlaneDetection();
         }
@@ -740,7 +699,7 @@ namespace IndoorNavAR.Core.Managers
             var arMgr = FindFirstObjectByType<AR.ARSessionManager>();
 
             Debug.Log(
-                $"[ModelLoadManager] v2\n" +
+                $"[ModelLoadManager] v2.1\n" +
                 $"  Prefab:           {(_modelPrefab ? _modelPrefab.name : "None")}\n" +
                 $"  Loaded:           {_isModelLoaded}\n" +
                 $"  Model pos:        {(_currentModel ? _currentModel.transform.position.ToString("F3") : "N/A")}\n" +

@@ -1,59 +1,23 @@
 // File: ARPerformanceManager.cs
-// ✅ NUEVO — Gestión centralizada de CPU para ARCore / AR Foundation.
+// ✅ v1.1 — Sin cambios funcionales respecto a v1.0.
+//           Bump de versión para consistencia con el resto del sistema (FIX_VIO suite).
 //
 // ============================================================================
-//  PROBLEMA RAÍZ (documentado en logs del dispositivo Infinix X6887)
+//  NOTA v1.1
 // ============================================================================
 //
-//  Los logs muestran este patrón repetido:
+//  ARPerformanceManager no requiere cambios directos para el FIX_VIO.
+//  El sistema ya implementa:
+//    - targetFrameRate = 30 durante navegación normal (libera CPU al VIO).
+//    - targetFrameRate = 15 durante HeavyLoad (cede CPU máxima al VIO).
+//    - ARSession.matchFrameRateRequested = true (elimina timestamp conflicts).
 //
-//    RESOURCE_EXHAUSTED: Behind by: 156ms, skip current frame
-//    RESOURCE_EXHAUSTED: Behind by: 180ms, skip current frame
-//    FeatureExtraction is taking too long: 112ms
-//    Skipped 30 frames! / Skipped 67 frames!
+//  Los tres fixes principales se aplican en archivos externos:
+//    - PersistenceManager.cs  v14.4 (FIX_VIO — WaitForVIOStableBeforeHeavyWork)
+//    - NavigationManager.cs   FIX#14 (FIX_RAM — ReleaseMemoryBeforeARStart)
+//    - AROriginAligner.cs     v8.12  (FIX_TIMESTAMP — cooldown de pose-query)
 //
-//  Causa: el estimador VIO (Visual-Inertial Odometry) de ARCore comparte CPU
-//  con Unity. Cuando Unity satura el main thread (NavMesh, escaleras, GC),
-//  el VIO no procesa frames a tiempo → tracking flicker → realineaciones
-//  → waypoints descolocados.
-//
-//  FUENTE OFICIAL — ARCore Performance Considerations:
-//    "When an ARCore session is active, your app must share limited mobile CPU
-//     and GPU resources with ARCore. CPU bound apps can compete with the CPU
-//     resources required for motion tracking."
-//    https://developers.google.com/ar/develop/performance
-//
-//  FUENTE OFICIAL — Unity Application.targetFrameRate:
-//    "Android: Content is rendered at fixed 30fps to conserve battery power
-//     when targetFrameRate = -1."
-//    "You can also reduce your game's frame rate to conserve battery life
-//     and avoid overheating on mobile devices."
-//    https://docs.unity3d.com/ScriptReference/Application-targetFrameRate.html
-//
-// ============================================================================
-//  SOLUCIONES IMPLEMENTADAS
-// ============================================================================
-//
-//  1. TARGET FRAMERATE = 30 en dispositivo
-//     Libera ciclos de CPU para el VIO de ARCore. El VIO necesita ~30Hz
-//     para funcionar correctamente. Unity a 60fps compite directamente.
-//
-//  2. ARSession.matchFrameRateRequested = true
-//     Le indica a AR Foundation que sincronice el render con el frame AR,
-//     evitando que Unity pida frames antes de que ARCore los tenga listos.
-//     Esto elimina la mayoría de los "GetRecentDevicePose failed: too new".
-//
-//  3. FASES DE CARGA — throttling durante operaciones pesadas
-//     NavMesh restore, escaleras y waypoints se marcan como "fases de carga".
-//     Durante estas fases, targetFrameRate baja a 15fps para maximizar
-//     el tiempo de CPU disponible para el VIO.
-//     Esto elimina los flickers de 66-430ms vistos en los logs.
-//
-//  4. PUNTO DE ENTRADA ÚNICO
-//     ARSessionManager, PersistenceManager y ModelLoadManager notifican
-//     al ARPerformanceManager cuando inician/finalizan operaciones pesadas.
-//
-// ============================================================================
+//  TODO LO DEMÁS ES IDÉNTICO A v1.0.
 
 using System.Collections;
 using UnityEngine;
@@ -103,16 +67,6 @@ namespace IndoorNavAR.AR
         {
             ApplyNormalFrameRate();
 
-            // ARSession.matchFrameRateRequested = true es la solución oficial
-            // para el error "GetRecentDevicePose failed: Passed timestamp is too new".
-            // Cuando Unity renderiza más rápido que ARCore produce frames,
-            // el plugin pide poses de timestamps que el VIO aún no procesó.
-            // Con matchFrameRate=true, Unity espera al frame AR antes de renderizar.
-            //
-            // FUENTE: AR Foundation docs — ARSession component reference
-            // "If True, the session will block execution until a new AR frame
-            //  is available and set Application.targetFrameRate to match the
-            //  native update frequency of the AR session."
             if (_matchARFrameRate)
             {
                 var arSession = FindFirstObjectByType<ARSession>();
@@ -141,7 +95,7 @@ namespace IndoorNavAR.AR
 
             if (!_isHeavyLoad)
             {
-                _isHeavyLoad       = true;
+                _isHeavyLoad        = true;
                 _heavyLoadStartTime = Time.realtimeSinceStartup;
                 ApplyHeavyLoadFrameRate();
                 Log($"🔴 HeavyLoad BEGIN [{_heavyLoadCount} ops]: {reason}");
@@ -187,7 +141,7 @@ namespace IndoorNavAR.AR
 
         private IEnumerator ReturnToNormalAfterMinDuration()
         {
-            float elapsed = Time.realtimeSinceStartup - _heavyLoadStartTime;
+            float elapsed   = Time.realtimeSinceStartup - _heavyLoadStartTime;
             float remaining = _minHeavyLoadDuration - elapsed;
 
             if (remaining > 0f)
@@ -196,7 +150,6 @@ namespace IndoorNavAR.AR
                 yield return new WaitForSeconds(remaining);
             }
 
-            // Verificar que no se haya iniciado otra operación pesada mientras esperábamos
             if (_heavyLoadCount == 0)
             {
                 _isHeavyLoad = false;
@@ -210,10 +163,8 @@ namespace IndoorNavAR.AR
 
         private void ApplyNormalFrameRate()
         {
-            // En Android con ARSession.matchFrameRateRequested=true, el AR session
-            // ya controla el framerate. targetFrameRate actúa como límite superior.
             Application.targetFrameRate = _normalFrameRate;
-            QualitySettings.vSyncCount  = 0; // Mobile ignora vSync, pero por consistencia
+            QualitySettings.vSyncCount  = 0;
             Log($"✅ TargetFrameRate → {_normalFrameRate}fps (modo normal)");
         }
 
@@ -234,7 +185,7 @@ namespace IndoorNavAR.AR
         [ContextMenu("ℹ️ Estado")]
         private void DebugState()
         {
-            Debug.Log($"[ARPerfMgr] isHeavyLoad={_isHeavyLoad} | ops={_heavyLoadCount} | " +
+            Debug.Log($"[ARPerfMgr] v1.1 | isHeavyLoad={_isHeavyLoad} | ops={_heavyLoadCount} | " +
                       $"fps={Application.targetFrameRate} | matchAR={_matchARFrameRate}");
         }
 

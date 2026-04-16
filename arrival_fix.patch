@@ -1,0 +1,350 @@
+ (cd "$(git rev-parse --show-toplevel)" && git apply --3way <<'EOF' 
+diff --git a/Assets/IndoorNavAR/Scripts/Agent/ARGuideController.cs b/Assets/IndoorNavAR/Scripts/Agent/ARGuideController.cs
+index dace8b29bbf10979868affe3cefd645a8ec3d65c..48161cf21fa1d90c559fcbef9c3d9454a5601d2f 100644
+--- a/Assets/IndoorNavAR/Scripts/Agent/ARGuideController.cs
++++ b/Assets/IndoorNavAR/Scripts/Agent/ARGuideController.cs
+@@ -60,50 +60,56 @@ namespace IndoorNavAR.Agent
+         {
+             Idle,
+             Leading,
+             Waiting,
+             Returning,
+             Reorienting,
+             ApproachingStairs,
+             WaitingAtGoal,
+             PausedForTTS,
+             PausedAfterTurn,
+             WaitingToStart,
+         }
+ 
+         [Header("─── Referencias ─────────────────────────────────────────────")]
+         [SerializeField] private XROrigin _xrOrigin;
+ 
+         [Header("─── Distancias ──────────────────────────────────────────────")]
+         [SerializeField] private float _safeDistance      = 2f;
+         [SerializeField] private float _minDistance       = 1.0f;
+         [SerializeField] private float _maxReturnDistance = 3f;
+ 
+         [Header("─── Llegada ─────────────────────────────────────────────────")]
+         [SerializeField] private float _arrivalConfirmDist = 1.5f;
+         [SerializeField] private float _arrivalTimeout     = 45.0f;
+         [SerializeField] private float _arrivalMinDelay    = 3.0f;
++        [SerializeField, Tooltip("Distancia horizontal máxima para aceptar llegada por timeout en FullAR.")]
++        private float _arrivalTimeoutConfirmDist = 2.2f;
++        [SerializeField, Tooltip("Tolerancia vertical (m) para confirmar llegada y evitar falsos positivos entre pisos.")]
++        private float _arrivalVerticalTolerance = 1.2f;
++        [SerializeField, Tooltip("Frames consecutivos dentro del umbral para confirmar llegada estable.")]
++        private int _arrivalStableFramesRequired = 6;
+ 
+         // ✅ FIX N: Distancia mínima que el usuario debe haberse acercado al
+         // destino para que el timeout de llegada pueda dispararse.
+         // Si el usuario nunca se acercó esta cantidad, el timeout se ignora.
+         [Header("─── Llegada FullAR (FIX N) ─────────────────────────────────")]
+         [Tooltip("Distancia mínima en metros que el usuario debe haberse acercado " +
+                  "al destino para que el timeout de llegada pueda dispararse. " +
+                  "Si el usuario nunca se acercó esta cantidad desde el inicio, " +
+                  "el timeout se ignora completamente.")]
+         [SerializeField] private float _arrivalMovementThreshold = 1.5f;
+ 
+         [Header("─── Velocidad ──────────────────────────────────────────────")]
+         [SerializeField] private float _maxAgentSpeed        = 0.5f;
+         [SerializeField] private float _minLeadingSpeed      = 0.3f;
+         [Range(0.2f, 1f)]
+         [SerializeField] private float _closedistSpeedFactor = 0.4f;
+         [Range(0.1f, 0.8f)]
+         [SerializeField] private float _stairSpeedFactor     = 0.3f;
+ 
+         [Header("─── Pausa inicial ─────────────────────────────────────────")]
+         [SerializeField] private float _initialNavigationPause = 3.5f;
+ 
+         [Header("─── Pausa tras giros ─────────────────────────────────────")]
+         [SerializeField] private float _postTurnPauseSeconds = 4.0f;
+         [SerializeField] private float _postTurnMaxWait      = 10.0f;
+@@ -157,50 +163,51 @@ namespace IndoorNavAR.Agent
+         private GuideState      _currentState     = GuideState.Idle;
+         private GuideState      _stateBeforePause = GuideState.Idle;
+         private Vector3         _guideDestination;
+         private bool            _hasDestination       = false;
+         private bool            _isHandlingNavigation = false;
+ 
+         // ✅ FIX M: _isFullAR ELIMINADO. Usar siempre la propiedad IsFullAR.
+ 
+         private float _originalSpeed  = -1f;
+         private int   _currentFloor   = 0;
+         private bool  _isOnStairs     = false;
+         private bool  _stairAnnounced = false;
+         private bool  _climbAnnounced = false;
+ 
+         private readonly Vector3[] _pathCornersBuffer = new Vector3[24];
+         private int _pathCornersCount = 0;
+ 
+         private bool    _isReorienting  = false;
+         private Vector3 _reorientTarget;
+         private bool    _agentWasPaused = false;
+ 
+         private bool  _ttsPauseActive    = false;
+         private float _ttsPauseTimer     = 0f;
+         private float _arrivalWaitTimer  = 0f;
+         private bool  _navCompletedFired = false;
++        private int   _arrivalStableFrames = 0;
+ 
+         private bool  _initialPauseDone    = false;
+         private float _initialPauseTimer   = 0f;
+         private float _postTurnPauseTimer  = 0f;
+         private bool  _inPostTurnPause     = false;
+ 
+         private UserPositionBridge _userBridge;
+ 
+         private int   _lastProcessedFloorTo    = -999;
+         private float _lastFloorTransitionTime = -999f;
+ 
+         // ✅ FIX N: Tracking de movimiento del usuario hacia el destino en FullAR.
+         // Se activa cuando el usuario se ha acercado _arrivalMovementThreshold metros.
+         // Si nunca se activa, el timeout de llegada NO puede dispararse.
+         private float _initialDistToDest         = float.MaxValue;
+         private bool  _userHasMovedTowardsDest   = false;
+ 
+         // ─────────────────────────────────────────────────────────────────────
+         //  ✅ FIX M — Propiedad dinámica de modo AR
+         // ─────────────────────────────────────────────────────────────────────
+         private bool IsFullAR => _navAgent != null && _navAgent.IsFullARMode;
+ 
+         // ─────────────────────────────────────────────────────────────────────
+         //  LIFECYCLE
+         // ─────────────────────────────────────────────────────────────────────
+@@ -352,78 +359,93 @@ namespace IndoorNavAR.Agent
+                 }
+             }
+ 
+             if (_ttsPauseActive)
+             {
+                 _ttsPauseTimer += Time.deltaTime;
+                 if (_ttsPauseTimer >= _maxTTSWaitTime) { _ttsPauseActive = false; _ttsPauseTimer = 0f; }
+             }
+ 
+             EvaluateArrivalInFullAR();
+         }
+ 
+         /// <summary>
+         /// ✅ FIX N (v5.3): Timeout solo disponible si el usuario se ha acercado al destino.
+         /// ✅ FIX L (v5.1): Timeout ignorado si el usuario sigue lejos del umbral ampliado.
+         /// ✅ FIX M (v5.2): Solo se llama cuando IsFullAR es true en este frame.
+         /// </summary>
+         private void EvaluateArrivalInFullAR()
+         {
+             if (_navCompletedFired) return;
+ 
+             _arrivalWaitTimer += Time.deltaTime;
+             if (_arrivalWaitTimer < _arrivalMinDelay) return;
+ 
+             Vector3 userPos  = GetUserPosition();
+-            float   dist     = Vector3.Distance(userPos, _guideDestination);
++            Vector3 delta    = userPos - _guideDestination;
++            float   distXZ   = new Vector2(delta.x, delta.z).magnitude;
++            float   deltaY   = Mathf.Abs(delta.y);
++            bool    inStableArrivalZone = distXZ <= _arrivalConfirmDist && deltaY <= _arrivalVerticalTolerance;
+             bool    timedOut = _arrivalWaitTimer >= _arrivalTimeout;
+ 
+             // ✅ FIX L: No confirmar por timeout si el usuario sigue lejos del umbral ampliado.
+-            if (timedOut && dist > _arrivalConfirmDist * 3f)
++            if (timedOut && distXZ > _arrivalTimeoutConfirmDist)
+             {
++                _arrivalStableFrames = 0;
+                 if (_logFullAR)
+                     Debug.Log($"[ARGuideController] 📡 FullAR: timeout IGNORADO — " +
+-                              $"usuario a {dist:F1}m (no se ha acercado a {_arrivalConfirmDist}m).");
++                              $"usuario a {distXZ:F1}m (timeoutConfirmDist={_arrivalTimeoutConfirmDist:F1}m).");
+                 return;
+             }
+ 
+             // ✅ FIX N: Timeout no puede disparar si el usuario nunca se ha acercado.
+             if (timedOut && !_userHasMovedTowardsDest)
+             {
++                _arrivalStableFrames = 0;
+                 if (_logFullAR)
+                     Debug.Log($"[ARGuideController] 📡 FullAR: timeout IGNORADO — " +
+                               $"usuario nunca se acercó al destino " +
+                               $"(threshold={_arrivalMovementThreshold}m). " +
+-                              $"dist={dist:F1}m. El timer sigue corriendo pero no dispara.");
++                              $"distXZ={distXZ:F1}m. El timer sigue corriendo pero no dispara.");
+                 return;
+             }
+ 
+-            if (dist <= _arrivalConfirmDist || timedOut)
++            // Evita falsos positivos por jitter AR: requiere presencia estable en umbral.
++            if (inStableArrivalZone)
++                _arrivalStableFrames++;
++            else
++                _arrivalStableFrames = 0;
++
++            bool stableArrival = _arrivalStableFrames >= Mathf.Max(1, _arrivalStableFramesRequired);
++            bool timeoutArrival = timedOut && distXZ <= _arrivalTimeoutConfirmDist && deltaY <= _arrivalVerticalTolerance;
++
++            if (stableArrival || timeoutArrival)
+             {
+                 if (_logFullAR)
+                     Debug.Log($"[ARGuideController] 📡 FullAR: llegada confirmada. " +
+-                              $"dist={dist:F1}m | timeout={timedOut} | " +
++                              $"distXZ={distXZ:F1}m | dY={deltaY:F1}m | timeout={timedOut} | " +
++                              $"stableFrames={_arrivalStableFrames}/{_arrivalStableFramesRequired} | " +
+                               $"userMovedTowardsDest={_userHasMovedTowardsDest}");
+                 _navCompletedFired = true;
+                 FireNavigationCompleted();
+             }
+         }
+ 
+         private void OnGuideAnnouncement(GuideAnnouncementEvent evt) { }
+ 
+         // ─────────────────────────────────────────────────────────────────────
+         //  TTS
+         // ─────────────────────────────────────────────────────────────────────
+ 
+         private void OnTTSSpeaking(TTSSpeakingEvent evt)
+         {
+             if (!_pauseForHighPriorityTTS || !_hasDestination) return;
+             if (_currentState == GuideState.WaitingAtGoal || _currentState == GuideState.Idle) return;
+ 
+             bool fullAR      = IsFullAR;
+             bool shouldPause = evt.IsSpeaking && evt.Priority >= _ttsPauseMinPriority;
+ 
+             if (shouldPause && !_ttsPauseActive)
+             {
+                 _stateBeforePause = _currentState;
+                 _ttsPauseActive   = true;
+                 _ttsPauseTimer    = 0f;
+@@ -569,50 +591,51 @@ namespace IndoorNavAR.Agent
+                 return;
+             }
+ 
+             string floorName = evt.ToLevel == 0 ? "planta baja" : $"piso {evt.ToLevel}";
+             Announce(GuideAnnouncementType.FloorReached,
+                 evt.ToLevel > evt.FromLevel ? $"Has llegado al {floorName}" : $"Has bajado a {floorName}");
+             Announce(GuideAnnouncementType.StairsComplete, "Tramo de escaleras completado");
+         }
+ 
+         // ─────────────────────────────────────────────────────────────────────
+         //  API PÚBLICA
+         // ─────────────────────────────────────────────────────────────────────
+ 
+         public void SetGuideDestination(Vector3 destination)
+         {
+             bool fullAR = IsFullAR;
+ 
+             _guideDestination    = destination;
+             _hasDestination      = true;
+             _isReorienting       = false;
+             _stairAnnounced      = false;
+             _climbAnnounced      = false;
+             _isOnStairs          = false;
+             _navCompletedFired   = false;
+             _arrivalWaitTimer    = 0f;
++            _arrivalStableFrames = 0;
+             _ttsPauseActive      = false;
+             _ttsPauseTimer       = 0f;
+             _initialPauseDone    = false;
+             _initialPauseTimer   = 0f;
+             _inPostTurnPause     = false;
+             _postTurnPauseTimer  = 0f;
+ 
+             // ✅ FIX N: Registrar distancia inicial al destino y resetear flag.
+             // UpdateFullARMode() usará esto para determinar si el usuario se ha movido.
+             _userHasMovedTowardsDest = false;
+             _initialDistToDest       = Vector3.Distance(GetUserPosition(), destination);
+ 
+             if (fullAR)
+             {
+                 if (_logFullAR)
+                     Debug.Log($"[ARGuideController] 📡 [FullAR] Destino: {destination:F2}. " +
+                               $"initialDist={_initialDistToDest:F1}m. " +
+                               $"Timeout habilitado solo si usuario se acerca {_arrivalMovementThreshold}m.");
+                 if (_rawAgent != null && _rawAgent.enabled && _rawAgent.isOnNavMesh)
+                     _rawAgent.isStopped = true;
+                 TransitionTo(GuideState.Leading);
+                 return;
+             }
+ 
+             if (_rawAgent != null)
+@@ -622,50 +645,51 @@ namespace IndoorNavAR.Agent
+             }
+             RestoreAgentRotationControl();
+             RestoreSpeed();
+             NavStart(destination);
+             PauseAgent();
+             TransitionTo(GuideState.WaitingToStart);
+ 
+             if (_logAccessibility)
+                 Debug.Log($"[ARGuideController] ♿ [NoAR] Destino establecido. Pausa {_initialNavigationPause}s.");
+         }
+ 
+         public void StopGuide()
+         {
+             bool fullAR = IsFullAR;
+ 
+             _hasDestination          = false;
+             _isReorienting           = false;
+             _isOnStairs              = false;
+             _stairAnnounced          = false;
+             _climbAnnounced          = false;
+             _agentWasPaused          = false;
+             _ttsPauseActive          = false;
+             _ttsPauseTimer           = 0f;
+             _navCompletedFired       = false;
+             _arrivalWaitTimer        = 0f;
++            _arrivalStableFrames     = 0;
+             _initialPauseDone        = false;
+             _initialPauseTimer       = 0f;
+             _inPostTurnPause         = false;
+             _postTurnPauseTimer      = 0f;
+             _userHasMovedTowardsDest = false;     // ✅ FIX N: reset al detener
+             _initialDistToDest       = float.MaxValue;
+ 
+             if (!fullAR) { RestoreAgentRotationControl(); RestoreSpeed(); }
+ 
+             bool wasHandling = _isHandlingNavigation;
+             _isHandlingNavigation = true;
+             try   { _navAgent.StopNavigation(fullAR ? "Guía detenida (FullAR)" : "Guía detenida"); }
+             finally { _isHandlingNavigation = wasHandling; }
+ 
+             if (fullAR && _logFullAR) Debug.Log("[ARGuideController] 📡 [FullAR] Navegación detenida.");
+             TransitionTo(GuideState.Idle);
+         }
+ 
+         public GuideState CurrentState => _currentState;
+ 
+         // ─────────────────────────────────────────────────────────────────────
+         //  MÁQUINA DE ESTADOS
+         // ─────────────────────────────────────────────────────────────────────
+ 
+         private void EvaluateState()
+@@ -1097,26 +1121,26 @@ namespace IndoorNavAR.Agent
+             bool    fullAR   = IsFullAR;
+             Debug.Log(
+                 $"[ARGuideController] v5.3\n" +
+                 $"  IsFullAR (dinámico) = {fullAR}\n" +
+                 $"  Estado = {_currentState}\n" +
+                 $"  UserPos = {userPos:F2} | DistToGoal = {Vector3.Distance(userPos, _guideDestination):F2}m " +
+                 $"(threshold={_arrivalConfirmDist}m)\n" +
+                 $"  Dest = {_guideDestination:F2}\n" +
+                 $"  ArrivalTimer = {_arrivalWaitTimer:F1}s / {_arrivalTimeout}s\n" +
+                 $"  [FIX N] userHasMoved={_userHasMovedTowardsDest} | " +
+                 $"initialDist={_initialDistToDest:F1}m | threshold={_arrivalMovementThreshold}m\n" +
+                 $"  NavMeshAgent: stopped={_rawAgent?.isStopped} hasPath={_rawAgent?.hasPath} " +
+                 $"remainingDist={_rawAgent?.remainingDistance:F2}m");
+         }
+ 
+         [ContextMenu("📡 Test: Modo AR actual")]
+         private void DebugARMode() =>
+             Debug.Log($"[ARGuideController] IsFullAR={IsFullAR} | NavAgent.IsFullARMode={_navAgent?.IsFullARMode}");
+ 
+         [ContextMenu("🚀 Test: destino 10m al frente")]
+         private void DebugSetDest() => SetGuideDestination(transform.position + transform.forward * 10f);
+ 
+         [ContextMenu("⏹ Test: StopGuide")]
+         private void DebugStop() => StopGuide();
+     }
+-}
+\ No newline at end of file
++}
+ 
+EOF
+)

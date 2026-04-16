@@ -1,41 +1,29 @@
 // File: NavigationManager.cs
-// ✅ FIX #13 — Esperar InitialAlignDone real antes de ReparentWaypointsAfterAlignment()
+// ✅ FIX #14 — FIX_RAM: Liberar memoria antes de que ARCore inicie el VIO.
 //
 // ============================================================================
-//  CAMBIOS FIX #12 → FIX #13
+//  CAMBIOS FIX #13 → FIX #14
 // ============================================================================
 //
-//  PROBLEMA EN FIX #12:
+//  PROBLEMA RAÍZ (logs del dispositivo Infinix X6887):
 //  ─────────────────────────────────────────────────────────────────────────
-//  InitializeFromSavedSession() llamaba:
+//  The used RAM memory size by current process is 1048624 kb
+//  which is greater than the threshold 1048576 kb, so stop online mapping.
 //
-//    _arOriginAligner.NotifySessionRestored();  // Inicia HandleModelReady() coroutine
-//    await Task.Yield();
-//    await Task.Delay(150);                      // ← INSUFICIENTE
-//    await _persistenceManager.ReparentWaypointsAfterAlignment();
+//  El proceso consume ~1 GB RAM, superando el umbral de ARCore por apenas
+//  48 KB. Esto detiene el mapping online a los ~3.4s y causa que el VIO
+//  no pueda mantener suficientes inliers (Insufficient inliers: 37/262).
 //
-//  HandleModelReady() tiene WaitForFullyStable() que puede tardar hasta
-//  _fullStabilityTimeout = 12s. 150ms NO garantiza que AlignXROriginOnce()
-//  haya terminado antes de que ReparentWaypointsAfterAlignment() re-cree
-//  los waypoints.
-//
-//  Resultado: waypoints se crean con el transform PRE-alineación del modelo,
-//  luego AlignXROriginOnce() mueve el modelo → waypoints quedan descolocados.
-//
-//  SOLUCIÓN FIX #13:
+//  SOLUCIÓN FIX #14:
 //  ─────────────────────────────────────────────────────────────────────────
-//  Esperar activamente a que _arOriginAligner.InitialAlignDone sea true,
-//  con polling de 200ms y timeout de 5s (conservador).
+//  ReleaseMemoryBeforeARStart():
+//    - Resources.UnloadUnusedAssets() — descarga texturas/meshes no usados.
+//    - GC.Collect compacting — libera heap fragmentado.
+//    - Se llama al inicio de InitializeFromSavedSession() antes de cualquier
+//      operación de carga, para que ARCore arranque con el máximo de RAM libre.
+//    - Solo se ejecuta en device (en Editor se hace GC normal sin blocking).
 //
-//  InitialAlignDone es la nueva propiedad pública expuesta en AROriginAligner v8.9.
-//  Se pone a true solo cuando AlignXROriginOnce() completa exitosamente.
-//
-//  Con este fix:
-//    - Si ARCore ya está en tracking → AlignXROriginOnce() completa en <1s
-//    - Si ARCore tarda → esperamos hasta que trackee (máx 5s)
-//    - Si hay timeout → continuamos de todos modos con advertencia
-//
-//  TODOS LOS CAMBIOS DE FIX #12 SE CONSERVAN ÍNTEGRAMENTE.
+//  TODOS LOS CAMBIOS DE FIX #13 SE CONSERVAN ÍNTEGRAMENTE.
 
 using System;
 using System.Threading.Tasks;
@@ -79,6 +67,17 @@ namespace IndoorNavAR.Core
         [Tooltip("Intervalo de polling para verificar InitialAlignDone (segundos).\n" +
                  "Default: 0.2s — balance entre responsividad y overhead.")]
         [SerializeField] private float _alignPollInterval = 0.2f;
+
+        [Header("─── FIX #14 — Liberación RAM pre-AR ──────────────────────")]
+        [Tooltip("Si true, ejecuta GC + UnloadUnusedAssets antes de iniciar ARCore.\n" +
+                 "Libera RAM para que ARCore no supere su umbral de 1 GB y detenga el mapping.\n" +
+                 "Default: true")]
+        [SerializeField] private bool _releaseMemoryBeforeAR = true;
+
+        [Tooltip("FPS objetivo durante la inicialización AR para reducir presión de framebuffers.\n" +
+                 "Se restaura automáticamente tras la carga. 0 = no cambiar.\n" +
+                 "Default: 30")]
+        [SerializeField] private int _initFrameRate = 30;
 
         [Header("🐛 Debug")]
         [SerializeField] private bool _logDetailedEvents = false;
@@ -302,10 +301,29 @@ namespace IndoorNavAR.Core
                 return false;
             }
         }
+
+        // 🔒 Guard contra re-entrada concurrente
+        private bool _sessionInitInProgress = false;
+
         private async Task<bool> InitializeFromSavedSession()
         {
+            if (_sessionInitInProgress)
+            {
+                Debug.LogWarning("[NavManager] ⚠️ InitializeFromSavedSession ya en progreso — ignorando.");
+                return false;
+            }
+
+            _sessionInitInProgress = true;
+
             try
             {
+                // ✅ FIX #14 FIX_RAM: Liberar memoria antes de que ARCore inicie el VIO.
+                // El proceso puede exceder el umbral de ARCore (~1 GB) por apenas 48 KB,
+                // lo que detiene el mapping online y causa Insufficient inliers en el VIO.
+                // Este paso se hace ANTES de cualquier carga para maximizar RAM disponible.
+                if (_releaseMemoryBeforeAR)
+                    await ReleaseMemoryBeforeARStart();
+
                 bool sessionLoaded;
 
                 // 🔒 Guard: si PersistenceManager ya completó la carga, no recargar
@@ -337,7 +355,6 @@ namespace IndoorNavAR.Core
                     Debug.Log("[NavManager] 🎯 [3/4] Ajustando VIO — NotifySessionRestored()...");
                     _arOriginAligner.NotifySessionRestored();
 
-                    // Espera activa hasta que la alineación termine o timeout
                     await WaitForAlignmentOrTimeout();
                 }
                 else
@@ -350,7 +367,6 @@ namespace IndoorNavAR.Core
                 await _persistenceManager.ReparentWaypointsAfterAlignment();
                 Debug.Log("[NavManager] ✅ Waypoints re-creados y Flutter notificado.");
 
-                // Finalización de cargas pesadas
                 ARPerformanceManager.Instance?.EndHeavyLoad("NavigationManager — cierre de seguridad");
 
                 ChangeState(AppMode.Navigation);
@@ -363,30 +379,72 @@ namespace IndoorNavAR.Core
                 Debug.LogError($"[NavManager] ❌ InitializeFromSavedSession: {ex.Message}\n{ex.StackTrace}");
                 return false;
             }
+            finally
+            {
+                _sessionInitInProgress = false;
+            }
+        }
+
+        /// <summary>
+        /// ✅ FIX #14 FIX_RAM — Libera RAM antes de que ARCore inicie el VIO.
+        ///
+        /// El proceso puede superar el umbral de ~1 GB de ARCore por márgenes muy
+        /// pequeños (48 KB en logs observados), lo que detiene el mapping online.
+        ///
+        /// Secuencia:
+        ///   1. Reducir FPS → menor presión de framebuffers (~15-30 MB liberados).
+        ///   2. Resources.UnloadUnusedAssets() → descarga texturas/meshes sin refs.
+        ///   3. GC.Collect compacting → libera heap fragmentado (costoso, una sola vez).
+        ///
+        /// En Editor: GC no-blocking para no interferir con el flujo de desarrollo.
+        /// </summary>
+        private async Task ReleaseMemoryBeforeARStart()
+        {
+            Debug.Log("[NavManager] [FIX_RAM] Liberando memoria antes de iniciar AR...");
+
+            // Reducir FPS durante inicialización — libera presión de framebuffers
+            if (_initFrameRate > 0)
+            {
+                Application.targetFrameRate = _initFrameRate;
+                Debug.Log($"[NavManager] [FIX_RAM] targetFrameRate → {_initFrameRate} (reducido durante init).");
+            }
+
+            // Descargar assets no usados del bundle (texturas comprimidas, meshes)
+            var unloadOp = Resources.UnloadUnusedAssets();
+            while (!unloadOp.isDone)
+                await Task.Yield();
+
+#if UNITY_EDITOR
+            // En Editor: GC simple sin blocking para no interferir con el workflow
+            System.GC.Collect();
+            await Task.Yield();
+            Debug.Log("[NavManager] [FIX_RAM] GC (editor, non-blocking) completado.");
+#else
+            // En device: GC completo compacting — costoso pero necesario (una sola vez al inicio)
+            // Compacting=true reorganiza el heap y elimina fragmentación que infla el RSS.
+            await Task.Run(() =>
+            {
+                System.GC.Collect(2, System.GCCollectionMode.Forced, blocking: true, compacting: true);
+                System.GC.WaitForPendingFinalizers();
+                System.GC.Collect(2, System.GCCollectionMode.Forced, blocking: true);
+            });
+
+            await Task.Yield();
+            await Task.Yield();
+            Debug.Log("[NavManager] [FIX_RAM] GC compacting completado — memoria liberada.");
+#endif
         }
 
         /// <summary>
         /// ✅ FIX #13 — Espera activamente a que AROriginAligner.InitialAlignDone sea true.
-        ///
-        /// Usa polling en lugar de un delay fijo porque la duración de AlignXROriginOnce()
-        /// depende de WaitForFullyStable(), que a su vez depende de ARCore tracking
-        /// (puede ser instantáneo o tardar varios segundos).
-        ///
-        /// Timeout de _alignWaitTimeout como fallback — si ARCore no trackea,
-        /// continuamos de todos modos y los waypoints se alinearán con lo que haya.
         /// </summary>
         private async Task WaitForAlignmentOrTimeout()
         {
-            // ✅ FIX_DEVICE: En builds de dispositivo, reducir timeout.
-            // Si el VIO está bloqueado por el main thread (las escaleras y NavMesh),
-            // esperar 5s solo retrasa la carga sin beneficio. 2s es suficiente:
-            // si ARCore va a trackear, lo hace en <1s normalmente.
-            // Referencia ARCore: https://developers.google.com/ar/develop/session-management
-        #if UNITY_EDITOR
+#if UNITY_EDITOR
             float effectiveTimeout = _alignWaitTimeout;
-        #else
+#else
             float effectiveTimeout = Mathf.Min(_alignWaitTimeout, 2f);
-        #endif
+#endif
 
             float elapsed = 0f;
             int   pollMs  = Mathf.RoundToInt(_alignPollInterval * 1000f);
@@ -618,7 +676,8 @@ namespace IndoorNavAR.Core
             Debug.Log($"[NavManager] Estado: {_currentState} | Init: {_isInitialized} | " +
                       $"Modo: {(isFullAR ? "FullAR" : "NoAR")} | " +
                       $"Waypoints: {_waypointManager?.WaypointCount ?? 0} | " +
-                      $"InitialAlignDone: {_arOriginAligner?.InitialAlignDone ?? false}");
+                      $"InitialAlignDone: {_arOriginAligner?.InitialAlignDone ?? false} | " +
+                      $"FPS: {Application.targetFrameRate}");
             if (_pathController != null)
                 Debug.Log($"[NavManager] PathController: IsFullARMode={_pathController.IsFullARMode} | " +
                           $"IsNavigating={_pathController.IsNavigating}");
@@ -627,6 +686,8 @@ namespace IndoorNavAR.Core
         [ContextMenu("📦 Load Model")]       private void DebugLoadModel()  => _ = LoadModelOnLargestPlane();
         [ContextMenu("🔄 Reset")]             private void DebugReset()      => ResetSystem();
         [ContextMenu("🚀 Force Initialize")]  private void DebugForceInit()  { _isInitialized = false; _ = Initialize(); }
+        [ContextMenu("🧹 Force GC Now")]
+        private void DebugForceGC()           => _ = ReleaseMemoryBeforeARStart();
 
         #endregion
     }

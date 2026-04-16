@@ -433,6 +433,15 @@ namespace IndoorNavAR.Core.Managers
             return waypoint;
         }
 
+        public WaypointData GetWaypointByName(string name)
+        {
+            if (string.IsNullOrEmpty(name))
+                return null;
+
+            return _waypointsList.FirstOrDefault(w =>
+                string.Equals(w.WaypointName, name, StringComparison.OrdinalIgnoreCase));
+        }
+
         public bool UpdateWaypoint(string waypointId, string name, WaypointType type, Color color, string description = "")
         {
             if (!_waypoints.TryGetValue(waypointId, out WaypointData waypoint))

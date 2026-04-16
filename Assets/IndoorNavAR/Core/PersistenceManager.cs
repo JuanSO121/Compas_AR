@@ -1,41 +1,34 @@
 // File: PersistenceManager.cs
-// ✅ v14.3 — FIX: IsSessionLoadCompleted nunca se ponía en true.
+// ✅ v14.4 — FIX_VIO: Serializar carga pesada hasta que VIO esté estable.
 //
 // ============================================================================
-//  CAMBIOS v14.2 → v14.3
+//  CAMBIOS v14.3 → v14.4
 // ============================================================================
 //
-//  PROBLEMA RAÍZ:
+//  PROBLEMA RAÍZ (logs del dispositivo Infinix X6887):
 //  ─────────────────────────────────────────────────────────────────────────
-//  IsSessionLoadCompleted = _autoLoadAttempted && _autoLoadCompleted
+//  VioFaultDetector: Insufficient inliers (37/262, 16/228, 5/255)
+//  → ARSession cae SessionTracking → SessionInitializing en loop.
 //
-//  En v14.x se eliminó el auto-load del Start(), pero los flags
-//  _autoLoadAttempted y _autoLoadCompleted NUNCA se ponían en true
-//  en ninguna ruta de código. NavigationManager llama LoadSession()
-//  directamente pero esos flags eran letra muerta.
+//  Dos causas en cascada:
 //
-//  Consecuencia en cadena:
-//    1. FlutterUnityBridge.NotifySubsystemsReady() ve IsSessionLoadCompleted=false
-//       → siempre transiciona a SessionLoading (nunca a Ready).
-//    2. SceneReadyNotifier.WaitForSessionLoad() espera IsSessionLoadCompleted=true
-//       → espera forever hasta el timeout de 20s (_sessionLoadTimeout).
-//    3. Solo tras el timeout de 20s se llama NotifySceneReady() y el bridge
-//       llega a Ready. Por eso "[Bridge] ✅ → Ready" aparecía con 20s de delay
-//       o directamente no aparecía si el timeout era el problema.
+//  CAUSA 1 — RAM crítica:
+//    El proceso consume ~1 GB RAM, superando el umbral de ARCore por 48 KB.
+//    Esto detiene el mapping online a los ~3.4s.
 //
-//  SOLUCIÓN v14.3:
+//  CAUSA 2 — CPU starvation del VIO:
+//    ARPerformanceManager registra HeavyLoad +1 [3 ops]: RecreateStairs
+//    justo cuando el VIO intenta inicializarse. RecreateStairGeometryAsync
+//    + LoadNavMeshFromFile + RestoreModelTransform compiten con el VIO por CPU.
+//
+//  SOLUCIONES v14.4:
 //  ─────────────────────────────────────────────────────────────────────────
-//  1. LoadSession() setea _autoLoadAttempted=true y _autoLoadCompleted=true
-//     en el bloque finally (siempre, independientemente del resultado).
-//  2. HasSavedSession()==false path también marca los flags como completados
-//     (no hay nada que cargar → la "carga" terminó inmediatamente).
-//  3. ReparentWaypointsAfterAlignment() llama
-//     FlutterUnityBridge.NotifySceneReady() directamente porque es el punto
-//     real de finalización de toda la carga. Esto elimina la dependencia del
-//     polling de SceneReadyNotifier y funciona incluso si SceneReadyNotifier
-//     no está en la escena.
+//  FIX_VIO — WaitForVIOStableBeforeHeavyWork():
+//    LoadNavMeshFromFile() espera a SessionTracking estable (5 checks × 300ms)
+//    antes de llamar RecreateStairGeometryAsync(). Timeout de 8s.
+//    En Editor → skip inmediato.
 //
-//  TODOS LOS COMPORTAMIENTOS DE v14.2 SE CONSERVAN ÍNTEGRAMENTE.
+//  TODOS LOS COMPORTAMIENTOS DE v14.3 SE CONSERVAN ÍNTEGRAMENTE.
 
 using System;
 using System.Collections.Generic;
@@ -79,6 +72,20 @@ namespace IndoorNavAR.Core
         [Tooltip("Tiempo máximo (s) esperando ARSession.SessionTracking antes de intentar cargar sesión.")]
         [SerializeField] private float _trackingWaitTimeout = 15f;
 
+        [Header("─── v14.4 FIX_VIO — Espera VIO antes de RecreateStairs ──")]
+        [Tooltip("Tiempo máximo (s) esperando SessionTracking estable antes de RecreateStairGeometryAsync().\n" +
+                 "Si el timeout se alcanza, se continúa con advertencia.\nDefault: 8s")]
+        [SerializeField] private float _vioStableTimeoutSec = 8f;
+
+        [Tooltip("Intervalo de polling (ms) para verificar SessionTracking en WaitForVIOStable.\nDefault: 300ms")]
+        [SerializeField] private int _vioPollMs = 300;
+
+        [Tooltip("Checks consecutivos en SessionTracking requeridos para considerar el VIO estable.\nDefault: 5")]
+        [SerializeField] private int _vioStableChecks = 5;
+
+        [Tooltip("Delay adicional (ms) tras detectar VIO estable, para que consolide estado interno.\nDefault: 500ms")]
+        [SerializeField] private int _vioPostStableDelayMs = 500;
+
         [Header("🐛 Debug")]
         [SerializeField] private bool _logOperations = true;
 
@@ -102,8 +109,6 @@ namespace IndoorNavAR.Core
 
         /// <summary>
         /// ✅ v14.3 FIX: Retorna true cuando LoadSession() ha terminado (con o sin éxito).
-        /// Anteriormente _autoLoadAttempted/_autoLoadCompleted nunca se ponían en true
-        /// porque el auto-load fue eliminado en v14.x pero los flags quedaron huérfanos.
         /// </summary>
         public bool IsSessionLoadCompleted => _autoLoadAttempted && _autoLoadCompleted;
         public bool AutoLoadResult         => _autoLoadResult;
@@ -130,19 +135,14 @@ namespace IndoorNavAR.Core
 
         private void Start()
         {
-            // PersistenceManager no auto-carga.
-            // NavigationManager decide cuándo cargar.
-            Log("[v14.3] PersistenceManager listo — esperando NavigationManager.");
+            Log("[v14.4] PersistenceManager listo — esperando NavigationManager.");
 
-            // ✅ v14.3 FIX: Si no hay sesión guardada, marcar como completado de inmediato.
-            // Esto permite que FlutterUnityBridge y SceneReadyNotifier avancen sin esperar
-            // una carga que nunca ocurrirá.
             if (!HasSavedSession())
             {
                 _autoLoadAttempted = true;
                 _autoLoadCompleted = true;
                 _autoLoadResult    = false;
-                Log("[v14.3] Sin sesión guardada → IsSessionLoadCompleted=true (no hay nada que cargar).");
+                Log("[v14.4] Sin sesión guardada → IsSessionLoadCompleted=true (no hay nada que cargar).");
             }
         }
 
@@ -152,11 +152,11 @@ namespace IndoorNavAR.Core
         {
             if (_alignmentCompleted)
             {
-                Log("[v14.3] ReparentWaypointsAfterAlignment ya completado — ignorando.");
+                Log("[v14.4] ReparentWaypointsAfterAlignment ya completado — ignorando.");
                 return;
             }
 
-            Log("[v14.3] ▶️ ReparentWaypointsAfterAlignment — modelo alineado al VIO.");
+            Log("[v14.4] ▶️ ReparentWaypointsAfterAlignment — modelo alineado al VIO.");
 
             if (_waypointManager != null && _pendingWaypointData != null
                 && _pendingWaypointData.Count > 0)
@@ -168,37 +168,28 @@ namespace IndoorNavAR.Core
                 Transform modelRoot = _modelLoadManager?.CurrentModel?.transform?.parent
                                    ?? _modelLoadManager?.CurrentModel?.transform;
 
-                Log($"[v14.3] Re-anclando {_pendingWaypointData.Count} waypoints " +
+                Log($"[v14.4] Re-anclando {_pendingWaypointData.Count} waypoints " +
                     $"bajo '{modelRoot?.name ?? "auto"}' (post-VIO)...");
 
                 _waypointManager.ForceReparentToModel(modelRoot);
                 _waypointManager.LoadWaypoints(_pendingWaypointData);
 
-                Log($"[v14.3] ✅ Waypoints re-creados: {_waypointManager.WaypointCount}");
+                Log($"[v14.4] ✅ Waypoints re-creados: {_waypointManager.WaypointCount}");
             }
 
             _alignmentCompleted  = true;
             _pendingWaypointData = null;
 
-            // ✅ v14.2: Notificar fin de fase pesada al ARPerformanceManager.
             ARPerformanceManager.Instance?.EndHeavyLoad("ReparentWaypointsAfterAlignment completado");
-            Log("[v14.3] ✅ ARPerformanceManager.EndHeavyLoad() — VIO puede recuperar frecuencia.");
+            Log("[v14.4] ✅ ARPerformanceManager.EndHeavyLoad() — VIO puede recuperar frecuencia.");
 
             NotifySessionLoadedToFlutter(sessionWasRestored: _sessionWasRestored);
             EventBus.Instance?.Publish(new Events.ARSessionReadyEvent());
 
-            // ✅ v14.3 FIX: Notificar al bridge directamente desde aquí.
-            // ReparentWaypointsAfterAlignment() es el punto REAL de finalización
-            // de toda la carga. Llamar NotifySceneReady() aquí garantiza que el
-            // bridge transite a Ready sin depender del polling de SceneReadyNotifier
-            // sobre IsSessionLoadCompleted.
-            //
-            // NotifySceneReady() es idempotente — si SceneReadyNotifier ya lo llamó
-            // antes (vía timeout o polling exitoso), el segundo llamado es ignorado.
             FlutterUnityBridge.NotifySceneReady(
                 $"ReparentWaypointsAfterAlignment completado — sessionRestored={_sessionWasRestored}");
 
-            Log($"✅ [v14.3] Flutter notificado con sessionWasRestored={_sessionWasRestored}.");
+            Log($"✅ [v14.4] Flutter notificado con sessionWasRestored={_sessionWasRestored}.");
         }
 
         // ─── Notificación a Flutter ───────────────────────────────────────
@@ -236,7 +227,7 @@ namespace IndoorNavAR.Core
                 api.ListWaypoints();
             }
 
-            Log($"✅ [v14.3] session_loaded enviado: {json}");
+            Log($"✅ [v14.4] session_loaded enviado: {json}");
         }
 
         // ─── Update ───────────────────────────────────────────────────────
@@ -392,12 +383,9 @@ namespace IndoorNavAR.Core
                 if (!HasSavedSession())
                 {
                     Log("⚠️ No hay sesión guardada");
-                    // ✅ v14.3 FIX: marcar como completado aunque no haya sesión.
-                    // Esto permite que IsSessionLoadCompleted=true y el bridge avance.
                     _autoLoadAttempted = true;
                     _autoLoadCompleted = true;
                     _autoLoadResult    = false;
-                    // Sin sesión → bridge puede pasar a Ready ahora mismo
                     FlutterUnityBridge.NotifySceneReady("LoadSession: sin sesión guardada");
                     return false;
                 }
@@ -421,6 +409,7 @@ namespace IndoorNavAR.Core
                     await WriteSessionJson(data);
                 }
 
+                _alignmentCompleted = false;
                 await LoadSessionData(data);
 
                 _sessionWasRestored = true;
@@ -436,10 +425,6 @@ namespace IndoorNavAR.Core
             }
             finally
             {
-                // ✅ v14.3 FIX: marcar SIEMPRE como completado al salir de LoadSession().
-                // Independientemente de si tuvo éxito o no, la "carga" terminó.
-                // Esto desbloquea IsSessionLoadCompleted para FlutterUnityBridge
-                // y SceneReadyNotifier, que hacen polling sobre esta propiedad.
                 _autoLoadAttempted = true;
                 _autoLoadCompleted = true;
                 _autoLoadResult    = sessionResult;
@@ -448,7 +433,7 @@ namespace IndoorNavAR.Core
                 _loadingTcs = null;
                 _isLoading  = false;
 
-                Log($"[v14.3] LoadSession finalizado — resultado={sessionResult} " +
+                Log($"[v14.4] LoadSession finalizado — resultado={sessionResult} " +
                     $"IsSessionLoadCompleted={IsSessionLoadCompleted}");
             }
         }
@@ -461,7 +446,6 @@ namespace IndoorNavAR.Core
 
             _savedModelPosition = data.modelPosition;
 
-            // ✅ v14.2: BeginHeavyLoad antes de RestoreModelTransform.
             ARPerformanceManager.Instance?.BeginHeavyLoad("LoadSessionData — RestoreModel inicio");
 
             if (data.hasModel && _modelLoadManager != null)
@@ -515,16 +499,24 @@ namespace IndoorNavAR.Core
                                 && !float.IsNaN(w.position.z))
                     .ToList();
 
-                _waypointManager.LoadWaypoints(validWaypoints);
+                // ✅ v14.4 FIX_DUPLICATE
+                if (!_alignmentCompleted)
+                {
+                    _waypointManager.LoadWaypoints(validWaypoints);
+                    Log($"[v14.4] {validWaypoints.Count} waypoints provisionales cargados.");
+                }
+                else
+                {
+                    Log($"[v14.4] _alignmentCompleted=true — saltando carga provisional " +
+                        $"({validWaypoints.Count} waypoints ya en escena).");
+                }
                 _pendingWaypointData = validWaypoints;
-                Log($"[v14.3] {validWaypoints.Count} waypoints provisionales cargados.");
             }
             else
             {
                 _alignmentCompleted = false;
             }
 
-            // ✅ v14.2: EndHeavyLoad después de la carga de datos.
             ARPerformanceManager.Instance?.EndHeavyLoad("LoadSessionData completado — esperando alineación VIO");
         }
 
@@ -546,7 +538,6 @@ namespace IndoorNavAR.Core
 
             for (int i = 0; i < 3; i++) await Task.Yield();
 
-            // ✅ v14.2: BeginHeavyLoad para operación de restauración de NavMesh.
             ARPerformanceManager.Instance?.BeginHeavyLoad("LoadNavMeshFromFile — BuildNavMeshData");
 
             var (success, firstInstance, allInstances) =
@@ -561,6 +552,12 @@ namespace IndoorNavAR.Core
                 _navMeshWasBaked       = false;
 
                 await Task.Delay(_postNavMeshDelayMs);
+
+                // ✅ v14.4 FIX_VIO: Esperar tracking estable antes de trabajo pesado.
+                // RecreateStairGeometryAsync corre en el main thread y compite con el VIO
+                // por CPU, causando Insufficient inliers y resets del tracker.
+                await WaitForVIOStableBeforeHeavyWork();
+
                 await RecreateStairGeometryAsync();
             }
             else
@@ -569,6 +566,57 @@ namespace IndoorNavAR.Core
             }
 
             return success;
+        }
+
+        /// <summary>
+        /// ✅ v14.4 FIX_VIO — Espera a que ARCore esté en SessionTracking antes de
+        /// ejecutar trabajo pesado en el main thread que compite con el VIO.
+        ///
+        /// El VIO necesita ~3s para inicializar; hacer NavMesh+Stairs durante ese
+        /// tiempo provoca CPU starvation y resets del tracker (Insufficient inliers).
+        ///
+        /// En Editor no hay ARCore real → skip inmediato.
+        /// Timeout de _vioStableTimeoutSec como fallback.
+        /// </summary>
+        private async Task WaitForVIOStableBeforeHeavyWork()
+        {
+#if UNITY_EDITOR
+            Log("[FIX_VIO] Editor — skip de espera VIO.");
+            return;
+#endif
+            float elapsed     = 0f;
+            int   stableCount = 0;
+
+            Log($"[FIX_VIO] Esperando SessionTracking estable antes de RecreateStairs " +
+                $"(timeout={_vioStableTimeoutSec}s, poll={_vioPollMs}ms, checks={_vioStableChecks})...");
+
+            while (elapsed < _vioStableTimeoutSec)
+            {
+                await Task.Delay(_vioPollMs);
+                elapsed += _vioPollMs / 1000f;
+
+                if (ARSession.state == ARSessionState.SessionTracking)
+                {
+                    stableCount++;
+                    if (stableCount >= _vioStableChecks)
+                    {
+                        Log($"[FIX_VIO] SessionTracking estable ({stableCount} checks) en {elapsed:F1}s — " +
+                            "procediendo con RecreateStairs.");
+                        // Delay adicional para que el VIO consolide su estado interno
+                        await Task.Delay(_vioPostStableDelayMs);
+                        return;
+                    }
+                }
+                else
+                {
+                    if (stableCount > 0)
+                        Log($"[FIX_VIO] Tracking perdido en check {stableCount} — reset.");
+                    stableCount = 0;
+                }
+            }
+
+            Debug.LogWarning($"[PersistenceManager] [FIX_VIO] Timeout {_vioStableTimeoutSec}s esperando " +
+                             "SessionTracking. Continuando RecreateStairs — puede causar flickers.");
         }
 
         private async Task RecreateStairGeometryAsync()
@@ -582,7 +630,7 @@ namespace IndoorNavAR.Core
                 return;
             }
 
-            Log($"🪜 [v14.3] Recreando geometría de {stairHelpers.Length} escalera(s)...");
+            Log($"🪜 [v14.4] Recreando geometría de {stairHelpers.Length} escalera(s)...");
 
             ARPerformanceManager.Instance?.BeginHeavyLoad($"RecreateStairs — {stairHelpers.Length} helper(s)");
 
@@ -753,7 +801,7 @@ namespace IndoorNavAR.Core
         [ContextMenu("ℹ️ Show Info")]            private void DbgInfo()    => Debug.Log(GetLastSaveInfo());
         [ContextMenu("✅ Ver flags")]
         private void DbgFlags() => Debug.Log(
-            $"[PersistenceManager] v14.3 flags:\n" +
+            $"[PersistenceManager] v14.4 flags:\n" +
             $"  streaming={_streamingAssetsCopied}\n" +
             $"  firstFrame={_firstFrameReady}\n" +
             $"  autoLoadAttempted={_autoLoadAttempted}\n" +

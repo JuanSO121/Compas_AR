@@ -100,7 +100,7 @@ namespace IndoorNavAR.Navigation
 
         [Header("🎯 Agente NavMesh")]
         [SerializeField] private float _agentRadius     = 0.10f;
-        [SerializeField] private float _agentHeight     = 1.8f;
+        [SerializeField] private float _agentHeight     = 1.5f;
         [SerializeField] [Tooltip("Pendiente máxima (°)")]
         private float _agentMaxSlope   = 50f;
         [SerializeField] [Tooltip("Escalón máximo (m)")]
