@@ -1,3 +1,12 @@
+// File: FlutterUnityBridge.cs
+// Carpeta: Assets/IndoorNavAR/Scripts/Integration/
+//
+// Parte receptora del bridge Flutter → Unity.
+// La parte estática (Unity → Flutter) está en FlutterUnityBridgeStatic.cs.
+//
+// ÚNICO CAMBIO respecto a la versión anterior:
+//   línea 19: "public class" → "public partial class"
+
 using System;
 using System.Threading.Tasks;
 using UnityEngine;
@@ -16,7 +25,7 @@ namespace IndoorNavAR.Integration
     ///
     /// Donde "FlutterBridge" es el nombre del GameObject que contiene este componente.
     /// </summary>
-    public class FlutterUnityBridge : MonoBehaviour
+    public partial class FlutterUnityBridge : MonoBehaviour   // ← partial añadido
     {
         [Header("Bridge")]
         [SerializeField] private bool _verboseLogs = true;
@@ -38,8 +47,8 @@ namespace IndoorNavAR.Integration
 
         private void Awake()
         {
-            _waypointManager ??= FindFirstObjectByType<WaypointManager>();
-            _navigationManager ??= FindFirstObjectByType<NavigationManager>();
+            _waypointManager    ??= FindFirstObjectByType<WaypointManager>();
+            _navigationManager  ??= FindFirstObjectByType<NavigationManager>();
             _persistenceManager ??= FindFirstObjectByType<PersistenceManager>();
         }
 
@@ -190,8 +199,8 @@ namespace IndoorNavAR.Integration
         {
             EventBus.Instance?.Publish(new ShowMessageEvent
             {
-                Message = message,
-                Type = MessageType.Info,
+                Message  = message,
+                Type     = MessageType.Info,
                 Duration = 2.5f
             });
         }
@@ -202,7 +211,7 @@ namespace IndoorNavAR.Integration
                 Debug.Log($"[FlutterUnityBridge] {msg}");
         }
 
-        private void LogWarn(string msg) => Debug.LogWarning($"[FlutterUnityBridge] {msg}");
+        private void LogWarn(string msg)  => Debug.LogWarning($"[FlutterUnityBridge] {msg}");
         private void LogError(string msg) => Debug.LogError($"[FlutterUnityBridge] {msg}");
     }
 }
