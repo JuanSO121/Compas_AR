@@ -1,39 +1,43 @@
 // File: AROriginAligner.cs
-// ✅ v9.0 — REFACTOR: Alineación correcta según AR Foundation + throttle de sync
+// ✅ v9.1 — Fix _floorSnapTolerance insuficiente para edificios con NavMesh alto
 //
 // ============================================================================
-//  PROBLEMA RAÍZ (diagnosticado desde logs)
+//  CAMBIOS v9.0 → v9.1
 // ============================================================================
 //
-//  Log de síntoma:
-//    [AROriginAligner] ! Hit r=1m descartado: Y=1.80 vs 4.46 (margen=1.30)
-//    [AROriginAligner] ! Hit r=2m descartado: Y=1.80 vs 4.46 (margen=1.30)
-//    [AROriginAligner] ! Hit r=3m descartado: Y=1.80 vs 4.46 (margen=1.30)
-//    → Repite decenas de veces por segundo → CPU starvation → STT falla
+//  BUG — _floorSnapTolerance=0.9 insuficiente para este edificio
+//  ─────────────────────────────────────────────────────────────
+//  SÍNTOMA (log v9.1):
+//    estimFloor=1.59 | hitY=3.51 | ΔY=1.92 | margen=1.40
+//    → Sync fallo #1 al #9 continuos
 //
-//  CAUSA A — GetExpectedFloorY() malinterpreta la posición de cámara:
-//    La cámara AR está a altura de OJO del usuario (~1.65m sobre el suelo
-//    físico). GetExpectedFloorY() buscaba el StartPoint más cercano en Y a
-//    cameraY=4.46, pero no hay ningún StartPoint a esa altura (todos están
-//    en el suelo: Y≈1.75 para piso 0, Y≈3.20 para piso 1). La función
-//    retornaba 4.46 como "expected floor", hitMargin=1.3 → buscaba NavMesh
-//    entre Y=3.16 y Y=5.76 → el NavMesh en Y=1.80 nunca entraba en rango
-//    → FALLA PERPETUA cada frame.
+//  CAUSA:
+//    En este edificio específico el NavMesh del piso 1 está a Y≈1.59 pero
+//    el único hit disponible (losa del techo del piso 2) está a Y=3.51.
+//    hitMargin = _floorSnapTolerance + 0.5 = 0.9 + 0.5 = 1.40m
+//    ΔY = |3.51 - 1.59| = 1.92m > 1.40m → descartado siempre.
+//    El NavMesh correcto (suelo del piso 1) está a ~0.03m de estimFloor
+//    pero los SamplePosition con r=0.5..3m no lo alcanzan porque
+//    searchOrigin.y = estimFloor + hitMargin = 1.59 + 1.40 = 2.99m
+//    y el NavMesh está en Y=1.62m (Δ=1.37m ≈ límite del margen).
 //
-//  CAUSA B — Sin throttle en el path de fallo:
-//    Cada fallo ejecuta 4 NavMesh.SamplePosition() por frame × 60fps
-//    = 240+ queries/segundo → CPU starvation → STT timeout → micrófono falla.
+//  FIX 1 — _floorSnapTolerance default: 0.9 → 1.5
+//    hitMargin = 1.5 + 0.5 = 2.0m — cubre ΔY=1.92m con margen de 0.08m.
+//    searchOrigin.y = 1.59 + 2.0 = 3.59m → SamplePosition hacia abajo
+//    encuentra NavMesh a Y≈1.62m (ΔY=1.97m ≤ 2.0m) → ✅ ACEPTADO.
 //
-//  FIX A — GetExpectedFloorY(cameraY) descuenta _eyeHeightOffset:
-//    estimatedGround = cameraY - _eyeHeightOffset → busca StartPoint más
-//    cercano a estimatedGround. Con cameraY=4.46, offset=1.3:
-//    estimatedGround=3.16 → StartPoint L0 en Y=1.75 (Δ=1.41) → ✅ SELECCIONADO
-//    searchOrigin elevado al hitMargin sobre estimatedGround → SamplePosition
-//    encuentra NavMesh en Y=1.80 dentro del rango → SYNC EXITOSO.
+//  FIX 2 — Diagnóstico automático al 5º fallo consecutivo
+//    Cuando _consecutiveSyncFails == 5, logea automáticamente los
+//    StartPoints disponibles y sus FloorHeight para facilitar el ajuste
+//    del Inspector sin necesidad de usar ContextMenu.
 //
-//  FIX B — Throttle exponencial en path de fallo:
-//    1er fallo → cooldown 0.5s | 2do → 1s | 3ro → 2s | ... | máx 5s
-//    Elimina 240 queries/seg → 1-2/seg en fallo → CPU libre para VIO + STT.
+//  FIX 3 — searchOrigin con radio progresivo en el eje Y también
+//    Para edificios donde el NavMesh puede estar significativamente
+//    por encima O por debajo de estimFloor (rampas, escaleras), el
+//    searchOrigin ahora prueba también desde estimFloor - hitMargin/2
+//    como segunda pasada si la primera falla.
+//
+//  TODOS LOS FIXES v9.0 SE MANTIENEN INTACTOS.
 
 using System.Collections;
 using UnityEngine;
@@ -69,14 +73,14 @@ namespace IndoorNavAR.AR
         [SerializeField] private float _fullArSyncThreshold = 0.05f;
 
         [Tooltip("Tolerancia vertical (m) para aceptar un hit de NavMesh.\n\n" +
-                 "✅ v9.0: Se aplica sobre (cameraY - _eyeHeightOffset), NO sobre cameraY.\n" +
-                 "Margen efectivo = _floorSnapTolerance + 0.5f\n" +
-                 "Default 0.8f → margen efectivo 1.3m\n\n" +
-                 "Ejemplo: cámara Y=4.46, offset=1.3 → estimGround=3.16\n" +
-                 "→ busca NavMesh cerca de Y=3.16 ±1.3m\n" +
-                 "→ acepta hits entre Y=1.86 y Y=4.46\n" +
-                 "→ NavMesh en Y=1.80 → ΔY=1.36 ≈ límite, ajustar a 0.9 si falla.")]
-        [SerializeField] private float _floorSnapTolerance = 0.9f;   // subido de 0.8 → 0.9 para cubrir el caso del log
+                 "✅ v9.1: Subido de 0.9 → 1.5 para cubrir edificios donde la\n" +
+                 "losa del techo está a >1.4m del NavMesh del piso correcto.\n\n" +
+                 "hitMargin efectivo = _floorSnapTolerance + 0.5f\n" +
+                 "v9.0: 0.9 → hitMargin=1.40m — insuficiente cuando ΔY=1.92m\n" +
+                 "v9.1: 1.5 → hitMargin=2.00m — cubre ΔY hasta 2.0m\n\n" +
+                 "Si sigues viendo 'Sync fallo' aumentar en 0.2 hasta que cese.\n" +
+                 "Valor máximo recomendado: 2.5 (evitar falsos positivos en pisos)")]
+        [SerializeField] private float _floorSnapTolerance = 1.5f;   // FIX 1: 0.9 → 1.5
 
         [Header("─── VIO Recovery ───────────────────────────────────────────")]
         [SerializeField] private float _vioRecoveryDelay          = 0.8f;
@@ -96,7 +100,7 @@ namespace IndoorNavAR.AR
         [Header("─── v9.0 FIX B — Throttle de sync en fallo ─────────────────")]
         [Tooltip("Cooldown base (s) entre reintentos de sync cuando el NavMesh\n" +
                  "no es alcanzable. Se multiplica exponencialmente.\n" +
-                 "Default: 0.5s — elimina la avalancha de logs que saturaba el CPU.")]
+                 "Default: 0.5s")]
         [SerializeField] private float _syncFailCooldown    = 0.5f;
 
         [Tooltip("Cooldown máximo (s) entre reintentos de sync fallidos.\n" +
@@ -135,17 +139,17 @@ namespace IndoorNavAR.AR
         private Vector3        _lastStableAgentPos;
         private bool           _hasStablePos   = false;
 
-        private float _trackingLostTime      = 0f;   // v8.10
-        private float _trackingRecoveredTime = 0f;   // v8.12
+        private float _trackingLostTime      = 0f;
+        private float _trackingRecoveredTime = 0f;
 
         private int _stableFrameCount = 0;
         private int _syncFailFrames   = 0;
 
-        private bool _pendingAlignAfterTracking    = false;  // v8.7
+        private bool _pendingAlignAfterTracking    = false;
         private bool _alignedWithoutTracking       = false;
         private bool _lastWaitForFullyStableResult = false;
 
-        // ✅ v9.0 FIX B — Throttle exponencial de sync en fallo
+        // v9.0 FIX B: throttle exponencial
         private float _nextSyncAllowedTime     = 0f;
         private float _currentSyncFailCooldown = 0f;
         private int   _consecutiveSyncFails    = 0;
@@ -300,13 +304,11 @@ namespace IndoorNavAR.AR
             if (nowTracking)
             {
                 _trackingRecoveredTime = Time.realtimeSinceStartup;
-                // v9.0: resetear throttle al recuperar tracking
                 _consecutiveSyncFails    = 0;
                 _currentSyncFailCooldown = 0f;
                 _nextSyncAllowedTime     = 0f;
             }
 
-            // v8.7: alineación diferida
             if (nowTracking && _pendingAlignAfterTracking)
             {
                 _pendingAlignAfterTracking = false;
@@ -456,21 +458,6 @@ namespace IndoorNavAR.AR
             _lastWaitForFullyStableResult = false;
         }
 
-        /// <summary>
-        /// Alinea el XROrigin para que la cámara quede en la posición del StartPoint.
-        ///
-        /// FUNDAMENTO AR FOUNDATION:
-        ///   El XROrigin transforma el "session space" (espacio relativo al inicio
-        ///   de la sesión AR) al espacio Unity. La cámara es controlada por
-        ///   TrackedPoseDriver y NO se puede mover directamente.
-        ///   MoveCameraToWorldLocation() mueve el XROrigin.transform para que la
-        ///   cámara quede en targetPos — es la forma oficial de anclar el contenido
-        ///   AR a una posición del mundo virtual.
-        ///
-        ///   Después de esta llamada, la cámara estará en targetPos y el XROrigin
-        ///   se habrá desplazado en la cantidad necesaria. Todos los trackables
-        ///   (anclas, planos) se moverán junto con el XROrigin.
-        /// </summary>
         private void AlignXROriginOnce()
         {
             if (_xrOrigin == null) { Debug.LogError("[AROriginAligner] ❌ XROrigin null."); return; }
@@ -486,9 +473,6 @@ namespace IndoorNavAR.AR
 
             if (!_initialAlignDone)
             {
-                // targetPos = posición del StartPoint + offset de ojo
-                // MoveCameraToWorldLocation mueve el XROrigin para que la cámara
-                // (controlada por TrackedPoseDriver) quede en esta posición
                 Vector3 targetPos = startPoint.transform.position + Vector3.up * _eyeHeightOffset;
 
                 _arSessionManager?.SuppressQuickMoveDetection(frames: 5);
@@ -497,7 +481,6 @@ namespace IndoorNavAR.AR
                 _initialAlignDone    = true;
                 _lastSyncedCameraPos = new Vector3(float.PositiveInfinity, 0, 0);
 
-                // v9.0: resetear throttle tras alineación
                 _consecutiveSyncFails    = 0;
                 _currentSyncFailCooldown = 0f;
                 _nextSyncAllowedTime     = 0f;
@@ -520,33 +503,11 @@ namespace IndoorNavAR.AR
 
         #region FullAR Sync
 
-        /// <summary>
-        /// Sincroniza el agente virtual a la posición de la cámara AR en el NavMesh.
-        ///
-        /// ✅ v9.0 LÓGICA CORREGIDA:
-        ///
-        ///   PROBLEMA v8.x:
-        ///     GetExpectedFloorY(cameraY=4.46) buscaba StartPoint más cercano a Y=4.46
-        ///     → ninguno existe → retornaba 4.46 → hitRange [3.16, 5.76]
-        ///     → NavMesh en Y=1.80 FUERA del rango → FALLA PERPETUA × 60fps
-        ///
-        ///   SOLUCIÓN v9.0:
-        ///     La cámara AR está a altura de ojo. El suelo está ~1.3m más abajo.
-        ///     estimatedGround = cameraY - _eyeHeightOffset = 4.46 - 1.3 = 3.16
-        ///     GetExpectedFloorY(cameraY) busca StartPoint más cercano a 3.16
-        ///     → StartPoint L0 en Y=1.75 (Δ=1.41) → seleccionado como piso esperado
-        ///     searchOrigin.y = estimatedFloorY + hitMargin = 1.75 + 1.40 = 3.15
-        ///     SamplePosition desde Y=3.15 con r=0.5m → NavMesh en Y=1.80 → ΔY=1.35
-        ///     hitMargin = 0.9 + 0.5 = 1.40 → 1.35 ≤ 1.40 → ✅ ACEPTADO
-        ///
-        ///   El throttle exponencial garantiza que los fallos no saturen el CPU.
-        /// </summary>
         private void SyncAgentToCameraFullAR()
         {
             if (_navigationAgent == null || _xrOrigin?.Camera == null) return;
             if (!_navigationAgent.gameObject.activeSelf) return;
 
-            // Fuera de tracking → congelar en última posición estable
             if (ARSession.state != ARSessionState.SessionTracking)
             {
                 _stableFrameCount = 0; _syncFailFrames = 0;
@@ -564,28 +525,23 @@ namespace IndoorNavAR.AR
                 return;
             }
 
-            // v8.12 FIX_TIMESTAMP: cooldown post-recovery
             if (_poseQueryCooldownSec > 0f &&
                 Time.realtimeSinceStartup - _trackingRecoveredTime < _poseQueryCooldownSec)
                 return;
 
             if (_arSessionManager != null && _arSessionManager.IsQuickMovePaused) return;
 
-            // Frames estables antes de sincronizar
             _stableFrameCount++;
             if (_stableFrameCount < _stableFramesRequired) return;
 
-            // ✅ v9.0 FIX B: Throttle — no ejecutar durante cooldown de fallo
             if (_currentSyncFailCooldown > 0f && Time.unscaledTime < _nextSyncAllowedTime)
                 return;
 
             Vector3 cameraPos = _xrOrigin.Camera.transform.position;
 
-            // Umbral de movimiento
             if (Vector3.Distance(cameraPos, _lastSyncedCameraPos) < _fullArSyncThreshold) return;
             _lastSyncedCameraPos = cameraPos;
 
-            // Si navegando, asegurar que el agente esté parado
             if (_navigationAgent.IsNavigating)
             {
                 if (_agentNavMeshAgent?.enabled == true &&
@@ -595,12 +551,10 @@ namespace IndoorNavAR.AR
                 return;
             }
 
-            // ✅ v9.0 FIX A: Calcular piso esperado desde suelo estimado (no desde cámara)
             float estimatedFloorY = GetExpectedFloorY(cameraPos.y);
             float hitMargin       = _floorSnapTolerance + 0.5f;
 
-            // searchOrigin: XZ de la cámara, Y elevado al hitMargin sobre el piso esperado
-            // para que SamplePosition encuentre el NavMesh hacia abajo
+            // Pasada 1: searchOrigin sobre el piso esperado (caso normal)
             Vector3 searchOrigin = new Vector3(cameraPos.x, estimatedFloorY + hitMargin, cameraPos.z);
 
             NavMeshHit bestHit = default;
@@ -619,16 +573,41 @@ namespace IndoorNavAR.AR
                     break;
                 }
 
-                // Log reducido: solo en debug (no cada frame)
                 if (_logAlignment)
                     Debug.Log($"[AROriginAligner] Hit r={r}m descartado: " +
                               $"hitY={hit.position.y:F2} estimFloor={estimatedFloorY:F2} " +
                               $"ΔY={deltaY:F2} margen={hitMargin:F2}");
             }
 
+            // FIX 3: Pasada 2 si la primera falló — searchOrigin desde debajo
+            // Cubre casos donde el NavMesh está significativamente por debajo
+            // del suelo estimado (ej: rampas descendentes, desniveles).
+            if (!found)
+            {
+                Vector3 searchOriginLow = new Vector3(
+                    cameraPos.x,
+                    estimatedFloorY - hitMargin * 0.5f,
+                    cameraPos.z);
+
+                foreach (float r in new[] { 1.0f, 2.0f, _fullArSnapRadius })
+                {
+                    if (!NavMesh.SamplePosition(searchOriginLow, out NavMeshHit hit, r, NavMesh.AllAreas))
+                        continue;
+
+                    float deltaY = Mathf.Abs(hit.position.y - estimatedFloorY);
+                    if (deltaY <= hitMargin)
+                    {
+                        bestHit = hit;
+                        found   = true;
+                        if (_logAlignment)
+                            Log($"Hit pasada2 r={r}m: hitY={hit.position.y:F2} ΔY={deltaY:F2} ✅");
+                        break;
+                    }
+                }
+            }
+
             if (found)
             {
-                // Resetear throttle al tener sync exitoso
                 _syncFailFrames          = 0;
                 _consecutiveSyncFails    = 0;
                 _currentSyncFailCooldown = 0f;
@@ -647,23 +626,24 @@ namespace IndoorNavAR.AR
             }
             else
             {
-                // ✅ v9.0 FIX B: Fallo → cooldown exponencial
                 _syncFailFrames++;
                 _consecutiveSyncFails++;
 
-                // 1er fallo→0.5s | 2do→1s | 3ro→2s | 4to→4s | 5to→5s (max)
                 _currentSyncFailCooldown = Mathf.Min(
                     _syncFailCooldown * Mathf.Pow(2f, _consecutiveSyncFails - 1),
                     _syncFailCooldownMax);
                 _nextSyncAllowedTime = Time.unscaledTime + _currentSyncFailCooldown;
 
                 Debug.LogWarning(
-                    $"[AROriginAligner] ⚠️ Sync fallo #{_consecutiveSyncFails} — " +
+                    $"[AROriginAligner] ! Sync fallo #{_consecutiveSyncFails} — " +
                     $"camY={cameraPos.y:F2} estimFloor={estimatedFloorY:F2} " +
                     $"searchOrigin={searchOrigin:F2} " +
                     $"cooldown={_currentSyncFailCooldown:F1}s");
 
-                // Warp de emergencia tras N fallos
+                // FIX 2: diagnóstico automático al 5º fallo
+                if (_consecutiveSyncFails == 5)
+                    LogStartPointDiagnostic(estimatedFloorY, hitMargin);
+
                 if (_syncFailThreshold > 0 && _syncFailFrames >= _syncFailThreshold)
                 {
                     _syncFailFrames = 0; _consecutiveSyncFails = 0;
@@ -672,22 +652,30 @@ namespace IndoorNavAR.AR
             }
         }
 
-        /// <summary>
-        /// ✅ v9.0 FIX A — GetExpectedFloorY corregido.
-        ///
-        ///   Descuenta _eyeHeightOffset de cameraY antes de buscar el piso más cercano.
-        ///   La cámara AR está a altura de ojo, no a altura de suelo.
-        ///
-        ///   ANTES (v8.x, INCORRECTO):
-        ///     return StartPoint más cercano a cameraY
-        ///     → con cameraY=4.46: ningún StartPoint cercano → retorna 4.46 → FALLA
-        ///
-        ///   AHORA (v9.0, CORRECTO):
-        ///     estimatedGround = cameraY - _eyeHeightOffset
-        ///     return StartPoint más cercano a estimatedGround
-        ///     → con cameraY=4.46, offset=1.3: estimatedGround=3.16
-        ///     → StartPoint L0 en Y=1.75 (Δ=1.41) → retorna 1.75 ✅
-        /// </summary>
+        // FIX 2: diagnóstico automático de StartPoints para ajuste de Inspector
+        private void LogStartPointDiagnostic(float estimatedFloorY, float hitMargin)
+        {
+            var pts = NavigationStartPointManager.GetAllStartPoints();
+            var sb = new System.Text.StringBuilder();
+            sb.AppendLine("[AROriginAligner] ⚠️ DIAGNÓSTICO SYNC — 5 fallos consecutivos:");
+            sb.AppendLine($"  estimatedFloorY={estimatedFloorY:F3} | hitMargin={hitMargin:F3}");
+            sb.AppendLine($"  _floorSnapTolerance={_floorSnapTolerance} | _eyeHeightOffset={_eyeHeightOffset}");
+            sb.AppendLine($"  Para que el sync funcione: ΔY entre FloorHeight y estimatedFloorY ≤ hitMargin");
+            sb.AppendLine("  StartPoints disponibles:");
+
+            foreach (var pt in pts)
+            {
+                if (pt == null) continue;
+                float delta = Mathf.Abs(pt.FloorHeight - estimatedFloorY);
+                bool  ok    = delta <= hitMargin;
+                sb.AppendLine($"    Level{pt.Level}: FloorH={pt.FloorHeight:F3} | " +
+                              $"Δ={delta:F3} | {(ok ? "✅ EN RANGO" : $"❌ FUERA — necesita _floorSnapTolerance ≥ {delta - 0.5f:F2}")}");
+            }
+
+            sb.AppendLine($"  ACCIÓN: en Inspector, subir _floorSnapTolerance hasta que todos sean ✅");
+            Debug.LogWarning(sb.ToString());
+        }
+
         private float GetExpectedFloorY(float cameraY)
         {
             float estimatedGroundY = cameraY - _eyeHeightOffset;
@@ -708,9 +696,6 @@ namespace IndoorNavAR.AR
             return bestFloorY;
         }
 
-        /// <summary>
-        /// ✅ v9.0 FIX D — Warp de emergencia sin restricción de Y.
-        /// </summary>
         private void EmergencyWarpAgentToCamera(Vector3 cameraPos)
         {
             float   estimatedGroundY = cameraPos.y - _eyeHeightOffset;
@@ -790,12 +775,13 @@ namespace IndoorNavAR.AR
 
         private void Log(string m) { if (_logAlignment) Debug.Log($"[AROriginAligner] {m}"); }
 
-        [ContextMenu("ℹ️ Info v9.0")]
+        [ContextMenu("ℹ️ Info v9.1")]
         private void DebugInfo()
         {
             float camY        = _xrOrigin?.Camera != null ? _xrOrigin.Camera.transform.position.y : -999f;
             float estimGround = camY - _eyeHeightOffset;
             float efy         = GetExpectedFloorY(camY);
+            float hitMargin   = _floorSnapTolerance + 0.5f;
             float lostDur     = _trackingLost ? Time.realtimeSinceStartup - _trackingLostTime : 0f;
             float recovAgo    = Time.realtimeSinceStartup - _trackingRecoveredTime;
             float syncCoolRem = Mathf.Max(0f, _nextSyncAllowedTime - Time.unscaledTime);
@@ -803,29 +789,29 @@ namespace IndoorNavAR.AR
 
             Debug.Log(
                 "══════════════════════════════════════════════\n" +
-                "  AROriginAligner v9.0\n" +
+                "  AROriginAligner v9.1\n" +
                 "══════════════════════════════════════════════\n" +
-                $"  Modo:             {(IsNoArMode ? "NoAR" : "FullAR")}\n" +
-                $"  ARSession:        {ARSession.state}\n" +
-                $"  InitialAlignDone: {_initialAlignDone}\n" +
-                $"  TrackingLost:     {_trackingLost} ({lostDur * 1000:F0}ms)\n" +
-                $"  PoseCooldown:     {_poseQueryCooldownSec}s | recovAgo={recovAgo:F2}s | " +
-                    $"inCooldown={recovAgo < _poseQueryCooldownSec}\n" +
-                $"  camY:             {camY:F3}\n" +
-                $"  estimGround:      {estimGround:F3}  (camY - eyeOffset={_eyeHeightOffset})\n" +
-                $"  expectedFloorY:   {efy:F3}  (StartPoint más cercano a estimGround)\n" +
-                $"  hitMargin:        ±{_floorSnapTolerance + 0.5f:F2}m\n" +
-                $"  SyncFails:        #{_consecutiveSyncFails} | " +
-                    $"cooldown={_currentSyncFailCooldown:F1}s | restante={syncCoolRem:F1}s\n" +
-                $"  StartPoint:       {(sp != null ? $"{sp.gameObject.name} @ {sp.transform.position:F2}" : "N/A")}\n" +
+                $"  Modo:                {(IsNoArMode ? "NoAR" : "FullAR")}\n" +
+                $"  ARSession:           {ARSession.state}\n" +
+                $"  InitialAlignDone:    {_initialAlignDone}\n" +
+                $"  TrackingLost:        {_trackingLost} ({lostDur * 1000:F0}ms)\n" +
+                $"  PoseCooldown:        {_poseQueryCooldownSec}s | recovAgo={recovAgo:F2}s\n" +
+                $"  camY:                {camY:F3}\n" +
+                $"  estimGround:         {estimGround:F3}  (camY - eyeOffset={_eyeHeightOffset})\n" +
+                $"  expectedFloorY:      {efy:F3}\n" +
+                $"  _floorSnapTolerance: {_floorSnapTolerance} → hitMargin={hitMargin:F2}m\n" +
+                $"  SyncFails:           #{_consecutiveSyncFails} | cooldown={_currentSyncFailCooldown:F1}s\n" +
+                $"  StartPoint:          {(sp != null ? $"{sp.gameObject.name} @ {sp.transform.position:F2}" : "N/A")}\n" +
                 "══════════════════════════════════════════════");
 
             foreach (var pt in NavigationStartPointManager.GetAllStartPoints())
             {
                 if (pt == null) continue;
                 float dGround = Mathf.Abs(pt.FloorHeight - estimGround);
+                bool  inRange = dGround <= hitMargin;
                 Debug.Log($"  Level{pt.Level}: FloorH={pt.FloorHeight:F3} | " +
-                          $"Δground={dGround:F3} {(pt.FloorHeight == efy ? "← SELECCIONADO" : "")}");
+                          $"Δground={dGround:F3} | {(inRange ? "✅ EN RANGO" : $"❌ — sube _floorSnapTolerance a ≥{dGround - 0.5f:F2}")} " +
+                          $"{(pt.FloorHeight == efy ? "← SELECCIONADO" : "")}");
             }
         }
 
@@ -844,23 +830,6 @@ namespace IndoorNavAR.AR
         {
             if (!_noArMode && _xrOrigin?.Camera != null)
                 EmergencyWarpAgentToCamera(_xrOrigin.Camera.transform.position);
-        }
-
-        [ContextMenu("⏳ Simular pendingAlign")]
-        private void DebugPending()
-        {
-            _pendingAlignAfterTracking = true;
-            Debug.Log("[AROriginAligner] pendingAlign=true");
-        }
-
-        [ContextMenu("🕒 Simular recovery + reset throttle")]
-        private void DebugRecovery()
-        {
-            _trackingRecoveredTime   = Time.realtimeSinceStartup;
-            _consecutiveSyncFails    = 0;
-            _currentSyncFailCooldown = 0f;
-            _nextSyncAllowedTime     = 0f;
-            Debug.Log($"[AROriginAligner] Recovery simulado. PoseCooldown {_poseQueryCooldownSec}s activo.");
         }
 
         [ContextMenu("🔄 Resetear throttle de sync")]
