@@ -279,11 +279,10 @@ MonoBehaviour:
   m_Script: {fileID: 11500000, guid: 9ab76f13e76134741abd30719e7a5895, type: 3}
   m_Name: 
   m_EditorClassIdentifier: Assembly-CSharp::IndoorNavAR.AR.ARPerformanceManager
-  _normalFrameRate: 30
+  _arSession: {fileID: 0}
+  _targetFrameRate: 30
   _heavyLoadFrameRate: 15
-  _matchARFrameRate: 1
-  _minHeavyLoadDuration: 1
-  _logChanges: 1
+  _logPerformance: 1
 --- !u!1 &186852593
 GameObject:
   m_ObjectHideFlags: 0
@@ -517,6 +516,10 @@ MonoBehaviour:
   _postNavMeshDelayMs: 800
   _postStairsDelayMs: 500
   _trackingWaitTimeout: 15
+  _vioStableTimeoutSec: 8
+  _vioPollMs: 300
+  _vioStableChecks: 5
+  _vioPostStableDelayMs: 500
   _logOperations: 0
 --- !u!114 &626949938 stripped
 MonoBehaviour:
@@ -1069,6 +1072,8 @@ MonoBehaviour:
   _autoLoadModel: 1
   _alignWaitTimeout: 5
   _alignPollInterval: 0.2
+  _releaseMemoryBeforeAR: 1
+  _initFrameRate: 30
   _logDetailedEvents: 0
 --- !u!195 &1001452946
 NavMeshAgent:
@@ -1213,6 +1218,7 @@ MonoBehaviour:
   _vioRecoveryDelay: 0.8
   _freezeAgentOnTrackingLoss: 1
   _minTrackingLostDuration: 0.5
+  _poseQueryCooldownSec: 1.5
   _stableFramesRequired: 10
   _syncFailThreshold: 120
   _fullStabilityTimeout: 12
@@ -1605,7 +1611,10 @@ MonoBehaviour:
   _roiTopSkip: 0.4
   _inferenceInterval: 3
   _obstacleAlertThreshold: 0.12
-  _alertCooldown: 3.5
+  _obstacleHighThreshold: 0.4
+  _alertCooldownNormal: 7
+  _alertCooldownHigh: 12
+  _obstacleConfirmCount: 2
   _onlyDuringNavigation: 1
   _logStats: 1
   _logFrameCapture: 1
@@ -1677,6 +1686,7 @@ MonoBehaviour:
   m_Script: {fileID: 11500000, guid: ec6a57dd72b153d4c830fe1399479b93, type: 3}
   m_Name: 
   m_EditorClassIdentifier: Assembly-CSharp::IndoorNavAR.Navigation.NavMeshObstacleAgent
+  _obstacleSize: {x: 2, y: 1.8, z: 1.4}
   _lifetimeSeconds: 8
   _forwardOffset: 1.5
 --- !u!208 &1375737371
@@ -1689,7 +1699,7 @@ NavMeshObstacle:
   m_Enabled: 1
   serializedVersion: 3
   m_Shape: 1
-  m_Extents: {x: 0.7, y: 0.5, z: 0.5}
+  m_Extents: {x: 1, y: 0.9, z: 0.7}
   m_MoveThreshold: 0.1
   m_Carve: 1
   m_CarveOnlyStationary: 1
@@ -1908,7 +1918,7 @@ GameObject:
   m_Icon: {fileID: 0}
   m_NavMeshLayer: 0
   m_StaticEditorFlags: 0
-  m_IsActive: 1
+  m_IsActive: 0
 --- !u!224 &1767928039
 RectTransform:
   m_ObjectHideFlags: 0
@@ -2142,6 +2152,10 @@ MonoBehaviour:
   m_Script: {fileID: 11500000, guid: 89630d0447c8be64cae88d09bdda4621, type: 3}
   m_Name: 
   m_EditorClassIdentifier: Assembly-CSharp::IndoorNavAR.Integration.FlutterUnityBridge
+  _verboseLogs: 1
+  _waypointManager: {fileID: 0}
+  _navigationManager: {fileID: 0}
+  _persistenceManager: {fileID: 0}
 --- !u!4 &1964602099
 Transform:
   m_ObjectHideFlags: 0

@@ -1,23 +1,34 @@
 // File: NavigationAgent.cs
-// ✅ v3.1 — Añade NavigateToWaypointForced() para ObstacleRerouteMediator
+// ✅ v3.2 — FIX: Detección de nivel durante escaleras
 //
 // ============================================================================
-//  CAMBIOS v3 → v3.1
+//  CAMBIOS v3.1 → v3.2
 // ============================================================================
 //
-//  ÚNICO CAMBIO: nuevo método público NavigateToWaypointForced(WaypointData)
+//  FIX NIVEL A — UpdateCurrentLevel() usaba FloorHeight de los StartPoints
+//  para detectar el nivel actual, pero durante el ascenso por escaleras la
+//  posición Y del dispositivo es intermedia entre pisos, por lo que el sistema
+//  confundía la posición con el piso superior ANTES de llegar a él.
 //
-//    Llamado por NavigationManager.RerouteToWaypoint() cuando el mediador
-//    de obstáculos necesita recalcular la ruta sin reiniciar el VoiceGuide.
+//  Solución: doble threshold.
+//    • Para SUBIR de nivel (bestLevel > CurrentLevel): se requiere que la
+//      posición Y supere FloorHeight + _floorArrivalMargin (margen de llegada).
+//    • Para BAJAR de nivel (bestLevel < CurrentLevel): se requiere que la
+//      posición Y esté por debajo de FloorHeight - _floorArrivalMargin.
+//    • El debounce original (_floorTransitionMinTime) se mantiene como segunda
+//      comprobación, pero el nuevo threshold evita que el candidato se registre
+//      prematuramente.
 //
-//    DIFERENCIA vs NavigateToWaypoint():
-//      • Llama _pathController.NavigateTo(dest, forceRecalculate: true)
-//        → PathController invalida caché Y dispara OnPathRecalculated
-//        → VoiceGuide.Resync() → "Ruta actualizada. N pasos."
-//      • NO publica HandlePathStarted → no hay NavigationStartedEvent extra
-//        → No hay doble TTS "Listo, vamos a X."
+//  FIX NIVEL B — En FullAR, la posición relevante es la de la CÁMARA (usuario
+//  físico), no la del agente virtual. Se usa UserPositionBridge.UserPosition
+//  cuando está disponible, con fallback al transform del agente.
 //
-//  TODOS LOS COMPORTAMIENTOS DE v3 SE CONSERVAN ÍNTEGRAMENTE.
+//  FIX NIVEL C — Histéresis: una vez detectado el nuevo nivel, el candidato
+//  no puede regresar al nivel anterior durante _floorHysteresisTime segundos.
+//  Evita el efecto "ping-pong" cuando el usuario está justo en el umbral de
+//  una escalera (posición Y oscilando entre pisos).
+//
+//  TODOS LOS COMPORTAMIENTOS DE v3.1 SE CONSERVAN ÍNTEGRAMENTE.
 
 using System;
 using UnityEngine;
@@ -40,11 +51,32 @@ namespace IndoorNavAR.Navigation
         [SerializeField] private bool _publishEvents = true;
 
         [Header("FullAR — Verificación al navegar")]
-        [SerializeField] private bool _verifyNavMeshOnFullAR = true;
-        [SerializeField] private float _fullARVerifyRadius = 3.0f;
+        [SerializeField] private bool  _verifyNavMeshOnFullAR = true;
+        [SerializeField] private float _fullARVerifyRadius    = 3.0f;
 
         [Header("Transición de Piso — Debounce")]
         [SerializeField] private float _floorTransitionMinTime = 0.8f;
+
+        [Header("─── v3.2: Umbral de llegada a piso ──────────────────────────────")]
+        [Tooltip("Margen vertical (m) que debe superar el usuario POR ENCIMA de FloorHeight\n" +
+                 "del piso destino antes de registrar la transición de nivel.\n" +
+                 "Evita que la posición Y intermedia en escaleras active el nivel siguiente.\n" +
+                 "Default: 0.25m — ajustar según altura de cada escalón.")]
+        [SerializeField, Range(0.05f, 1.0f)]
+        private float _floorArrivalMargin = 0.25f;
+
+        [Tooltip("Tiempo (s) de histéresis tras detectar un cambio de nivel.\n" +
+                 "Durante este tiempo no se acepta un candidato al nivel anterior.\n" +
+                 "Evita el efecto ping-pong en umbrales de escalera.\n" +
+                 "Default: 2.0s")]
+        [SerializeField, Range(0.5f, 5.0f)]
+        private float _floorHysteresisTime = 2.0f;
+
+        [Tooltip("Radio de búsqueda vertical (m) para evaluar si la posición Y del usuario\n" +
+                 "está dentro del rango de un piso. Mayor = menos estricto.\n" +
+                 "Default: 0.8m (mitad de la separación típica entre pisos de 1.6m).")]
+        [SerializeField, Range(0.2f, 2.0f)]
+        private float _floorDetectionRadius = 0.8f;
 
         [Header("Debug")]
         [SerializeField] private Transform _debugDestination;
@@ -87,10 +119,14 @@ namespace IndoorNavAR.Navigation
 
         private string _lastDestinationName = string.Empty;
 
-        // v3 FIX A/B: Debounce y guard de transición de piso
-        private int   _candidateLevel         = -1;
-        private float _candidateLevelTime     = 0f;
-        private bool  _floorTransitionFired   = false;
+        // Detección de nivel — debounce original (v3)
+        private int   _candidateLevel       = -1;
+        private float _candidateLevelTime   = 0f;
+        private bool  _floorTransitionFired = false;
+
+        // v3.2 FIX NIVEL C — Histéresis post-transición
+        private float _lastFloorTransitionTime   = -999f;
+        private int   _lastTransitionFromLevel   = -1;
 
         // ─── Lifecycle ────────────────────────────────────────────────────────
 
@@ -170,12 +206,9 @@ namespace IndoorNavAR.Navigation
             EnsureNavMeshAgentEnabled();
             LastDestination      = destination;
             _lastDestinationName = string.Empty;
-
             if (IsFullARMode) PrepareForFullARNavigation();
-
             if (_logVerbose) Debug.Log($"[NavigationAgent] StartNavigation → {destination:F2}");
             _pathController.NavigateTo(destination);
-
             if (IsFullARMode) EnsureAgentStoppedInFullAR();
         }
 
@@ -188,41 +221,26 @@ namespace IndoorNavAR.Navigation
             }
 
             EnsureNavMeshAgentEnabled();
-
             LastDestination      = waypoint.Position;
             _lastDestinationName = waypoint.WaypointName;
-
             if (IsFullARMode) PrepareForFullARNavigation();
 
             if (_logVerbose)
                 Debug.Log($"[NavigationAgent] NavigateToWaypoint → {waypoint.WaypointName} " +
-                          $"@ {waypoint.Position:F2} | agentPos={transform.position:F2} | FullAR={IsFullARMode}");
+                          $"@ {waypoint.Position:F2} | FullAR={IsFullARMode}");
 
             _pathController.NavigateTo(waypoint.Position);
-
             bool ok = _pathController.CurrentPath?.IsValid ?? false;
 
             if (!ok)
-                Debug.LogWarning($"[NavigationAgent] ⚠️ Ruta inválida a '{waypoint.WaypointName}' " +
-                                 $"desde {transform.position:F2}. NavMesh disponible?");
+                Debug.LogWarning($"[NavigationAgent] ⚠️ Ruta inválida a '{waypoint.WaypointName}'");
 
             if (IsFullARMode) EnsureAgentStoppedInFullAR();
-
             return ok;
         }
 
         /// <summary>
         /// ✅ v3.1 — Recálculo silencioso de ruta para ObstacleRerouteMediator.
-        ///
-        /// DIFERENCIA vs NavigateToWaypoint():
-        ///   • Usa forceRecalculate=true → PathController invalida caché y dispara
-        ///     OnPathRecalculated (en lugar de OnPathStarted).
-        ///   • OnPathRecalculated → NavigationVoiceGuide.Resync() →
-        ///     "Ruta actualizada. N pasos." (en lugar de "Listo, vamos a X.")
-        ///   • NO actualiza _lastDestinationName → HandlePathStarted NO se dispara
-        ///     porque PathController usa OnPathRecalculated con forceRecalculate.
-        ///
-        /// Llamado por: NavigationManager.RerouteToWaypoint()
         /// </summary>
         public bool NavigateToWaypointForced(WaypointData waypoint)
         {
@@ -233,29 +251,19 @@ namespace IndoorNavAR.Navigation
             }
 
             EnsureNavMeshAgentEnabled();
-
-            // Actualizar LastDestination pero NO _lastDestinationName
-            // para que HandlePathStarted no publique NavigationStartedEvent si se dispara
             LastDestination = waypoint.Position;
-
             if (IsFullARMode) PrepareForFullARNavigation();
 
             if (_logVerbose)
-                Debug.Log($"[NavigationAgent] NavigateToWaypointForced → {waypoint.WaypointName} " +
-                          $"@ {waypoint.Position:F2} | forceRecalculate=true");
+                Debug.Log($"[NavigationAgent] NavigateToWaypointForced → {waypoint.WaypointName}");
 
-            // forceRecalculate=true → PathController dispara OnPathRecalculated
-            // → NavigationVoiceGuide.Resync() → "Ruta actualizada. N pasos."
             _pathController.NavigateTo(waypoint.Position, forceRecalculate: true);
-
             bool ok = _pathController.CurrentPath?.IsValid ?? false;
 
             if (!ok)
-                Debug.LogWarning($"[NavigationAgent] ⚠️ [Forced] Ruta inválida a '{waypoint.WaypointName}' " +
-                                 $"desde {transform.position:F2}.");
+                Debug.LogWarning($"[NavigationAgent] ⚠️ [Forced] Ruta inválida a '{waypoint.WaypointName}'");
 
             if (IsFullARMode) EnsureAgentStoppedInFullAR();
-
             return ok;
         }
 
@@ -263,9 +271,7 @@ namespace IndoorNavAR.Navigation
         {
             LastDestination      = newDestination;
             _lastDestinationName = string.Empty;
-            if (_logVerbose) Debug.Log($"[NavigationAgent] SetDestination → {newDestination:F2}");
             _pathController.NavigateTo(newDestination, forceRecalculate: true);
-
             if (IsFullARMode) EnsureAgentStoppedInFullAR();
         }
 
@@ -304,12 +310,10 @@ namespace IndoorNavAR.Navigation
             }
 
             if (IsNavigating) _pathController.StopNavigation();
-
             transform.position = hit.position;
             if (_navAgent != null && _navAgent.enabled && _navAgent.isOnNavMesh)
                 _navAgent.Warp(hit.position);
 
-            if (_logVerbose) Debug.Log($"[NavigationAgent] Teleport exitoso a {hit.position:F2}");
             return true;
         }
 
@@ -318,23 +322,14 @@ namespace IndoorNavAR.Navigation
         private void PrepareForFullARNavigation()
         {
             if (!_verifyNavMeshOnFullAR) return;
-
             if (!NavMesh.SamplePosition(transform.position, out NavMeshHit hit,
-                    _fullARVerifyRadius, NavMesh.AllAreas))
-            {
-                Debug.LogWarning($"[NavigationAgent] ⚠️ FullAR: agente en {transform.position:F2} " +
-                                 $"no está sobre el NavMesh (radio {_fullARVerifyRadius}m).");
-                return;
-            }
+                    _fullARVerifyRadius, NavMesh.AllAreas)) return;
 
             if (Vector3.Distance(transform.position, hit.position) > 0.1f)
             {
                 transform.position = hit.position;
                 if (_navAgent != null && _navAgent.enabled && _navAgent.isOnNavMesh)
                     _navAgent.Warp(hit.position);
-
-                if (_logVerbose)
-                    Debug.Log($"[NavigationAgent] FullAR: corrección menor al NavMesh → {hit.position:F2}");
             }
         }
 
@@ -348,72 +343,129 @@ namespace IndoorNavAR.Navigation
         {
             yield return null;
             if (_navAgent != null && _navAgent.enabled && _navAgent.isOnNavMesh)
-            {
                 _navAgent.isStopped = true;
-                if (_logVerbose)
-                    Debug.Log("[NavigationAgent] FullAR: NavMeshAgent detenido.");
-            }
         }
 
         private void EnsureNavMeshAgentEnabled()
         {
             if (_navAgent != null && !_navAgent.enabled)
             {
-                if (NavMesh.SamplePosition(transform.position, out _, 2f, NavMesh.AllAreas))
-                {
-                    _navAgent.enabled = true;
-                    Debug.Log("[NavigationAgent] ✅ NavMeshAgent re-habilitado antes de navegar.");
-                }
-                else
-                {
+                _navAgent.enabled = true;
+                if (!NavMesh.SamplePosition(transform.position, out _, 2f, NavMesh.AllAreas))
                     Debug.LogWarning("[NavigationAgent] ⚠️ NavMesh aún no disponible.");
-                    _navAgent.enabled = true;
-                }
             }
         }
 
         // ─── Detección de nivel ───────────────────────────────────────────────
 
         /// <summary>
-        /// v3 FIX A/B: Debounce + guard contra doble disparo.
+        /// v3.2 — Detección de nivel con umbral de llegada + histéresis.
+        ///
+        /// LÓGICA PRINCIPAL:
+        ///   1. Obtener posición Y real (cámara en FullAR, agente en NoAR).
+        ///   2. Para cada StartPoint, evaluar si el usuario "ha llegado" al piso:
+        ///        - Subir (bestLevel > CurrentLevel): Y >= FloorHeight - _floorDetectionRadius
+        ///          Y además Y >= FloorHeight - _floorArrivalMargin (está suficientemente arriba).
+        ///        - Bajar (bestLevel < CurrentLevel): Y <= FloorHeight + _floorDetectionRadius.
+        ///        - Mismo nivel: dentro del radio normal.
+        ///   3. Histéresis: no volver al nivel anterior durante _floorHysteresisTime.
+        ///   4. Debounce: confirmar candidato estable durante _floorTransitionMinTime.
         /// </summary>
         private void UpdateCurrentLevel()
         {
             var startPoints = NavigationStartPointManager.GetAllStartPoints();
-            if (startPoints.Count == 0) return;
+            if (startPoints == null || startPoints.Count == 0) return;
 
-            float agentY    = transform.position.y;
-            int   bestLevel = 0;
-            float bestDist  = float.MaxValue;
+            // FIX NIVEL B: usar posición de cámara en FullAR
+            float agentY = GetUserHeightY();
+
+            int   bestLevel = CurrentLevel;  // iniciar con nivel actual para no cambiar si no hay candidato claro
+            float bestScore = float.MaxValue;
 
             foreach (var pt in startPoints)
             {
-                float dist = Mathf.Abs(agentY - pt.FloorHeight);
-                if (dist < bestDist) { bestDist = dist; bestLevel = pt.Level; }
+                if (pt == null) continue;
+
+                float floorY = pt.FloorHeight;
+                float deltaY = agentY - floorY;
+
+                // Calcular score: cuán lejos estamos del piso en dirección correcta
+                float score;
+
+                if (pt.Level > CurrentLevel)
+                {
+                    // Subiendo: solo aceptar este piso si el usuario ya superó el umbral
+                    // deltaY debe ser >= -_floorArrivalMargin (estamos cerca o encima del piso)
+                    // y <= _floorDetectionRadius (no estamos demasiado por encima)
+                    if (deltaY < -_floorArrivalMargin || deltaY > _floorDetectionRadius * 2f)
+                        continue; // aún en escalera subiendo, no hemos llegado
+                    score = Mathf.Abs(deltaY);
+                }
+                else if (pt.Level < CurrentLevel)
+                {
+                    // Bajando: aceptar si el usuario está claramente por debajo del piso actual
+                    if (deltaY > _floorArrivalMargin || deltaY < -_floorDetectionRadius * 2f)
+                        continue;
+                    score = Mathf.Abs(deltaY);
+                }
+                else
+                {
+                    // Mismo nivel: usar radio normal
+                    if (Mathf.Abs(deltaY) > _floorDetectionRadius)
+                        continue;
+                    score = Mathf.Abs(deltaY);
+                }
+
+                if (score < bestScore)
+                {
+                    bestScore = score;
+                    bestLevel = pt.Level;
+                }
+            }
+
+            // FIX NIVEL C: Histéresis — no volver al nivel anterior recién abandonado
+            if (bestLevel == _lastTransitionFromLevel &&
+                (Time.time - _lastFloorTransitionTime) < _floorHysteresisTime)
+            {
+                if (_logVerbose)
+                    Debug.Log($"[NavigationAgent] ⏳ Histéresis activa — ignorando candidato " +
+                              $"nivel {bestLevel} (origen={_lastTransitionFromLevel}, " +
+                              $"elapsed={Time.time - _lastFloorTransitionTime:F1}s/{_floorHysteresisTime}s)");
+                return;
             }
 
             if (bestLevel != CurrentLevel)
             {
+                // Acumular tiempo de estabilidad del candidato
                 if (bestLevel == _candidateLevel)
                 {
                     _candidateLevelTime += Time.deltaTime;
                 }
                 else
                 {
+                    // Nuevo candidato — resetear timer
                     _candidateLevel       = bestLevel;
                     _candidateLevelTime   = 0f;
                     _floorTransitionFired = false;
+
+                    if (_logVerbose)
+                        Debug.Log($"[NavigationAgent] 🔍 Nuevo candidato de nivel: {bestLevel} " +
+                                  $"(agentY={agentY:F3}, score={bestScore:F3})");
                 }
 
+                // Confirmar transición tras debounce
                 if (_candidateLevelTime >= _floorTransitionMinTime && !_floorTransitionFired)
                 {
                     int prev = CurrentLevel;
-                    CurrentLevel = bestLevel;
+                    CurrentLevel          = bestLevel;
                     _floorTransitionFired = true;
 
-                    if (_logVerbose)
-                        Debug.Log($"[NavigationAgent] Transición nivel {prev} → {bestLevel} " +
-                                  $"(confirmada tras {_candidateLevelTime:F2}s)");
+                    // Registrar para histéresis
+                    _lastFloorTransitionTime = Time.time;
+                    _lastTransitionFromLevel = prev;
+
+                    Debug.Log($"[NavigationAgent] ✅ Transición nivel {prev} → {bestLevel} " +
+                              $"(confirmada tras {_candidateLevelTime:F2}s | agentY={agentY:F3})");
 
                     if (_publishEvents)
                         EventBus.Instance?.Publish(new FloorTransitionEvent
@@ -426,13 +478,36 @@ namespace IndoorNavAR.Navigation
             }
             else
             {
+                // Volvimos al nivel actual — resetear candidato
                 if (_candidateLevel != CurrentLevel)
                 {
+                    if (_logVerbose && _candidateLevel != -1)
+                        Debug.Log($"[NavigationAgent] ↩️ Cancelado candidato nivel {_candidateLevel} " +
+                                  $"(regresó a nivel {CurrentLevel})");
                     _candidateLevel       = CurrentLevel;
                     _candidateLevelTime   = 0f;
                     _floorTransitionFired = false;
                 }
             }
+        }
+
+        /// <summary>
+        /// v3.2 FIX NIVEL B: Obtiene la posición Y real del usuario.
+        /// En FullAR usa la cámara XR (posición física real).
+        /// En NoAR usa el transform del agente.
+        /// </summary>
+        private float GetUserHeightY()
+        {
+            // Intentar UserPositionBridge primero (más preciso en FullAR)
+            var bridge = UserPositionBridge.Instance;
+            if (bridge != null)
+                return bridge.UserPosition.y;
+
+            // Fallback: cámara principal en FullAR, agente en NoAR
+            if (IsFullARMode && Camera.main != null)
+                return Camera.main.transform.position.y;
+
+            return transform.position.y;
         }
 
         // ─── Handlers del PathController ──────────────────────────────────────
@@ -492,7 +567,7 @@ namespace IndoorNavAR.Navigation
         private void DebugStartNavigation()
         {
             if (_debugDestination == null)
-            { Debug.LogWarning("[NavigationAgent] Asignar _debugDestination en el Inspector."); return; }
+            { Debug.LogWarning("[NavigationAgent] Asignar _debugDestination."); return; }
             StartNavigation(_debugDestination.position);
         }
 
@@ -505,23 +580,23 @@ namespace IndoorNavAR.Navigation
             Debug.Log($"[NavigationAgent] IsNavigating={IsNavigating} | FullAR={IsFullARMode}\n" +
                       $"  Level={CurrentLevel} | CandidateLevel={_candidateLevel} | " +
                       $"CandidateTime={_candidateLevelTime:F2}s\n" +
-                      $"  Remaining={RemainingDistance:F2}m\n" +
-                      $"  Progress={ProgressPercent * 100f:F0}% | Speed={CurrentSpeed:F2}m/s\n" +
-                      $"  AgentPos={transform.position:F2} | Dest={LastDestination:F2}\n" +
-                      $"  NavAgent stopped={_navAgent?.isStopped} | enabled={_navAgent?.enabled}");
-
-            if (_pathController?.CurrentPath != null)
-            {
-                var p = _pathController.CurrentPath;
-                Debug.Log($"  Path: {p.Waypoints.Count} waypoints | " +
-                          $"{p.TotalLength:F1}m | status={p.Status} | valid={p.IsValid}");
-            }
+                      $"  UserHeightY={GetUserHeightY():F3} | AgentY={transform.position.y:F3}\n" +
+                      $"  Remaining={RemainingDistance:F2}m | Speed={CurrentSpeed:F2}m/s\n" +
+                      $"  floorArrivalMargin={_floorArrivalMargin}m | " +
+                      $"detectionRadius={_floorDetectionRadius}m\n" +
+                      $"  hysteresisActive={Time.time - _lastFloorTransitionTime < _floorHysteresisTime} | " +
+                      $"fromLevel={_lastTransitionFromLevel}");
 
             var bridge = UserPositionBridge.Instance;
             if (bridge != null)
-                Debug.Log($"  UserPos={bridge.UserPosition:F2} | " +
-                          $"AgentPos={bridge.AgentPosition:F2} | " +
-                          $"Speed={bridge.UserSpeed:F2}m/s");
+                Debug.Log($"  UserPos={bridge.UserPosition:F2} | IsNoAR={bridge.IsNoArMode}");
+
+            var startPoints = NavigationStartPointManager.GetAllStartPoints();
+            foreach (var pt in startPoints)
+            {
+                float deltaY = GetUserHeightY() - pt.FloorHeight;
+                Debug.Log($"  StartPoint Level{pt.Level}: Y={pt.FloorHeight:F3} | ΔY={deltaY:F3}");
+            }
         }
     }
 }

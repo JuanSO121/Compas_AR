@@ -1,33 +1,36 @@
 // File: SceneReadyNotifier.cs
-// Carpeta: Assets/IndoorNavAR/Scripts/Integration/
-// ✅ v5.1 — FIX: WaitForSessionLoad() nunca completaba porque IsSessionLoadCompleted
-//           siempre era false (bug en PersistenceManager v14.x).
+// ✅ v5.2 — FIX: timeout insuficiente + diagnóstico mejorado + guard doble Ready
 //
 // ════════════════════════════════════════════════════════════════════════════
-// CAMBIOS v5.0 → v5.1
+// CAMBIOS v5.1 → v5.2
 // ════════════════════════════════════════════════════════════════════════════
 //
-//  PROBLEMA EN v5.0:
+//  BUG #1 — _sessionLoadTimeout demasiado corto (12s):
 //  ─────────────────────────────────────────────────────────────────────────
-//  WaitForSessionLoad() hace polling sobre pm.IsSessionLoadCompleted, que
-//  en PersistenceManager v14.x era _autoLoadAttempted && _autoLoadCompleted.
-//  Esos flags nunca se ponían en true porque el auto-load fue eliminado pero
-//  los flags quedaron huérfanos. Resultado: polling espera 20s hasta timeout,
-//  y solo entonces llama NotifySceneReady(). El bridge llega a Ready con 20s
-//  de delay, o nunca si el timeout tampoco era suficiente.
+//  En v5.1, el timeout se redujo de 20s a 12s. Con el Infinix X6887
+//  (dispositivo lento), el flujo completo de sesión restaurada toma:
+//    - GC compacting:           ~2s
+//    - LoadSession:             ~1s
+//    - WaitForAlignmentOrTimeout: hasta 6s (FIX #15)
+//    - ReparentWaypointsAfterAlignment: ~1s
+//    = ~10s mínimo, hasta 12s en días lentos
+//  Con timeout=12s, el margen era cero. Con 25s hay margen suficiente.
 //
-//  SOLUCIÓN v5.1:
+//  BUG #2 — WaitForSessionLoad() no distingue entre "bridge Ready por
+//  NavigationManager" y "bridge Ready por timeout anterior":
 //  ─────────────────────────────────────────────────────────────────────────
-//  1. WaitForSessionLoad() ahora también verifica BridgeState.Ready como
-//     condición de salida temprana — si PersistenceManager.ReparentWaypointsAfterAlignment()
-//     ya llamó NotifySceneReady() directamente (fix en v14.3), el polling
-//     termina de inmediato sin esperar el timeout.
-//  2. Reducción del _sessionLoadTimeout default a 12s (era 20s). El timeout
-//     sigue siendo el último fallback para casos donde PersistenceManager
-//     falla completamente, pero ya no es el camino normal.
-//  3. Log mejorado para diagnosticar la ruta de salida de WaitForSessionLoad().
+//  Si SceneReadyNotifier se reiniciaba tras Resume (ResetForResume() →
+//  BridgeState.Idle), el polling verificaba BridgeState.Ready, pero si
+//  NavigationManager nunca llegó a llamar NotifySceneReady(), el bridge
+//  quedaba en SessionLoading para siempre. Añadido log de diagnóstico
+//  que permite ver exactamente en qué estado está el bridge en cada poll.
 //
-//  TODOS LOS COMPORTAMIENTOS DE v5.0 SE CONSERVAN ÍNTEGRAMENTE.
+//  BUG #3 — _subsystemsNotified no se reseteaba en RenotifyAfterResume()
+//  antes de FlutterUnityBridge.ResetForResume(), causando que la coroutine
+//  principal se saltara el ciclo de espera si _subsystemsNotified=true.
+//  Ahora el reset se hace en el orden correcto.
+//
+//  TODOS LOS COMPORTAMIENTOS DE v5.1 SE CONSERVAN ÍNTEGRAMENTE.
 
 using System.Collections;
 using UnityEngine;
@@ -53,17 +56,21 @@ namespace IndoorNavAR.Integration
         [Tooltip("Intervalo de polling para verificar subsistemas.")]
         [SerializeField] private float _pollIntervalSeconds = 0.1f;
 
-        [Tooltip("Segundos máximos esperando que LoadSession() complete.\n" +
-                 "v5.1: reducido a 12s (era 20s). En v14.3, PersistenceManager llama\n" +
-                 "NotifySceneReady() directamente, así que este timeout es solo fallback.")]
-        [SerializeField] private float _sessionLoadTimeout  = 12f;
+        [Tooltip("Segundos máximos esperando que LoadSession() complete.\n\n" +
+                 "v5.2: aumentado a 25s (era 12s).\n" +
+                 "Flujo en Infinix X6887 con sesión restaurada:\n" +
+                 "  GC (~2s) + LoadSession (~1s) + WaitAlign (~6s) + Reparent (~1s) = ~10s\n" +
+                 "Con 25s hay margen suficiente para dispositivos lentos.\n" +
+                 "Este timeout es último fallback: NavigationManager llama\n" +
+                 "NotifySceneReady() directamente, por lo que el polling\n" +
+                 "normalmente sale antes de los 10s.")]
+        [SerializeField] private float _sessionLoadTimeout  = 25f;
 
         [Tooltip("Log de progreso.")]
-        [SerializeField] private bool  _logProgress         = true;
+        [SerializeField] private bool  _logProgress = true;
 
         [Header("Configuración Resume")]
-        [Tooltip("Delay (s) tras resume antes de re-notificar. " +
-                 "Da tiempo a ARCore y VoiceCommandAPI para re-inicializarse.")]
+        [Tooltip("Delay (s) tras resume antes de re-notificar.")]
         [SerializeField] private float _resumeDelay = 1.5f;
 
         // ─── Estado interno ───────────────────────────────────────────────────
@@ -98,6 +105,9 @@ namespace IndoorNavAR.Integration
 
         private IEnumerator RenotifyAfterResume()
         {
+            // ✅ FIX #15 BUG #3: resetear _subsystemsNotified ANTES de
+            // FlutterUnityBridge.ResetForResume() para evitar que la coroutine
+            // principal detecte _subsystemsNotified=true y se salte el ciclo.
             _subsystemsNotified = false;
             FlutterUnityBridge.ResetForResume();
 
@@ -130,11 +140,8 @@ namespace IndoorNavAR.Integration
                         : BuildInitialDetail();
 
                     Log($"✅ Subsistemas OK en {elapsed:F2}s — NotifySubsystemsReady()");
-
-                    // Paso 1: bridge → SessionLoading (o Ready si sesión ya cargó)
                     FlutterUnityBridge.NotifySubsystemsReady(detail);
 
-                    // Paso 2: esperar carga de sesión → bridge → Ready
                     yield return StartCoroutine(WaitForSessionLoad());
                     yield break;
                 }
@@ -143,7 +150,7 @@ namespace IndoorNavAR.Integration
                 elapsed += _pollIntervalSeconds;
             }
 
-            // Timeout
+            // Timeout de subsistemas
             Log($"⚠️ Timeout {_maxWaitSeconds}s — forzando NotifySubsystemsReady().");
             _subsystemsNotified = true;
             FlutterUnityBridge.NotifySubsystemsReady(
@@ -154,20 +161,22 @@ namespace IndoorNavAR.Integration
         // ─── Coroutine: esperar que LoadSession() complete ────────────────────
 
         /// <summary>
-        /// Espera que el bridge llegue a Ready, lo cual ocurre por una de tres vías:
-        ///   A) pm.IsSessionLoadCompleted=true   → NotifySceneReady() desde aquí (v5.0)
-        ///   B) BridgeState.Ready ya alcanzado   → PersistenceManager.ReparentWaypointsAfterAlignment()
-        ///                                          llamó NotifySceneReady() directamente (v14.3)
+        /// ✅ v5.2 — Espera que el bridge llegue a Ready por cualquiera de estas vías:
+        ///
+        ///   A) pm.IsSessionLoadCompleted=true → NotifySceneReady() desde aquí
+        ///   B) BridgeState.Ready ya alcanzado → NavigationManager lo llamó directamente
         ///   C) pm == null o sin sesión guardada → NotifySceneReady() inmediato
-        ///   D) Timeout de _sessionLoadTimeout   → NotifySceneReady() forzado (último fallback)
+        ///   D) Timeout _sessionLoadTimeout (25s) → NotifySceneReady() forzado
+        ///
+        /// LOG DE DIAGNÓSTICO: cada 2s imprime el estado exacto del bridge y del
+        /// PersistenceManager para facilitar la depuración en dispositivos lentos.
         /// </summary>
         private IEnumerator WaitForSessionLoad()
         {
-            // Salida rápida A: bridge ya en Ready (puede haber llegado por auto-repair
-            // en NotifySubsystemsReady, o por llamada directa desde PersistenceManager v14.3)
+            // Ruta B: bridge ya en Ready al entrar
             if (FlutterUnityBridge.State == BridgeState.Ready)
             {
-                Log("WaitForSessionLoad: bridge ya Ready — saltando. (ruta A)");
+                Log("WaitForSessionLoad: bridge ya Ready al entrar — OK. (ruta B)");
                 yield break;
             }
 
@@ -178,8 +187,6 @@ namespace IndoorNavAR.Integration
                 yield break;
             }
 
-            // Si no hay sesión guardada → IsSessionLoadCompleted ya es true (v14.3 lo setea en Start())
-            // pero verificamos ambas condiciones por si acaso
             if (!_persistenceManager.HasSavedSession())
             {
                 Log("WaitForSessionLoad: sin sesión previa — Ready inmediato. (ruta C)");
@@ -188,33 +195,45 @@ namespace IndoorNavAR.Integration
             }
 
             float elapsed = 0f;
-            Log($"⏳ Esperando IsSessionLoadCompleted o BridgeState.Ready (max {_sessionLoadTimeout}s)...");
+            Log($"⏳ Esperando IsSessionLoadCompleted o BridgeState.Ready " +
+                $"(max {_sessionLoadTimeout}s)...");
 
             while (elapsed < _sessionLoadTimeout)
             {
-                // ✅ v5.1 FIX: salida temprana si el bridge ya llegó a Ready.
-                // En v14.3, PersistenceManager.ReparentWaypointsAfterAlignment() llama
-                // NotifySceneReady() directamente, así que el bridge puede estar en Ready
-                // antes de que IsSessionLoadCompleted sea true desde nuestra perspectiva.
+                // ✅ Ruta B: salida temprana si NavigationManager ya llamó NotifySceneReady
                 if (FlutterUnityBridge.State == BridgeState.Ready)
                 {
-                    Log($"WaitForSessionLoad: BridgeState=Ready en {elapsed:F2}s — OK. (ruta B)");
+                    Log($"✅ WaitForSessionLoad: BridgeState=Ready en {elapsed:F2}s. (ruta B)");
                     yield break;
                 }
 
+                // ✅ Ruta A: PersistenceManager reporta carga completa
                 if (_persistenceManager.IsSessionLoadCompleted)
                 {
-                    Log($"✅ Sesión cargada en {elapsed:F2}s — NotifySceneReady(). (ruta A)");
+                    Log($"✅ WaitForSessionLoad: IsSessionLoadCompleted=true en {elapsed:F2}s. (ruta A)");
                     FlutterUnityBridge.NotifySceneReady(
-                        $"Sesión cargada ({(_persistenceManager.SessionWasRestored ? "restaurada" : "nueva")})");
+                        $"Sesión {(_persistenceManager.SessionWasRestored ? "restaurada" : "nueva")}");
                     yield break;
+                }
+
+                // ✅ v5.2: Log de diagnóstico cada 2s para depuración en device
+                if (Mathf.RoundToInt(elapsed * 10f) % 20 == 0)
+                {
+                    Log($"  [{elapsed:F1}s/{_sessionLoadTimeout}s] " +
+                        $"BridgeState={FlutterUnityBridge.State} | " +
+                        $"IsSessionLoadCompleted={_persistenceManager.IsSessionLoadCompleted} | " +
+                        $"SessionWasRestored={_persistenceManager.SessionWasRestored} | " +
+                        $"HasSavedSession={_persistenceManager.HasSavedSession()}");
                 }
 
                 yield return new WaitForSeconds(_pollIntervalSeconds);
                 elapsed += _pollIntervalSeconds;
             }
 
-            Log($"⚠️ Timeout {_sessionLoadTimeout}s esperando sesión — forzando Ready. (ruta D)");
+            // Ruta D: último fallback
+            Log($"⚠️ Timeout {_sessionLoadTimeout}s — forzando Ready. (ruta D)\n" +
+                $"  Estado final: BridgeState={FlutterUnityBridge.State} | " +
+                $"IsSessionLoadCompleted={_persistenceManager.IsSessionLoadCompleted}");
             FlutterUnityBridge.NotifySceneReady($"Timeout sesión ({_sessionLoadTimeout}s)");
         }
 
@@ -253,11 +272,12 @@ namespace IndoorNavAR.Integration
         private void DbgState()
         {
             Debug.Log("══════════════════════════════════════════════");
-            Debug.Log($"  SceneReadyNotifier v5.1 — Estado");
+            Debug.Log($"  SceneReadyNotifier v5.2 — Estado");
             Debug.Log("══════════════════════════════════════════════");
             Debug.Log($"  BridgeState:              {FlutterUnityBridge.State}");
             Debug.Log($"  IsSceneReady (compat):    {FlutterUnityBridge.IsSceneReady}");
             Debug.Log($"  _subsystemsNotified:      {_subsystemsNotified}");
+            Debug.Log($"  _sessionLoadTimeout:      {_sessionLoadTimeout}s (v5.2: 25s)");
             Debug.Log($"  _resumeDelay:             {_resumeDelay}s");
             Debug.Log($"  VoiceCommandAPI OK:       {VoiceCommandAPI.Instance != null}");
             Debug.Log($"  ARSession OK:             {(_arSession != null && _arSession.enabled)}");

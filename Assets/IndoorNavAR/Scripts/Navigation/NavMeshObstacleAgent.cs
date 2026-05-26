@@ -6,8 +6,8 @@
 // El obstáculo talla el NavMesh automáticamente, forzando a
 // NavigationPathController a recalcular la ruta al detectar el cambio.
 //
-// Tamaño estándar: 0.8m ancho × 1.8m alto × 0.8m profundidad
-// (equivalente a una persona de pie bloqueando el paso).
+// Tamaño por defecto: 2.0m ancho × 1.8m alto × 1.4m profundidad
+// (bloqueo amplio para forzar una ruta alternativa con más margen).
 
 using System.Collections;
 using UnityEngine;
@@ -18,8 +18,9 @@ namespace IndoorNavAR.Navigation
     [RequireComponent(typeof(NavMeshObstacle))]
     public class NavMeshObstacleAgent : MonoBehaviour
     {
-        // ── Tamaño estándar "persona bloqueando el paso" ───────────────────
-        private static readonly Vector3 STANDARD_SIZE = new Vector3(0.8f, 1.8f, 0.8f);
+        // ── Tamaño estándar "bloqueo amplio de paso" ───────────────────
+        [Tooltip("Tamaño del obstáculo virtual tallado en el NavMesh (ancho, alto, profundidad).")]
+        [SerializeField] private Vector3 _obstacleSize = new Vector3(2.0f, 1.8f, 1.4f);
 
         // Cuántos segundos permanece el obstáculo antes de auto-destruirse.
         // Permite que el usuario rodee el obstáculo y la ruta se normalice.
@@ -37,7 +38,7 @@ namespace IndoorNavAR.Navigation
             _obstacle            = GetComponent<NavMeshObstacle>();
             _obstacle.carving    = true;   // activa el tallado dinámico del NavMesh
             _obstacle.shape      = NavMeshObstacleShape.Box;
-            _obstacle.size       = STANDARD_SIZE;
+            _obstacle.size       = _obstacleSize;
             _obstacle.center     = Vector3.zero;
 
             // Mover sólo si el obstáculo se desplaza > 0.1m — evita re-tallados
@@ -52,6 +53,7 @@ namespace IndoorNavAR.Navigation
         /// </summary>
         public void PlaceAt(Vector3 worldPosition)
         {
+            _obstacle.size = _obstacleSize;
             transform.position = worldPosition;
             gameObject.SetActive(true);
 
@@ -61,7 +63,20 @@ namespace IndoorNavAR.Navigation
             _lifetimeCoroutine = StartCoroutine(AutoExpire());
 
             Debug.Log($"[NavMeshObstacleAgent] Obstáculo colocado en {worldPosition:F2}. " +
-                      $"Vida: {_lifetimeSeconds}s.");
+                      $"Tamaño: {_obstacleSize:F2}. Vida: {_lifetimeSeconds}s.");
+        }
+
+        private void OnValidate()
+        {
+            _obstacleSize.x = Mathf.Max(0.1f, _obstacleSize.x);
+            _obstacleSize.y = Mathf.Max(0.1f, _obstacleSize.y);
+            _obstacleSize.z = Mathf.Max(0.1f, _obstacleSize.z);
+
+            if (_obstacle == null)
+                _obstacle = GetComponent<NavMeshObstacle>();
+
+            if (_obstacle != null)
+                _obstacle.size = _obstacleSize;
         }
 
         /// <summary>

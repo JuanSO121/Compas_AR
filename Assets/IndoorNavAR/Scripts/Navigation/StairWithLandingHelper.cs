@@ -304,6 +304,13 @@ namespace IndoorNavAR.Navigation
                 : $"[StairHelper] ✅ Gap Landing→T2: {g2:F4}m");
         }
 
+        public bool HasValidGeometry()
+        {
+            string rootName = $"NavRamps_{gameObject.name.Trim()}";
+            var existing    = GameObject.Find(rootName);
+            return existing != null && existing.activeInHierarchy;
+        }
+
         private GameObject CreateRamp(string rampName, Vector3 worldStart, Vector3 worldEnd, int layer)
         {
             var go = new GameObject(rampName);

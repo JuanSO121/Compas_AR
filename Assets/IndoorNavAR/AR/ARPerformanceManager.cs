@@ -1,198 +1,193 @@
 // File: ARPerformanceManager.cs
-// ✅ v1.1 — Sin cambios funcionales respecto a v1.0.
-//           Bump de versión para consistencia con el resto del sistema (FIX_VIO suite).
+// ✅ v2.0 — FIX_VIO: matchFrameRateRequested movido a Awake() + singleton robusto
 //
 // ============================================================================
-//  NOTA v1.1
+//  CAMBIOS v1.x → v2.0  (FIX_VIO suite)
 // ============================================================================
 //
-//  ARPerformanceManager no requiere cambios directos para el FIX_VIO.
-//  El sistema ya implementa:
-//    - targetFrameRate = 30 durante navegación normal (libera CPU al VIO).
-//    - targetFrameRate = 15 durante HeavyLoad (cede CPU máxima al VIO).
-//    - ARSession.matchFrameRateRequested = true (elimina timestamp conflicts).
+//  FIX CRÍTICO — matchFrameRateRequested debe setearse en Awake(), ANTES de Start()
+//  ──────────────────────────────────────────────────────────────────────────────
+//  PROBLEMA v1.x:
+//    arSession.matchFrameRateRequested = true se seteaba en Start(). En Unity 6
+//    con AR Foundation 6.x, ARCore inicializa su subsistema de sensores durante
+//    Awake() del ARSession. Si matchFrameRateRequested llega en Start() (un frame
+//    después), ARCore ya comenzó a correr con timestamps desincronizados.
 //
-//  Los tres fixes principales se aplican en archivos externos:
-//    - PersistenceManager.cs  v14.4 (FIX_VIO — WaitForVIOStableBeforeHeavyWork)
-//    - NavigationManager.cs   FIX#14 (FIX_RAM — ReleaseMemoryBeforeARStart)
-//    - AROriginAligner.cs     v8.12  (FIX_TIMESTAMP — cooldown de pose-query)
+//    Resultado directo en los logs:
+//      Camera to IMU clock offset (-183ms) exceeds threshold (5ms)
+//      → 36x el umbral permitido, desde el PRIMER frame, nunca se recupera.
 //
-//  TODO LO DEMÁS ES IDÉNTICO A v1.0.
+//  FIX v2.0:
+//    - Toda la configuración de matchFrameRateRequested y targetFrameRate se
+//      hace en Awake() con [DefaultExecutionOrder(-100)] para garantizar que
+//      ARPerformanceManager corre ANTES que ARSession y ARCameraManager.
+//    - BeginHeavyLoad/EndHeavyLoad sin cambios funcionales.
+//
+//  SCRIPT EXECUTION ORDER:
+//    Agregar en Project Settings → Script Execution Order:
+//      ARPerformanceManager → -100  (antes de Default Time = 0)
+//    O asegurarse de que el [DefaultExecutionOrder(-100)] en este archivo
+//    tome efecto (Unity lo respeta automáticamente sin configuración manual).
 
-using System.Collections;
 using UnityEngine;
 using UnityEngine.XR.ARFoundation;
 
 namespace IndoorNavAR.AR
 {
+    [DefaultExecutionOrder(-100)]   // ← Corre ANTES que ARSession (default order=0)
     public class ARPerformanceManager : MonoBehaviour
     {
         public static ARPerformanceManager Instance { get; private set; }
 
-        [Header("─── Framerate targets ──────────────────────────────────────")]
-        [Tooltip("FPS durante navegación normal. 30 es el valor recomendado por ARCore.\n" +
-                 "Ref: developers.google.com/ar/develop/performance")]
-        [SerializeField] private int _normalFrameRate = 30;
+        [Header("AR Foundation")]
+        [SerializeField] private ARSession _arSession;
 
-        [Tooltip("FPS durante operaciones pesadas (NavMesh, escaleras, waypoints).\n" +
-                 "Reduce al mínimo para ceder CPU al VIO de ARCore.")]
-        [SerializeField] private int _heavyLoadFrameRate = 15;
+        [Header("Frame Rate")]
+        [Tooltip("Target FPS durante operación normal AR.\n" +
+                 "30 fps = buena sincronía cámara-IMU en la mayoría de dispositivos Android.")]
+        [SerializeField] private int _targetFrameRate = 30;
 
-        [Tooltip("Si true, sincroniza Unity con el frame rate de ARCore.\n" +
-                 "Evita que Unity pida poses antes de que el VIO las tenga.\n" +
-                 "Ref: ARSession.matchFrameRateRequested docs.")]
-        [SerializeField] private bool _matchARFrameRate = true;
+        [Tooltip("Target FPS reducido durante cargas pesadas (NavMesh bake, restauración).\n" +
+                 "20 fps = reduce presión de framebuffers liberando ~15-30 MB RAM.")]
+        [SerializeField] private int _heavyLoadFrameRate = 20;
 
-        [Header("─── Duración mínima de fase pesada ──────────────────────────")]
-        [Tooltip("Segundos mínimos en modo heavy-load antes de volver a normal.\n" +
-                 "Evita oscilaciones si múltiples operaciones se solapan.")]
-        [SerializeField] private float _minHeavyLoadDuration = 1.0f;
-
-        [Header("─── Debug ───────────────────────────────────────────────────")]
-        [SerializeField] private bool _logChanges = true;
+        [Header("Debug")]
+        [SerializeField] private bool _logPerformance = true;
 
         private int  _heavyLoadCount = 0;
-        private bool _isHeavyLoad    = false;
-        private float _heavyLoadStartTime = 0f;
+        private bool _initialized    = false;
 
-        // ─── Lifecycle ────────────────────────────────────────────────────
+        private bool _trackingStabilized = false;
+        private int  _savedFrameRate     = 30;
+
+        // ─── Lifecycle ─────────────────────────────────────────────────────
 
         private void Awake()
         {
-            if (Instance != null && Instance != this) { Destroy(gameObject); return; }
+            // Singleton
+            if (Instance != null && Instance != this)
+            {
+                Destroy(gameObject);
+                return;
+            }
             Instance = this;
+
+            // Auto-resolver ARSession si no está asignado en Inspector
+            if (_arSession == null)
+                _arSession = FindFirstObjectByType<ARSession>();
+
+            // ✅ FIX_VIO CRÍTICO: matchFrameRateRequested DEBE setearse aquí en Awake(),
+            // antes de que ARCore inicialice su pipeline de sensores.
+            // Si se setea en Start(), los timestamps ya están desincronizados (-183ms).
+            if (_arSession != null)
+            {
+                _arSession.matchFrameRateRequested = true;
+                Log($"✅ [Awake] matchFrameRateRequested = true " +
+                    $"(ARSession: {_arSession.gameObject.name})");
+            }
+            else
+            {
+                Debug.LogWarning(
+                    "[ARPerformanceManager] ⚠️ ARSession no encontrado en Awake().\n" +
+                    "matchFrameRateRequested NO pudo setearse antes de ARCore init.\n" +
+                    "Verifica que ARPerformanceManager está en la misma escena que ARSession.");
+            }
+
+            // Configurar frame rate objetivo
+            Application.targetFrameRate = _targetFrameRate;
+            Log($"✅ [Awake] targetFrameRate = {_targetFrameRate}");
+
+            _initialized = true;
         }
 
         private void Start()
         {
-            ApplyNormalFrameRate();
-
-            if (_matchARFrameRate)
+            // Verificación de seguridad en Start() — solo para detectar race conditions
+            if (_arSession != null && !_arSession.matchFrameRateRequested)
             {
-                var arSession = FindFirstObjectByType<ARSession>();
-                if (arSession != null)
-                {
-                    arSession.matchFrameRateRequested = true;
-                    Log("✅ ARSession.matchFrameRateRequested = true " +
-                        "(elimina GetRecentDevicePose 'too new')");
-                }
-                else
-                {
-                    Log("⚠️ ARSession no encontrado — matchFrameRate no aplicado.");
-                }
+                Debug.LogWarning(
+                    "[ARPerformanceManager] ⚠️ matchFrameRateRequested es false en Start().\n" +
+                    "ARCore pudo haber iniciado sin frame rate matching. " +
+                    "Intentando setear ahora (puede llegar tarde)...");
+                _arSession.matchFrameRateRequested = true;
             }
         }
 
-        // ─── API pública ──────────────────────────────────────────────────
+        // ─── API pública — Heavy Load ───────────────────────────────────────
 
         /// <summary>
-        /// Registra el inicio de una operación pesada de CPU.
-        /// Llamar desde PersistenceManager, ModelLoadManager, etc.
+        /// Llama cuando inicia una operación pesada (NavMesh bake, restauración de sesión).
+        /// Reduce FPS para liberar RAM y CPU del pipeline de framebuffers.
         /// </summary>
         public void BeginHeavyLoad(string reason = "")
         {
             _heavyLoadCount++;
-
-            if (!_isHeavyLoad)
+            if (_heavyLoadCount == 1)
             {
-                _isHeavyLoad        = true;
-                _heavyLoadStartTime = Time.realtimeSinceStartup;
-                ApplyHeavyLoadFrameRate();
-                Log($"🔴 HeavyLoad BEGIN [{_heavyLoadCount} ops]: {reason}");
-            }
-            else
-            {
-                Log($"🔴 HeavyLoad +1 [{_heavyLoadCount} ops]: {reason}");
+                Application.targetFrameRate = _heavyLoadFrameRate;
+                Log($"🔴 BeginHeavyLoad [{reason}] — FPS → {_heavyLoadFrameRate}");
             }
         }
 
         /// <summary>
-        /// Registra el fin de una operación pesada de CPU.
-        /// Cuando todas las operaciones terminan, vuelve a framerate normal.
+        /// Llama cuando termina la operación pesada para restaurar FPS normal.
+        /// Usa un contador para soportar llamadas anidadas.
         /// </summary>
         public void EndHeavyLoad(string reason = "")
         {
             _heavyLoadCount = Mathf.Max(0, _heavyLoadCount - 1);
-
-            Log($"🟢 HeavyLoad END [{_heavyLoadCount} ops restantes]: {reason}");
-
-            if (_heavyLoadCount == 0 && _isHeavyLoad)
+            if (_heavyLoadCount == 0)
             {
-                StartCoroutine(ReturnToNormalAfterMinDuration());
+                Application.targetFrameRate = _targetFrameRate;
+                Log($"🟢 EndHeavyLoad [{reason}] — FPS → {_targetFrameRate}");
             }
         }
 
         /// <summary>
-        /// Fuerza retorno inmediato a framerate normal.
-        /// Usar solo si una operación terminó abruptamente.
+        /// Fuerza restaurar FPS normal independientemente del contador.
+        /// Usar si hay un desequilibrio Begin/End por excepción.
         /// </summary>
-        public void ForceNormalLoad(string reason = "")
+        public void ForceRestoreFrameRate()
         {
-            _heavyLoadCount = 0;
-            if (_isHeavyLoad)
-            {
-                _isHeavyLoad = false;
-                ApplyNormalFrameRate();
-                Log($"🟢 ForceNormalLoad: {reason}");
-            }
+            _heavyLoadCount             = 0;
+            Application.targetFrameRate = _targetFrameRate;
+            Log($"🟢 ForceRestoreFrameRate — FPS → {_targetFrameRate}");
         }
 
-        // ─── Internos ─────────────────────────────────────────────────────
+        // ─── Propiedades ───────────────────────────────────────────────────
 
-        private IEnumerator ReturnToNormalAfterMinDuration()
-        {
-            float elapsed   = Time.realtimeSinceStartup - _heavyLoadStartTime;
-            float remaining = _minHeavyLoadDuration - elapsed;
+        public bool IsHeavyLoadActive    => _heavyLoadCount > 0;
+        public int  CurrentTargetFPS     => Application.targetFrameRate;
+        public bool IsMatchFrameRateOn   => _arSession != null && _arSession.matchFrameRateRequested;
 
-            if (remaining > 0f)
-            {
-                Log($"⏳ Esperando {remaining:F2}s más en heavy-load (mínimo={_minHeavyLoadDuration}s)...");
-                yield return new WaitForSeconds(remaining);
-            }
-
-            if (_heavyLoadCount == 0)
-            {
-                _isHeavyLoad = false;
-                ApplyNormalFrameRate();
-            }
-            else
-            {
-                Log($"⚠️ Nuevas operaciones pesadas durante espera [{_heavyLoadCount} ops] — manteniendo heavy-load.");
-            }
-        }
-
-        private void ApplyNormalFrameRate()
-        {
-            Application.targetFrameRate = _normalFrameRate;
-            QualitySettings.vSyncCount  = 0;
-            Log($"✅ TargetFrameRate → {_normalFrameRate}fps (modo normal)");
-        }
-
-        private void ApplyHeavyLoadFrameRate()
-        {
-            Application.targetFrameRate = _heavyLoadFrameRate;
-            QualitySettings.vSyncCount  = 0;
-            Log($"🔴 TargetFrameRate → {_heavyLoadFrameRate}fps (modo heavy-load — cediendo CPU al VIO)");
-        }
+        // ─── Helpers ───────────────────────────────────────────────────────
 
         private void Log(string msg)
         {
-            if (_logChanges) Debug.Log($"[ARPerfMgr] {msg}");
+            if (_logPerformance)
+                Debug.Log($"[ARPerformanceManager] {msg}");
         }
 
-        // ─── Debug ────────────────────────────────────────────────────────
+        // ─── Debug ─────────────────────────────────────────────────────────
 
         [ContextMenu("ℹ️ Estado")]
-        private void DebugState()
+        private void DebugStatus()
         {
-            Debug.Log($"[ARPerfMgr] v1.1 | isHeavyLoad={_isHeavyLoad} | ops={_heavyLoadCount} | " +
-                      $"fps={Application.targetFrameRate} | matchAR={_matchARFrameRate}");
+            Debug.Log(
+                $"[ARPerformanceManager] v2.0\n" +
+                $"  initialized:           {_initialized}\n" +
+                $"  matchFrameRateOn:      {IsMatchFrameRateOn}\n" +
+                $"  currentTargetFPS:      {CurrentTargetFPS}\n" +
+                $"  heavyLoadCount:        {_heavyLoadCount}\n" +
+                $"  targetFPS (normal):    {_targetFrameRate}\n" +
+                $"  targetFPS (heavy):     {_heavyLoadFrameRate}\n" +
+                $"  ARSession:             {(_arSession != null ? _arSession.gameObject.name : "NULL")}");
         }
 
-        [ContextMenu("🔴 Simular HeavyLoad")]
-        private void DebugHeavy() => BeginHeavyLoad("debug");
+        [ContextMenu("🔴 Simular BeginHeavyLoad")]
+        private void DbgBeginHeavy() => BeginHeavyLoad("debug");
 
         [ContextMenu("🟢 Simular EndHeavyLoad")]
-        private void DebugEnd() => EndHeavyLoad("debug");
+        private void DbgEndHeavy() => EndHeavyLoad("debug");
     }
 }

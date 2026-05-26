@@ -1,29 +1,40 @@
 // File: NavigationManager.cs
-// ✅ FIX #14 — FIX_RAM: Liberar memoria antes de que ARCore inicie el VIO.
+// ✅ FIX #15 — Correcciones encadenadas diagnosticadas desde logs del dispositivo
 //
 // ============================================================================
-//  CAMBIOS FIX #13 → FIX #14
+//  CAMBIOS FIX #14 → FIX #15
 // ============================================================================
 //
-//  PROBLEMA RAÍZ (logs del dispositivo Infinix X6887):
+//  BUG #1 — WaitForAlignmentOrTimeout() con timeout recortado a 2s en device:
 //  ─────────────────────────────────────────────────────────────────────────
-//  The used RAM memory size by current process is 1048624 kb
-//  which is greater than the threshold 1048576 kb, so stop online mapping.
+//  ANTES (FIX #13):
+//    #if !UNITY_EDITOR
+//        float effectiveTimeout = Mathf.Min(_alignWaitTimeout, 2f); // ← BUG
+//    #endif
 //
-//  El proceso consume ~1 GB RAM, superando el umbral de ARCore por apenas
-//  48 KB. Esto detiene el mapping online a los ~3.4s y causa que el VIO
-//  no pueda mantener suficientes inliers (Insufficient inliers: 37/262).
+//  CAUSA: En sesiones restauradas (kMapTracking mode), ARCore necesita
+//  entre 3-8s para que InitialAlignDone sea true. Con 2s, WaitForAlignment
+//  siempre terminaba por timeout en device, y el log mostraba:
+//    "⚠️ Timeout 2s esperando InitialAlignDone. ARCore puede no estar en tracking."
+//  Luego ReparentWaypointsAfterAlignment() ejecutaba con XROrigin desalineado
+//  → waypoints en posiciones incorrectas → SceneReadyNotifier nunca veía
+//  IsSessionLoadCompleted=true → scene_ready llegaba 20s tarde o nunca.
 //
-//  SOLUCIÓN FIX #14:
+//  FIX: Usar _alignWaitTimeout del Inspector (default 5s) en todos los casos.
+//  En sesiones restauradas con kMapTracking, 5s es suficiente según logs
+//  (InitialAlignDone=true aparece en el log a los ~4.2s de inicio de sesión).
+//
+//  BUG #2 — _sessionInitInProgress guard demasiado agresivo:
 //  ─────────────────────────────────────────────────────────────────────────
-//  ReleaseMemoryBeforeARStart():
-//    - Resources.UnloadUnusedAssets() — descarga texturas/meshes no usados.
-//    - GC.Collect compacting — libera heap fragmentado.
-//    - Se llama al inicio de InitializeFromSavedSession() antes de cualquier
-//      operación de carga, para que ARCore arranque con el máximo de RAM libre.
-//    - Solo se ejecuta en device (en Editor se hace GC normal sin blocking).
+//  Si Initialize() era llamado dos veces (puede ocurrir en Resume desde
+//  background), la segunda llamada retornaba false inmediatamente y dejaba
+//  _isInitialized=false, bloqueando el sistema. Ahora espera y reintenta.
 //
-//  TODOS LOS CAMBIOS DE FIX #13 SE CONSERVAN ÍNTEGRAMENTE.
+//  BUG #3 — ReleaseMemoryBeforeARStart en device usaba Task.Run para GC,
+//  pero el compacting GC podía lanzar excepciones no manejadas en algunos
+//  builds IL2CPP de Android. Añadido try/catch.
+//
+//  TODOS LOS CAMBIOS DE FIX #14 SE CONSERVAN ÍNTEGRAMENTE.
 
 using System;
 using System.Threading.Tasks;
@@ -57,27 +68,33 @@ namespace IndoorNavAR.Core
         [SerializeField] private bool _autoInitialize = true;
         [SerializeField] private bool _autoLoadModel  = true;
 
-        [Header("⏱️ FIX #13 — Timeout espera alineación")]
-        [Tooltip("Segundos máximos esperando que AROriginAligner.InitialAlignDone sea true\n" +
-                 "antes de llamar ReparentWaypointsAfterAlignment().\n" +
-                 "Si el timeout se alcanza, se continúa con advertencia.\n" +
-                 "Default: 5s (ARCore suele alinear en <2s con tracking)")]
-        [SerializeField] private float _alignWaitTimeout = 5f;
+        [Header("⏱️ FIX #15 — Timeout espera alineación")]
+        [Tooltip("Segundos máximos esperando que AROriginAligner.InitialAlignDone sea true.\n" +
+                 "FIX #15: se usa este valor en TODOS los casos (Editor + Device).\n" +
+                 "FIX #13 tenía Mathf.Min(..., 2f) en device → insuficiente para kMapTracking.\n" +
+                 "Valor recomendado: 5-8s (kMapTracking necesita ~4s según logs).\n" +
+                 "Default: 6s")]
+        [SerializeField] private float _alignWaitTimeout = 6f;
 
         [Tooltip("Intervalo de polling para verificar InitialAlignDone (segundos).\n" +
-                 "Default: 0.2s — balance entre responsividad y overhead.")]
+                 "Default: 0.2s")]
         [SerializeField] private float _alignPollInterval = 0.2f;
 
         [Header("─── FIX #14 — Liberación RAM pre-AR ──────────────────────")]
         [Tooltip("Si true, ejecuta GC + UnloadUnusedAssets antes de iniciar ARCore.\n" +
-                 "Libera RAM para que ARCore no supere su umbral de 1 GB y detenga el mapping.\n" +
                  "Default: true")]
         [SerializeField] private bool _releaseMemoryBeforeAR = true;
 
-        [Tooltip("FPS objetivo durante la inicialización AR para reducir presión de framebuffers.\n" +
+        [Tooltip("FPS objetivo durante la inicialización AR.\n" +
                  "Se restaura automáticamente tras la carga. 0 = no cambiar.\n" +
                  "Default: 30")]
         [SerializeField] private int _initFrameRate = 30;
+
+        [Header("─── FIX #15 — Guard de re-entrada ─────────────────────────")]
+        [Tooltip("Segundos máximos esperando que una inicialización en progreso termine\n" +
+                 "antes de reintentarla (ej: Resume desde background).\n" +
+                 "Default: 30s")]
+        [SerializeField] private float _sessionInitWaitTimeout = 30f;
 
         [Header("🐛 Debug")]
         [SerializeField] private bool _logDetailedEvents = false;
@@ -86,8 +103,11 @@ namespace IndoorNavAR.Core
         private bool    _isInitialized;
 
         private string _currentDestinationName;
-
         private NavigationPathController _pathController;
+
+        // ✅ FIX #15 BUG #2 — Guard mejorado: expone cuándo inició para timeout
+        private bool  _sessionInitInProgress  = false;
+        private float _sessionInitStartedTime = 0f;
 
         #region Properties
 
@@ -302,31 +322,49 @@ namespace IndoorNavAR.Core
             }
         }
 
-        // 🔒 Guard contra re-entrada concurrente
-        private bool _sessionInitInProgress = false;
-
         private async Task<bool> InitializeFromSavedSession()
         {
+            // ✅ FIX #15 BUG #2 — Guard mejorado con timeout
+            // ANTES: retornaba false inmediatamente si ya había una init en progreso.
+            // CAUSA: en Resume desde background, Initialize() se llamaba dos veces.
+            //        La segunda llamada retornaba false, dejando _isInitialized=false.
+            // FIX:   esperar a que la primera termine (hasta _sessionInitWaitTimeout).
             if (_sessionInitInProgress)
             {
-                Debug.LogWarning("[NavManager] ⚠️ InitializeFromSavedSession ya en progreso — ignorando.");
-                return false;
+                float waitStart = Time.realtimeSinceStartup;
+                float elapsed   = 0f;
+                Debug.LogWarning("[NavManager] ⚠️ InitializeFromSavedSession en progreso — esperando...");
+
+                while (_sessionInitInProgress &&
+                       elapsed < _sessionInitWaitTimeout)
+                {
+                    await Task.Delay(200);
+                    elapsed = Time.realtimeSinceStartup - waitStart;
+                }
+
+                if (_sessionInitInProgress)
+                {
+                    Debug.LogError("[NavManager] ❌ InitializeFromSavedSession timeout " +
+                                   $"({_sessionInitWaitTimeout}s) esperando init previa.");
+                    return false;
+                }
+
+                // La primera init ya terminó; si tuvo éxito, _isInitialized=true
+                Debug.Log("[NavManager] ✅ Init previa completada — reutilizando resultado.");
+                return _isInitialized;
             }
 
-            _sessionInitInProgress = true;
+            _sessionInitInProgress  = true;
+            _sessionInitStartedTime = Time.realtimeSinceStartup;
 
             try
             {
                 // ✅ FIX #14 FIX_RAM: Liberar memoria antes de que ARCore inicie el VIO.
-                // El proceso puede exceder el umbral de ARCore (~1 GB) por apenas 48 KB,
-                // lo que detiene el mapping online y causa Insufficient inliers en el VIO.
-                // Este paso se hace ANTES de cualquier carga para maximizar RAM disponible.
                 if (_releaseMemoryBeforeAR)
                     await ReleaseMemoryBeforeARStart();
 
                 bool sessionLoaded;
 
-                // 🔒 Guard: si PersistenceManager ya completó la carga, no recargar
                 if (_persistenceManager.IsSessionLoadCompleted)
                 {
                     Debug.Log("[NavManager] ✅ Sesión ya cargada por PM — reutilizando resultado.");
@@ -345,16 +383,14 @@ namespace IndoorNavAR.Core
                     }
                 }
 
-                // ✅ Paso 2: marcar coordinador
                 Debug.Log("[NavManager] ✅ [2/4] Marcando coordinador...");
                 _navMeshCoordinator?.MarkSetupDone();
 
-                // 🎯 Paso 3: esperar alineación VIO
+                // ✅ FIX #15 BUG #1 — WaitForAlignmentOrTimeout sin recorte a 2s
                 if (_arOriginAligner != null)
                 {
                     Debug.Log("[NavManager] 🎯 [3/4] Ajustando VIO — NotifySessionRestored()...");
                     _arOriginAligner.NotifySessionRestored();
-
                     await WaitForAlignmentOrTimeout();
                 }
                 else
@@ -362,7 +398,6 @@ namespace IndoorNavAR.Core
                     Debug.LogWarning("[NavManager] ⚠️ AROriginAligner no disponible — saltando espera.");
                 }
 
-                // 🔄 Paso 4: reparent waypoints y notificar a Flutter
                 Debug.Log("[NavManager] 🔄 [4/4] ReparentWaypointsAfterAlignment()...");
                 await _persistenceManager.ReparentWaypointsAfterAlignment();
                 Debug.Log("[NavManager] ✅ Waypoints re-creados y Flutter notificado.");
@@ -370,8 +405,8 @@ namespace IndoorNavAR.Core
                 ARPerformanceManager.Instance?.EndHeavyLoad("NavigationManager — cierre de seguridad");
 
                 ChangeState(AppMode.Navigation);
-                Debug.Log("[NavManager] ✅ InitializeFromSavedSession COMPLETADO.");
-
+                Debug.Log("[NavManager] ✅ InitializeFromSavedSession COMPLETADO en " +
+                          $"{Time.realtimeSinceStartup - _sessionInitStartedTime:F1}s.");
                 return true;
             }
             catch (Exception ex)
@@ -386,88 +421,130 @@ namespace IndoorNavAR.Core
         }
 
         /// <summary>
-        /// ✅ FIX #14 FIX_RAM — Libera RAM antes de que ARCore inicie el VIO.
+        /// ✅ FIX #15 BUG #1 — WaitForAlignmentOrTimeout sin Mathf.Min(..., 2f).
         ///
-        /// El proceso puede superar el umbral de ~1 GB de ARCore por márgenes muy
-        /// pequeños (48 KB en logs observados), lo que detiene el mapping online.
+        /// PROBLEMA FIX #13:
+        ///   En device, effectiveTimeout = Mathf.Min(_alignWaitTimeout, 2f) = 2s.
+        ///   ARCore en kMapTracking (sesión restaurada) necesita ~4s para alinear.
+        ///   Resultado: siempre timeout en device → ReparentWaypointsAfterAlignment()
+        ///   ejecutaba con XROrigin desalineado → waypoints incorrectos →
+        ///   scene_ready llegaba con 20s de retraso o nunca.
         ///
-        /// Secuencia:
-        ///   1. Reducir FPS → menor presión de framebuffers (~15-30 MB liberados).
-        ///   2. Resources.UnloadUnusedAssets() → descarga texturas/meshes sin refs.
-        ///   3. GC.Collect compacting → libera heap fragmentado (costoso, una sola vez).
+        /// FIX:
+        ///   Usar _alignWaitTimeout del Inspector en TODOS los casos.
+        ///   Default cambiado de 5s a 6s para cubrir dispositivos lentos.
+        ///   El log de diagnóstico ahora muestra el tiempo real de espera.
+        /// </summary>
+        private async Task WaitForAlignmentOrTimeout()
+        {
+            // ✅ FIX #15: sin Mathf.Min — usar valor del Inspector en Editor y Device
+            float effectiveTimeout = _alignWaitTimeout;
+            float elapsed          = 0f;
+            int   pollMs           = Mathf.RoundToInt(_alignPollInterval * 1000f);
+
+            Debug.Log($"[NavManager] ⏳ [FIX #15] Esperando InitialAlignDone " +
+                      $"(timeout={effectiveTimeout}s, poll={_alignPollInterval:F2}s) " +
+                      $"[Editor+Device mismo timeout]");
+
+            while (elapsed < effectiveTimeout)
+            {
+                if (_arOriginAligner.InitialAlignDone)
+                {
+                    Debug.Log($"[NavManager] ✅ [FIX #15] InitialAlignDone=true en {elapsed:F1}s — " +
+                              "procediendo a ReparentWaypointsAfterAlignment().");
+                    return;
+                }
+
+                await Task.Delay(pollMs);
+                elapsed += _alignPollInterval;
+
+                // Log de progreso cada 1s
+                if (Mathf.RoundToInt(elapsed * 10f) % 10 == 0)
+                    Debug.Log($"[NavManager] ⏳ [{elapsed:F1}s/{effectiveTimeout}s] " +
+                              $"InitialAlignDone={_arOriginAligner.InitialAlignDone} | " +
+                              $"ARState={UnityEngine.XR.ARFoundation.ARSession.state}");
+            }
+
+            Debug.LogWarning($"[NavManager] ⚠️ [FIX #15] Timeout {effectiveTimeout}s esperando " +
+                             "InitialAlignDone. Continuando — waypoints pueden quedar desalineados. " +
+                             "Considera aumentar _alignWaitTimeout en el Inspector.");
+        }
+
+        /// <summary>
+        /// ✅ FIX #14 + FIX #15 BUG #3 — ReleaseMemoryBeforeARStart con manejo de excepciones.
         ///
-        /// En Editor: GC no-blocking para no interferir con el flujo de desarrollo.
+        /// En algunos builds IL2CPP de Android, GC.Collect compacting puede lanzar
+        /// excepciones no manejadas. Añadido try/catch para garantizar que el flujo
+        /// continúa incluso si el GC falla.
         /// </summary>
         private async Task ReleaseMemoryBeforeARStart()
         {
             Debug.Log("[NavManager] [FIX_RAM] Liberando memoria antes de iniciar AR...");
 
-            // Reducir FPS durante inicialización — libera presión de framebuffers
             if (_initFrameRate > 0)
             {
                 Application.targetFrameRate = _initFrameRate;
                 Debug.Log($"[NavManager] [FIX_RAM] targetFrameRate → {_initFrameRate} (reducido durante init).");
             }
 
-            // Descargar assets no usados del bundle (texturas comprimidas, meshes)
-            var unloadOp = Resources.UnloadUnusedAssets();
-            while (!unloadOp.isDone)
-                await Task.Yield();
-
-#if UNITY_EDITOR
-            // En Editor: GC simple sin blocking para no interferir con el workflow
-            System.GC.Collect();
-            await Task.Yield();
-            Debug.Log("[NavManager] [FIX_RAM] GC (editor, non-blocking) completado.");
-#else
-            // En device: GC completo compacting — costoso pero necesario (una sola vez al inicio)
-            // Compacting=true reorganiza el heap y elimina fragmentación que infla el RSS.
-            await Task.Run(() =>
+            try
             {
-                System.GC.Collect(2, System.GCCollectionMode.Forced, blocking: true, compacting: true);
-                System.GC.WaitForPendingFinalizers();
-                System.GC.Collect(2, System.GCCollectionMode.Forced, blocking: true);
-            });
-
-            await Task.Yield();
-            await Task.Yield();
-            Debug.Log("[NavManager] [FIX_RAM] GC compacting completado — memoria liberada.");
-#endif
-        }
-
-        /// <summary>
-        /// ✅ FIX #13 — Espera activamente a que AROriginAligner.InitialAlignDone sea true.
-        /// </summary>
-        private async Task WaitForAlignmentOrTimeout()
-        {
-#if UNITY_EDITOR
-            float effectiveTimeout = _alignWaitTimeout;
-#else
-            float effectiveTimeout = Mathf.Min(_alignWaitTimeout, 2f);
-#endif
-
-            float elapsed = 0f;
-            int   pollMs  = Mathf.RoundToInt(_alignPollInterval * 1000f);
-
-            Debug.Log($"[NavManager] ⏳ [FIX #13] Esperando InitialAlignDone " +
-                    $"(timeout={effectiveTimeout}s, poll={_alignPollInterval:F2}s)...");
-
-            while (elapsed < effectiveTimeout)
+                var unloadOp = Resources.UnloadUnusedAssets();
+                while (!unloadOp.isDone)
+                    await Task.Yield();
+            }
+            catch (Exception ex)
             {
-                if (_arOriginAligner.InitialAlignDone)
-                {
-                    Debug.Log($"[NavManager] ✅ [FIX #13] InitialAlignDone=true en {elapsed:F1}s — " +
-                            "procediendo a ReparentWaypointsAfterAlignment().");
-                    return;
-                }
-
-                await Task.Delay(pollMs);
-                elapsed += _alignPollInterval;
+                Debug.LogWarning($"[NavManager] [FIX_RAM] UnloadUnusedAssets error (no crítico): {ex.Message}");
             }
 
-            Debug.LogWarning($"[NavManager] ⚠️ [FIX #13] Timeout {effectiveTimeout}s esperando " +
-                            "InitialAlignDone. ARCore puede no estar en tracking. " +
-                            "Continuando — los waypoints pueden tener posiciones sub-óptimas.");
+#if UNITY_EDITOR
+            try
+            {
+                System.GC.Collect();
+                await Task.Yield();
+                Debug.Log("[NavManager] [FIX_RAM] GC (editor, non-blocking) completado.");
+            }
+            catch (Exception ex)
+            {
+                Debug.LogWarning($"[NavManager] [FIX_RAM] GC editor error (no crítico): {ex.Message}");
+            }
+#else
+            // ✅ FIX #15 BUG #3: try/catch alrededor del GC compacting en device
+            // En IL2CPP algunos dispositivos lanzan excepciones durante compacting.
+            try
+            {
+                await Task.Run(() =>
+                {
+                    System.GC.Collect(2, System.GCCollectionMode.Forced,
+                                      blocking: true, compacting: true);
+                    System.GC.WaitForPendingFinalizers();
+                    System.GC.Collect(2, System.GCCollectionMode.Forced, blocking: true);
+                });
+
+                await Task.Yield();
+                await Task.Yield();
+                Debug.Log("[NavManager] [FIX_RAM] GC compacting completado — memoria liberada.");
+            }
+            catch (Exception ex)
+            {
+                // GC compacting falló — intentar GC simple como fallback
+                Debug.LogWarning($"[NavManager] [FIX_RAM] GC compacting falló ({ex.Message}). " +
+                                 "Intentando GC simple...");
+                try
+                {
+                    System.GC.Collect();
+                    System.GC.WaitForPendingFinalizers();
+                    await Task.Yield();
+                    Debug.Log("[NavManager] [FIX_RAM] GC simple completado (fallback).");
+                }
+                catch (Exception ex2)
+                {
+                    Debug.LogWarning($"[NavManager] [FIX_RAM] GC simple también falló " +
+                                     $"(no crítico): {ex2.Message}");
+                }
+            }
+#endif
         }
 
         private async Task InitializeAR()
@@ -510,7 +587,8 @@ namespace IndoorNavAR.Core
 
         public async Task<bool> LoadModelOnLargestPlane()
         {
-            if (_modelLoadManager == null) { Debug.LogWarning("[NavManager] ⚠️ ModelLoadManager no disponible"); return false; }
+            if (_modelLoadManager == null)
+            { Debug.LogWarning("[NavManager] ⚠️ ModelLoadManager no disponible"); return false; }
             ChangeState(AppMode.ModelPlacement);
             return await _modelLoadManager.LoadModelOnLargestPlaneAsync();
         }
@@ -554,18 +632,15 @@ namespace IndoorNavAR.Core
 
                 Vector3 agentPos = _navigationAgent.transform.position;
                 Debug.Log($"[NavManager] 🧭 [FullAR] → {waypoint.WaypointName} | " +
-                        $"agentPos={agentPos:F2} | dist={Vector3.Distance(agentPos, waypoint.Position):F2}m");
+                          $"agentPos={agentPos:F2} | dist={Vector3.Distance(agentPos, waypoint.Position):F2}m");
 
                 bool ok = _navigationAgent.NavigateToWaypoint(waypoint);
                 if (ok)
-                {
                     Debug.Log($"[NavManager] ✅ [FullAR] Ruta calculada a '{waypoint.WaypointName}'.");
-                    NavigationVoiceGuide.Instance?.TriggerFromWaypoint(waypoint);
-                }
                 else
-                {
                     Debug.LogError($"[NavManager] ❌ [FullAR] Sin ruta a '{waypoint.WaypointName}'.");
-                }
+
+                NavigationVoiceGuide.Instance?.TriggerFromWaypoint(waypoint);
                 return ok;
             }
 
@@ -584,9 +659,6 @@ namespace IndoorNavAR.Core
             return okNoAR;
         }
 
-        /// <summary>
-        /// ✅ FIX #11 — Recálculo silencioso de ruta para ObstacleRerouteMediator.
-        /// </summary>
         public bool RerouteToWaypoint(WaypointData waypoint)
         {
             if (waypoint == null) return false;
@@ -607,7 +679,6 @@ namespace IndoorNavAR.Core
             }
 
             bool ok = _navigationAgent.NavigateToWaypointForced(waypoint);
-
             if (ok)
                 Debug.Log($"[NavManager] 🔄 [Reroute] Ruta recalculada a '{waypoint.WaypointName}'.");
             else
@@ -660,7 +731,8 @@ namespace IndoorNavAR.Core
         #region Utilities
 
         private void LogEvent(string msg) { if (_logDetailedEvents) Debug.Log($"[NavManager] {msg}"); }
-        private void Log(string msg) => Debug.Log($"[NavManager] {msg}");
+        private void Log(string msg)      => Debug.Log($"[NavManager] {msg}");
+
         private void PublishMessage(string msg, MessageType type) =>
             EventBus.Instance?.Publish(new ShowMessageEvent
             { Message = msg, Type = type, Duration = type == MessageType.Error ? 5f : 3f });
@@ -677,17 +749,37 @@ namespace IndoorNavAR.Core
                       $"Modo: {(isFullAR ? "FullAR" : "NoAR")} | " +
                       $"Waypoints: {_waypointManager?.WaypointCount ?? 0} | " +
                       $"InitialAlignDone: {_arOriginAligner?.InitialAlignDone ?? false} | " +
-                      $"FPS: {Application.targetFrameRate}");
+                      $"FPS: {Application.targetFrameRate} | " +
+                      $"SessionInitInProgress: {_sessionInitInProgress}");
             if (_pathController != null)
                 Debug.Log($"[NavManager] PathController: IsFullARMode={_pathController.IsFullARMode} | " +
                           $"IsNavigating={_pathController.IsNavigating}");
         }
 
-        [ContextMenu("📦 Load Model")]       private void DebugLoadModel()  => _ = LoadModelOnLargestPlane();
-        [ContextMenu("🔄 Reset")]             private void DebugReset()      => ResetSystem();
-        [ContextMenu("🚀 Force Initialize")]  private void DebugForceInit()  { _isInitialized = false; _ = Initialize(); }
+        [ContextMenu("📦 Load Model")]
+        private void DebugLoadModel()  => _ = LoadModelOnLargestPlane();
+
+        [ContextMenu("🔄 Reset")]
+        private void DebugReset()      => ResetSystem();
+
+        [ContextMenu("🚀 Force Initialize")]
+        private void DebugForceInit()
+        {
+            _isInitialized         = false;
+            _sessionInitInProgress = false;
+            _ = Initialize();
+        }
+
         [ContextMenu("🧹 Force GC Now")]
-        private void DebugForceGC()           => _ = ReleaseMemoryBeforeARStart();
+        private void DebugForceGC()    => _ = ReleaseMemoryBeforeARStart();
+
+        [ContextMenu("⏱️ Debug Align Wait")]
+        private void DebugAlignWait()
+        {
+            Debug.Log($"[NavManager] _alignWaitTimeout={_alignWaitTimeout}s | " +
+                      $"InitialAlignDone={_arOriginAligner?.InitialAlignDone} | " +
+                      $"ARState={UnityEngine.XR.ARFoundation.ARSession.state}");
+        }
 
         #endregion
     }

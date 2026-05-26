@@ -1,38 +1,32 @@
 // File: ARGuideController.cs
-// ✅ v5.5 — FIX LLEGADA: Detección mejorada con umbral dinámico + verificación de progreso.
+// ✅ v5.6 — FIX TTS SATURACIÓN: Escaleras solo si la ruta cambia de piso real.
 //
 // ══════════════════════════════════════════════════════════════════════════════
-// CAMBIOS v5.4 → v5.5
+// CAMBIOS v5.5 → v5.6
 // ══════════════════════════════════════════════════════════════════════════════
 //
-// FIX P — Detección de llegada al waypoint mejorada
-// ──────────────────────────────────────────────────
-//   PROBLEMA v5.4: EvaluateArrivalInFullAR() usaba solo distancia XZ + piso.
-//   Problemas observados:
-//   1. Falso positivo: si el usuario pasa CERCA del destino pero sin
-//      detenerse, y luego se aleja, la llegada no se disparaba correctamente.
-//   2. Falso negativo: si el usuario está exactamente en el destino pero
-//      el NavMesh tiene un offset Y, la condición deltaY podía fallar.
-//   3. Sin detección de convergencia: el sistema no distingue si el usuario
-//      se está ACERCANDO al destino vs ya pasó de largo.
+// FIX R — Anuncios de escaleras solo cuando la ruta incluye cambio de piso real
+// ──────────────────────────────────────────────────────────────────────────────
+//   PROBLEMA v5.5: DetectStairsAhead() usaba solo el umbral de altura en el
+//   path del NavMesh (_stairHeightThreshold = 0.4m). Esto causaba falsos
+//   positivos en cualquier rampa, desnivel o irregularidad del modelo 3D
+//   que no implica un cambio real de planta.
+//
+//   Además _stairAnnounced se reseteaba al iniciar cada destino, permitiendo
+//   que el mismo tramo se anunciara múltiples veces si el agente oscilaba
+//   cerca del umbral.
 //
 //   FIX:
-//   • _arrivalConfirmDist se hace dinámico: se amplía si el usuario lleva
-//     más de _arrivalTimeoutConfirmDist segundos navegando (indica rutas largas).
-//   • Se añade verificación de convergencia: la llegada se confirma si
-//     el usuario estaba más lejos y ahora está dentro del umbral (no solo
-//     si pasa de largo por un momento).
-//   • Distancia XZ es el criterio principal; deltaY solo filtra pisos distintos.
-//   • Para NoAR también se usa distancia XZ en lugar de 3D.
+//   • Se añade _routeIncludesFloorChange (bool) que se calcula al establecer
+//     el destino comparando el piso origen (_currentFloor) con _destFloor.
+//     Si son iguales → DetectStairsAhead() devuelve siempre false.
+//   • Se añade _stairSilenceCooldown: una vez que se anuncia el tramo de
+//     escaleras, se impone un cooldown de _stairAnnounceCooldown segundos
+//     antes de permitir otro anuncio, aunque el agente se aleje y vuelva
+//     al mismo tramo.
+//   • Se mantiene toda la lógica de FullAR (supresión de anuncios de piso).
 //
-// FIX Q — ARGuideController.EvaluateArrivalConfirmation (NoAR) con XZ
-// ──────────────────────────────────────────────────────────────────────────
-//   PROBLEMA: EvaluateArrivalConfirmation() usaba Vector3.Distance (3D), que
-//   penaliza diferencias de altura legítimas (escalones, rampas, NavMesh).
-//
-//   FIX: Usar distancia XZ + verificación de piso, idéntico a FullAR.
-//
-// TODOS LOS FIXES ANTERIORES (v5.0 … v5.4) SE CONSERVAN ÍNTEGRAMENTE.
+// TODOS LOS FIXES ANTERIORES (v5.0 … v5.5) SE CONSERVAN ÍNTEGRAMENTE.
 
 using UnityEngine;
 using UnityEngine.AI;
@@ -83,20 +77,14 @@ namespace IndoorNavAR.Agent
         [SerializeField] private float _arrivalMovementThreshold = 1.5f;
 
         [Header("─── v5.5 FIX P — Llegada mejorada ───────────────────────────")]
-        [Tooltip("✅ v5.5 — Distancia máxima en XZ (m) para confirmar llegada en NoAR.\n" +
-                 "Reemplaza Vector3.Distance para ser robusto ante diferencias de altura.")]
+        [Tooltip("✅ v5.5 — Distancia máxima en XZ (m) para confirmar llegada en NoAR.")]
         [SerializeField] private float _arrivalXZDistance = 1.5f;
 
-        [Tooltip("✅ v5.5 — Número de frames consecutivos que el usuario debe estar\n" +
-                 "dentro del radio de llegada antes de confirmar. Evita falsas llegadas\n" +
-                 "por pases rápidos cerca del destino.\n" +
-                 "Default: 4 frames a 30fps = ~0.13s.")]
+        [Tooltip("✅ v5.5 — Frames consecutivos dentro del radio de llegada para confirmar.")]
         [SerializeField] private int _arrivalConvergenceFrames = 4;
         private int _arrivalConvergenceCount = 0;
 
-        [Tooltip("✅ v5.5 — Distancia mínima que el usuario debe haberse acercado\n" +
-                 "al destino comparado con la distancia inicial para que la llegada\n" +
-                 "sea válida. Evita confirmar llegada si el usuario nunca se movió.")]
+        [Tooltip("✅ v5.5 — Distancia mínima acercada al destino para que la llegada sea válida.")]
         [SerializeField] private float _arrivalProgressRequired = 2.0f;
 
         [Header("─── Velocidad ──────────────────────────────────────────────")]
@@ -125,6 +113,21 @@ namespace IndoorNavAR.Agent
         [SerializeField] private float _stairConfirmDistance = 1.5f;
         [Range(0.1f, 1f)]
         [SerializeField] private float _stairHeightThreshold = 0.4f;
+
+        [Header("─── v5.6 FIX R — Escaleras solo con cambio de piso real ─────")]
+        [Tooltip("✅ v5.6 — Si true, solo anuncia escaleras cuando la ruta implica\n" +
+                 "un cambio real de piso (destFloor != currentFloor).\n" +
+                 "Evita anuncios en rampas o desniveles del modelo sin cambio de planta.\n" +
+                 "Default: true")]
+        [SerializeField] private bool _requireFloorChangeForStairAnnounce = true;
+
+        [Tooltip("✅ v5.6 — Cooldown (s) tras anunciar escaleras antes de permitir\n" +
+                 "otro anuncio del mismo tramo. Evita repetición si el agente oscila.\n" +
+                 "Default: 15s")]
+        [SerializeField] private float _stairAnnounceCooldown = 15f;
+
+        private float _lastStairAnnounceTime = -999f;
+        private bool  _routeIncludesFloorChange = false;
 
         [Header("─── Ángulo ──────────────────────────────────────────────────")]
         [SerializeField] private float _maxAngle      = 120f;
@@ -201,8 +204,7 @@ namespace IndoorNavAR.Agent
         // FIX O: Piso del destino
         private int _destFloor = 0;
 
-        // ✅ v5.5 FIX P: Convergencia de llegada
-        // _arrivalConvergenceCount declarado en campos de Inspector arriba
+        // v5.5 FIX P: Convergencia de llegada declarada en Inspector arriba
 
         // ─────────────────────────────────────────────────────────────────────
         //  Propiedad dinámica de modo AR
@@ -364,7 +366,7 @@ namespace IndoorNavAR.Agent
         }
 
         // ─────────────────────────────────────────────────────────────────────
-        //  ✅ v5.5 FIX P — Evaluación de llegada FullAR mejorada
+        //  v5.5 FIX P — Evaluación de llegada FullAR mejorada
         // ─────────────────────────────────────────────────────────────────────
 
         private void EvaluateArrivalInFullAR()
@@ -376,7 +378,7 @@ namespace IndoorNavAR.Agent
 
             Vector3 userPos = GetUserPosition();
 
-            // ✅ FIX O: Verificar piso
+            // FIX O: Verificar piso
             int userFloor = ResolveFloorForY(userPos.y);
             if (userFloor != _destFloor)
             {
@@ -384,39 +386,34 @@ namespace IndoorNavAR.Agent
                 return;
             }
 
-            // ✅ v5.5 FIX P: Usar distancia XZ como criterio principal
+            // v5.5 FIX P: Usar distancia XZ como criterio principal
             float distXZ = DistXZ(userPos, _guideDestination);
             float deltaY = Mathf.Abs(userPos.y - _guideDestination.y);
 
             bool timedOut = _arrivalWaitTimer >= _arrivalTimeout;
 
-            // Si timedOut pero el usuario está lejos, ignorar
             if (timedOut && distXZ > _arrivalTimeoutConfirmDist)
             {
                 _arrivalConvergenceCount = 0;
                 return;
             }
 
-            // Si timedOut pero nunca se acercó, ignorar
             if (timedOut && !_userHasMovedTowardsDest)
             {
                 _arrivalConvergenceCount = 0;
                 return;
             }
 
-            // ✅ v5.5 FIX P: Zona de llegada estable
+            // v5.5 FIX P: Zona de llegada estable
             bool inArrivalZone = distXZ <= _arrivalConfirmDist &&
                                  deltaY <= _arrivalVerticalTolerance;
 
-            // Convergencia: contar frames consecutivos en la zona
             if (inArrivalZone)
                 _arrivalConvergenceCount++;
             else
                 _arrivalConvergenceCount = Mathf.Max(0, _arrivalConvergenceCount - 1);
 
             bool stableArrival = _arrivalConvergenceCount >= Mathf.Max(1, _arrivalStableFramesRequired);
-
-            // Fallback por timeout (zona ampliada)
             bool timeoutArrival = timedOut &&
                                   distXZ <= _arrivalTimeoutConfirmDist &&
                                   deltaY <= _arrivalVerticalTolerance  &&
@@ -496,7 +493,7 @@ namespace IndoorNavAR.Agent
         }
 
         // ─────────────────────────────────────────────────────────────────────
-        //  ✅ v5.5 FIX Q — Llegada NoAR con distancia XZ
+        //  v5.5 FIX Q — Llegada NoAR con distancia XZ
         // ─────────────────────────────────────────────────────────────────────
 
         private void EvaluateArrivalConfirmation()
@@ -506,7 +503,6 @@ namespace IndoorNavAR.Agent
 
             Vector3 userPos = GetUserPosition();
 
-            // ✅ v5.5 FIX Q: Verificar piso (mismo que FullAR)
             int userFloor = ResolveFloorForY(userPos.y);
             if (userFloor != _destFloor)
             {
@@ -514,7 +510,6 @@ namespace IndoorNavAR.Agent
                 return;
             }
 
-            // ✅ v5.5 FIX Q: Usar distancia XZ en lugar de 3D
             float distXZ = DistXZ(userPos, _guideDestination);
             float deltaY = Mathf.Abs(userPos.y - _guideDestination.y);
 
@@ -642,20 +637,28 @@ namespace IndoorNavAR.Agent
             _navCompletedFired   = false;
             _arrivalWaitTimer    = 0f;
             _arrivalStableFrames = 0;
-            _arrivalConvergenceCount = 0; // ✅ v5.5: reset convergencia
+            _arrivalConvergenceCount = 0;
             _ttsPauseActive      = false;
             _ttsPauseTimer       = 0f;
             _initialPauseDone    = false;
             _initialPauseTimer   = 0f;
             _inPostTurnPause     = false;
             _postTurnPauseTimer  = 0f;
+            _lastStairAnnounceTime = -999f; // ✅ v5.6: reset cooldown escaleras al iniciar ruta
 
             // FIX N
             _userHasMovedTowardsDest = false;
-            _initialDistToDest       = DistXZ(GetUserPosition(), destination); // ✅ v5.5: usar XZ
+            _initialDistToDest       = DistXZ(GetUserPosition(), destination);
 
             // FIX O
             _destFloor = ResolveFloorForY(destination.y);
+
+            // ✅ v5.6 FIX R: Determinar si la ruta implica cambio de piso real
+            _routeIncludesFloorChange = _destFloor != _currentFloor;
+
+            if (_logStairs)
+                Debug.Log($"[ARGuideController] 🪜 [v5.6] routeIncludesFloorChange={_routeIncludesFloorChange} " +
+                          $"(currentFloor={_currentFloor} destFloor={_destFloor})");
 
             if (fullAR)
             {
@@ -698,7 +701,7 @@ namespace IndoorNavAR.Agent
             _ttsPauseTimer           = 0f;
             _navCompletedFired       = false;
             _arrivalWaitTimer        = 0f;
-            _arrivalConvergenceCount = 0;  // ✅ v5.5
+            _arrivalConvergenceCount = 0;
             _initialPauseDone        = false;
             _initialPauseTimer       = 0f;
             _inPostTurnPause         = false;
@@ -706,6 +709,8 @@ namespace IndoorNavAR.Agent
             _userHasMovedTowardsDest = false;
             _initialDistToDest       = float.MaxValue;
             _destFloor               = 0;
+            _routeIncludesFloorChange = false; // ✅ v5.6
+            _lastStairAnnounceTime   = -999f;  // ✅ v5.6
 
             if (!fullAR) { RestoreAgentRotationControl(); RestoreSpeed(); }
 
@@ -786,11 +791,14 @@ namespace IndoorNavAR.Agent
                 return;
             }
 
-            if (distance <= _safeDistance && DetectStairsAhead(guidePos))
+            // ✅ v5.6 FIX R: Solo detectar escaleras si la ruta incluye cambio de piso
+            //    y no se ha superado el cooldown de anuncio.
+            if (distance <= _safeDistance && StairDetectionAllowed() && DetectStairsAhead(guidePos))
             {
                 if (!_stairAnnounced)
                 {
-                    _stairAnnounced = true;
+                    _stairAnnounced        = true;
+                    _lastStairAnnounceTime = Time.time;
                     PauseAgent();
                     Announce(GuideAnnouncementType.ApproachingStairs, "Atención: escaleras próximas.");
                     TransitionTo(GuideState.ApproachingStairs);
@@ -925,12 +933,41 @@ namespace IndoorNavAR.Agent
         }
 
         // ─────────────────────────────────────────────────────────────────────
-        //  HELPERS
+        //  ✅ v5.6 FIX R — Guard de detección de escaleras
         // ─────────────────────────────────────────────────────────────────────
 
         /// <summary>
-        /// ✅ v5.5: Distancia horizontal XZ entre dos puntos (ignora altura).
+        /// Devuelve true solo cuando está permitido anunciar escaleras:
+        ///   1. La ruta incluye cambio de piso real (o _requireFloorChangeForStairAnnounce=false).
+        ///   2. Ha pasado suficiente tiempo desde el último anuncio de escaleras.
         /// </summary>
+        private bool StairDetectionAllowed()
+        {
+            if (_requireFloorChangeForStairAnnounce && !_routeIncludesFloorChange)
+            {
+                if (_logStairs)
+                    Debug.Log("[ARGuideController] 🪜 [v5.6] Detección escaleras bloqueada — " +
+                              "ruta sin cambio de piso real.");
+                return false;
+            }
+
+            float elapsed = Time.time - _lastStairAnnounceTime;
+            if (elapsed < _stairAnnounceCooldown)
+            {
+                if (_logStairs)
+                    Debug.Log($"[ARGuideController] 🪜 [v5.6] Cooldown escaleras activo — " +
+                              $"{elapsed:F1}s / {_stairAnnounceCooldown}s.");
+                return false;
+            }
+
+            return true;
+        }
+
+        // ─────────────────────────────────────────────────────────────────────
+        //  HELPERS
+        // ─────────────────────────────────────────────────────────────────────
+
+        /// <summary>v5.5: Distancia horizontal XZ entre dos puntos (ignora altura).</summary>
         private static float DistXZ(Vector3 a, Vector3 b)
         {
             float dx = a.x - b.x;
@@ -1097,7 +1134,6 @@ namespace IndoorNavAR.Agent
                 Gizmos.DrawSphere(_guideDestination, 0.15f);
                 Gizmos.DrawLine(pos, _guideDestination);
 
-                // ✅ v5.5: Mostrar radio de llegada XZ
                 if (fullAR)
                 {
                     Gizmos.color = new Color(0f, 1f, 0.5f, 0.3f);
@@ -1118,13 +1154,15 @@ namespace IndoorNavAR.Agent
                 alignment = TextAnchor.MiddleCenter
             };
 
-            string floorInfo = fullAR && _hasDestination ? $" 🏢→piso{_destFloor}" : string.Empty;
-            string convInfo  = _hasDestination ? $" conv={_arrivalConvergenceCount}" : string.Empty;
+            string floorInfo  = fullAR && _hasDestination ? $" 🏢→piso{_destFloor}" : string.Empty;
+            string convInfo   = _hasDestination ? $" conv={_arrivalConvergenceCount}" : string.Empty;
+            // ✅ v5.6: mostrar si la ruta incluye cambio de piso
+            string floorChange = _hasDestination && _routeIncludesFloorChange ? " 🪜↕" : string.Empty;
 
             UnityEditor.Handles.Label(pos + Vector3.up * 1.8f,
                 $"[{(fullAR ? "AR" : "NoAR")} {_currentState}" +
                 (_isOnStairs ? " 🪜" : "") + (_ttsPauseActive ? " 🔊" : "") +
-                floorInfo + convInfo + "]",
+                floorInfo + convInfo + floorChange + "]",
                 style);
         }
 
@@ -1168,7 +1206,7 @@ namespace IndoorNavAR.Agent
             float   dxz      = DistXZ(userPos, _guideDestination);
             float   dy       = Mathf.Abs(userPos.y - _guideDestination.y);
             Debug.Log(
-                $"[ARGuideController] v5.5\n" +
+                $"[ARGuideController] v5.6\n" +
                 $"  IsFullAR = {fullAR}\n" +
                 $"  Estado = {_currentState}\n" +
                 $"  UserPos = {userPos:F2}\n" +
@@ -1179,7 +1217,9 @@ namespace IndoorNavAR.Agent
                 $"  Convergencia = {_arrivalConvergenceCount}/{_arrivalConvergenceFrames}\n" +
                 $"  [FIX N] userHasMoved={_userHasMovedTowardsDest} | " +
                 $"initialDist={_initialDistToDest:F1}m\n" +
-                $"  [FIX O] destFloor={_destFloor} | userFloor={ResolveFloorForY(userPos.y)}");
+                $"  [FIX O] destFloor={_destFloor} | userFloor={ResolveFloorForY(userPos.y)}\n" +
+                $"  [FIX R v5.6] routeIncludesFloorChange={_routeIncludesFloorChange} | " +
+                $"lastStairAnnounce={_lastStairAnnounceTime:F1}s | cooldown={_stairAnnounceCooldown}s");
         }
 
         [ContextMenu("🚀 Test: destino 10m al frente")]

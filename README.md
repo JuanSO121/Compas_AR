@@ -286,5 +286,3 @@ Este README describe qué está implementado y qué está proyectado para evitar
 - Publicar guía de despliegue de investigación, dataset de recorridos y métricas de evaluación.
 
 ---
-
-Si necesitas usar este README como prompt base para IA, úsalo junto con `docs/INTEGRACION_FLUTTER_UNITY.md` para darle contexto de arquitectura y contexto de integración Android Flutter Unity en paralelo.

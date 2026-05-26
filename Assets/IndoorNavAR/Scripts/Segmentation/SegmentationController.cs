@@ -1,53 +1,30 @@
 // File: SegmentationController.cs
-// ✅ v11.0 — Desacopla inferencia del render loop de ARCore para preservar framerate
+// ✅ v12.0 — FIX overlay + lógica de obstáculos por posición en imagen
 //
 // ============================================================================
-//  CAMBIOS v10.2 → v11.0
+//  CAMBIOS v11.2 → v12.0
 // ============================================================================
 //
-//  PROBLEMA RAÍZ (v10.x):
-//  ─────────────────────────────────────────────────────────────────────────
-//  _cameraManager.frameReceived se disparaba en cada frame de ARCore y dentro
-//  de él se ejecutaba TryCaptureFromCpuImage() que incluye:
-//    - XRCpuImage.Convert() (CPU-heavy, copia de buffer)
-//    - Texture2D.LoadRawTextureData() + Apply()
-//    - GL.Clear() + Graphics.DrawTexture() + ReadPixels()
-//  Aunque la inferencia GPU era asíncrona, la CAPTURA bloqueaba el hilo
-//  principal en cada frame polling, causando drops de framerate en la cámara AR.
+//  FIX OVERLAY A — SetOverlayVisible() no activaba el overlay si la
+//  segmentación estaba inactiva, aunque se llamara explícitamente desde
+//  Inspector o ContextMenu para ver la máscara en debug.
+//  Ahora SetOverlayVisible(true) activa también la segmentación si
+//  _onlyDuringNavigation=false, o fuerza el overlay visible independientemente.
 //
-//  SOLUCIÓN v11.0 — PIPELINE COMPLETAMENTE DESACOPLADO:
-//  ─────────────────────────────────────────────────────────────────────────
-//  1. frameReceived YA NO SE USA para disparar inferencias.
-//     Solo se usa para capturar la textura cruda de ARCore cuando el timer
-//     de segmentación lo indica — fuera del path caliente de render.
+//  FIX OVERLAY B — El overlay se inicializaba con SetVisible(false) en Start()
+//  pero si después se llamaba ActivateSegmentation() con _debugOverlayEnabled=true
+//  no se llamaba SetVisible(true) explícitamente.
+//  Corregido: ActivateSegmentation() siempre llama SetVisible(_debugOverlayEnabled).
 //
-//  2. Timer independiente (_inferenceInterval, default 3s) controla cuándo
-//     se captura y schedules la inferencia. ARCore corre a su framerate
-//     nativo sin interrupciones.
+//  FIX OBSTACLE — Nueva lógica de posición de obstáculos en imagen:
+//    • AnalyzeObstaclePosition() detecta en qué región de la imagen (izquierda,
+//      centro, derecha, lejos/cerca por fila Y) se concentran los píxeles de obstáculo.
+//    • PlaceObstacleByImagePosition() proyecta esa región al espacio de mundo
+//      usando la dirección de la cámara y un offset lateral, colocando el
+//      NavMeshObstacle en la posición real correspondiente.
+//    • El recálculo de ruta se dispara con información espacial precisa.
 //
-//  3. Captura lazy: en el tick del timer se captura el frame más reciente
-//     disponible de ARCore usando TryAcquireLatestCpuImage(). Si el worker
-//     está ocupado, se espera al siguiente tick.
-//
-//  4. _debugOverlayEnabled (booleano en Inspector + ContextMenu):
-//     - false (default producción): overlay desactivado, cero overhead de
-//       Texture2D.SetPixels32/Apply en Update(). La información sigue
-//       fluyendo a Flutter/VoiceAPI normalmente.
-//     - true (demo/presentación): muestra cómo el modelo "ve" la escena,
-//       exactamente igual que v10.x.
-//     Cambiable en runtime desde el Inspector o ContextMenu sin reiniciar.
-//
-//  5. Frecuencia adaptativa ELIMINADA del render loop — el timer fijo de
-//     3s es suficiente para alertas de obstáculos. Se conserva la lógica
-//     de cooldown de alertas y supresión por ObstacleRerouteMediator.
-//
-//  6. TODOS LOS COMPORTAMIENTOS DE v10.2 SE CONSERVAN:
-//     - Activación/desactivación por NavigationStartedEvent/StoppedEvent
-//     - Fallback CPU tras MAX_GPU_TIMEOUTS
-//     - Notificación a Flutter de segmentation_active
-//     - PassageBlockDetector sigue leyendo ObstacleRatio/WallRatio/FloorRatio
-//     - _onlyDuringNavigation respetado
-//     - ContextMenus de debug
+//  TODOS LOS FIX_VIO DE v11.2 SE CONSERVAN ÍNTEGRAMENTE.
 
 using System;
 using System.Collections;
@@ -86,10 +63,9 @@ namespace IndoorNavAR.Segmentation
         [Header("Overlay")]
         [SerializeField] private SegmentationOverlayRenderer _overlayRenderer;
 
-        [Tooltip("Solo para demos / presentaciones.\n" +
-                 "false (default) = overlay oculto, cero overhead de GPU en textura de máscara.\n" +
-                 "true            = muestra cómo el modelo ve la escena (igual que v10.x).\n" +
-                 "Cambiable en runtime desde Inspector o ContextMenu sin reiniciar.")]
+        [Tooltip("Muestra la máscara de segmentación sobre la cámara.\n" +
+                 "true  = overlay visible (debug / demo).\n" +
+                 "false = overlay oculto (producción).")]
         [SerializeField] private bool _debugOverlayEnabled = false;
 
         [Header("ROI — Región de Interés")]
@@ -97,16 +73,28 @@ namespace IndoorNavAR.Segmentation
         [SerializeField, Range(0f, 0.7f)]
         private float _roiTopSkip = 0.4f;
 
-        [Header("─── v11.0: Timer de inferencia (desacoplado del render loop) ───")]
-        [Tooltip("Intervalo en segundos entre inferencias.\n" +
-                 "El render loop de ARCore NO es afectado por este timer.\n" +
-                 "Default: 3s — suficiente para alertas de obstáculos en tiempo real.")]
+        [Header("─── Timer de inferencia ──────────────────────────────────────")]
+        [Tooltip("Intervalo entre inferencias (s). Mínimo 3s en device. Default: 3s")]
         [SerializeField, Range(0.5f, 10f)]
         private float _inferenceInterval = 3f;
 
-        [Header("Alertas TTS")]
-        [SerializeField] private float _obstacleAlertThreshold = 0.12f;
-        [SerializeField] private float _alertCooldown          = 3.5f;
+        [Header("─── Alertas TTS ──────────────────────────────────────────────")]
+        [SerializeField] private float _obstacleAlertThreshold = 0.20f;
+        [SerializeField] private float _obstacleHighThreshold  = 0.40f;
+        [SerializeField] private float _alertCooldownNormal    = 7f;
+        [SerializeField] private float _alertCooldownHigh      = 12f;
+        [SerializeField] private int   _obstacleConfirmCount   = 2;
+
+        [Header("─── Posicionamiento de obstáculos ──────────────────────────────")]
+        [Tooltip("Distancia frontal (m) al colocar obstáculo cuando se detecta en zona central.")]
+        [SerializeField] private float _obstacleForwardDistance = 1.8f;
+        [Tooltip("Offset lateral (m) para obstáculos en zona izquierda/derecha.")]
+        [SerializeField] private float _obstacleLateralOffset   = 0.8f;
+        [Tooltip("Fracción de píxeles de obstáculo en una columna para considerarla 'bloqueada'.")]
+        [SerializeField, Range(0.05f, 0.5f)]
+        private float _columnBlockThreshold = 0.15f;
+        [Tooltip("Prefab de NavMeshObstacleAgent para instanciar cuando se detecta obstáculo.")]
+        [SerializeField] private NavMeshObstacleAgent _obstacleAgentPrefab;
 
         [Header("Control de activación")]
         [Tooltip("Si está marcado, la segmentación SOLO se activa durante navegación.")]
@@ -117,8 +105,14 @@ namespace IndoorNavAR.Segmentation
         [SerializeField] private bool _logFrameCapture = true;
 
         // ── Constantes ────────────────────────────────────────────────────
-        private const int   MODEL_SIZE       = ObstacleSegmentationWorker.IMAGE_SIZE;
-        private const int   MAX_GPU_TIMEOUTS = 3;
+        private const int   MODEL_SIZE                    = ObstacleSegmentationWorker.IMAGE_SIZE;
+        private const int   MAX_GPU_TIMEOUTS              = 3;
+        private const float MIN_INFERENCE_INTERVAL_DEVICE = 3.0f;
+
+        // Regiones de imagen para análisis de posición de obstáculo
+        private const float REGION_LEFT_LIMIT   = 0.33f;
+        private const float REGION_RIGHT_LIMIT  = 0.67f;
+        private const float REGION_NEAR_LIMIT   = 0.6f;  // fila Y normalizada (de abajo)
 
         // ── Worker y texturas ─────────────────────────────────────────────
         private ObstacleSegmentationWorker _worker;
@@ -127,22 +121,51 @@ namespace IndoorNavAR.Segmentation
         private Texture2D                  _fitTex;
 
         // ── Estado ────────────────────────────────────────────────────────
-        private bool  _initialized           = false;
-        private bool  _segmentationActive    = false;
-        private bool  _pendingActivation     = false;
-        private bool  _cpuFallbackActive     = false;
-        private float _lastAlertTime         = -999f;
+        private bool  _initialized        = false;
+        private bool  _segmentationActive = false;
+        private bool  _pendingActivation  = false;
+        private bool  _cpuFallbackActive  = false;
 
         // ── Control de timeout GPU ────────────────────────────────────────
-        private bool _inferenceScheduled      = false;  // hay una inferencia en vuelo
+        private bool _inferenceScheduled      = false;
         private int  _consecutivePollTimeouts = 0;
 
-        // ── Timer de inferencia (v11.0) ───────────────────────────────────
+        // ── Timer de inferencia ───────────────────────────────────────────
         private float _timeSinceLastInference = 0f;
 
+        // ── Estado de alertas ─────────────────────────────────────────────
+        private float _lastAlertTime           = -999f;
+        private bool  _obstacleAlertActive     = false;
+        private int   _obstacleConsecutiveCount = 0;
+
+        // ── Obstacle placement ────────────────────────────────────────────
+        private NavMeshObstacleAgent _activeObstacleAgent = null;
+        private float _lastObstaclePlaceTime = -999f;
+        private const float OBSTACLE_PLACE_COOLDOWN = 5f;
+
         // ── Propiedades públicas ──────────────────────────────────────────
-        public bool OverlayVisible        => _debugOverlayEnabled;
-        public bool IsSegmentationActive  => _segmentationActive;
+        public bool OverlayVisible       => _debugOverlayEnabled;
+        public bool IsSegmentationActive => _segmentationActive;
+
+        // ═════════════════════════════════════════════════════════════════
+        //  Awake — FIX_VIO: garantías antes de Start()
+        // ═════════════════════════════════════════════════════════════════
+
+        private void Awake()
+        {
+#if !UNITY_EDITOR
+            if (!_onlyDuringNavigation)
+            {
+                _onlyDuringNavigation = true;
+                Debug.Log("[SegCtrl v12] 📱 [FIX_VIO] _onlyDuringNavigation forzado a true en device.");
+            }
+            if (_inferenceInterval < MIN_INFERENCE_INTERVAL_DEVICE)
+            {
+                Debug.LogWarning($"[SegCtrl v12] ⚠️ [FIX_VIO] _inferenceInterval corregido a {MIN_INFERENCE_INTERVAL_DEVICE}s.");
+                _inferenceInterval = MIN_INFERENCE_INTERVAL_DEVICE;
+            }
+#endif
+        }
 
         // ═════════════════════════════════════════════════════════════════
         //  Lifecycle
@@ -154,109 +177,92 @@ namespace IndoorNavAR.Segmentation
 
             if (_modelAsset == null)
             {
-                Debug.LogError("[SegCtrl v11] ❌ ModelAsset no asignado.");
+                Debug.LogError("[SegCtrl v12] ❌ ModelAsset no asignado.");
                 return;
             }
 
             if (_cameraManager == null)
-                _cameraManager = FindFirstObjectByType<ARCameraManager>(
-                    FindObjectsInactive.Include);
-
+                _cameraManager = FindFirstObjectByType<ARCameraManager>(FindObjectsInactive.Include);
             if (_cameraBackground == null)
-                _cameraBackground = FindFirstObjectByType<ARCameraBackground>(
-                    FindObjectsInactive.Include);
+                _cameraBackground = FindFirstObjectByType<ARCameraBackground>(FindObjectsInactive.Include);
 
             if (_cameraManager == null)
             {
-                Debug.LogError("[SegCtrl v11] ❌ ARCameraManager NO encontrado.");
+                Debug.LogError("[SegCtrl v12] ❌ ARCameraManager NO encontrado.");
                 return;
             }
 
-            // Buffers de captura
-            _cameraRT = new RenderTexture(MODEL_SIZE, MODEL_SIZE, 0,
-                                          RenderTextureFormat.ARGB32)
+            _cameraRT = new RenderTexture(MODEL_SIZE, MODEL_SIZE, 0, RenderTextureFormat.ARGB32)
             {
                 filterMode = FilterMode.Bilinear,
                 wrapMode   = TextureWrapMode.Clamp
             };
             _cameraRT.Create();
 
-            _frameBufferFallback = new Texture2D(MODEL_SIZE, MODEL_SIZE,
-                                                  TextureFormat.RGB24, false);
+            _frameBufferFallback = new Texture2D(MODEL_SIZE, MODEL_SIZE, TextureFormat.RGB24, false);
 
-            // Worker de Sentis
             _worker = new ObstacleSegmentationWorker(
                 _modelAsset, _backend, _tensorRotation, _flipInputY, _flipInputX);
 
             if (!_worker.IsReady)
             {
-                Debug.LogError("[SegCtrl v11] ❌ Worker no pudo inicializarse.");
+                Debug.LogError("[SegCtrl v12] ❌ Worker no pudo inicializarse.");
                 return;
             }
 
             _overlayRenderer?.Initialize(_worker.MaskWidth, _worker.MaskHeight);
             _overlayRenderer?.SetFlipMode(SegmentationOverlayRenderer.FlipMode.None);
-            // El overlay arranca oculto siempre — _debugOverlayEnabled lo controla
+            // FIX OVERLAY B: comenzar explícitamente oculto
             _overlayRenderer?.SetVisible(false);
 
             _worker.OnInferenceComplete += HandleInferenceComplete;
 
-            // v11.0: NO suscribimos a frameReceived en Start.
-            // La captura la hace el timer en Update() cuando _segmentationActive = true.
             if (!_onlyDuringNavigation)
             {
                 _segmentationActive = true;
                 NotifyFlutterSegmentationState(true);
-                Debug.Log("[SegCtrl v11] ✅ Segmentación activa desde Start (onlyDuringNavigation=false)");
+                // FIX OVERLAY B: si overlay está habilitado desde el inicio, activarlo
+                if (_debugOverlayEnabled)
+                    _overlayRenderer?.SetVisible(true);
+                Debug.Log("[SegCtrl v12] ✅ Segmentación activa desde Start.");
             }
 
             _initialized = true;
-
             SubscribeToNavigationEvents();
 
-            // Procesar activación pendiente si el evento llegó antes de Start()
             if (_pendingActivation)
             {
                 _pendingActivation = false;
-                Debug.Log("[SegCtrl v11] ✅ Procesando activación pendiente");
                 ActivateSegmentation();
             }
 
             StartCoroutine(DiagnoseARSetup());
 
-            Debug.Log($"[SegCtrl v11] ✅ Inicializado. rotation={_tensorRotation}° " +
+            Debug.Log($"[SegCtrl v12] ✅ Inicializado. rotation={_tensorRotation}° " +
                       $"flipY={_flipInputY} flipX={_flipInputX} " +
-                      $"MODEL_SIZE={MODEL_SIZE} ROI={_roiTopSkip:P0} " +
-                      $"interval={_inferenceInterval}s " +
-                      $"onlyDuringNav={_onlyDuringNavigation} " +
-                      $"debugOverlay={_debugOverlayEnabled}");
+                      $"interval={_inferenceInterval}s onlyDuringNav={_onlyDuringNavigation}");
         }
 
         private void OnDestroy()
         {
             UnsubscribeFromNavigationEvents();
             _worker?.Dispose();
-
             if (_cameraRT != null)           { _cameraRT.Release(); Destroy(_cameraRT); }
             if (_frameBufferFallback != null)  Destroy(_frameBufferFallback);
             if (_fitTex != null)               Destroy(_fitTex);
         }
 
         // ═════════════════════════════════════════════════════════════════
-        //  Update — ÚNICO punto de control (timer + poll)
+        //  Update — timer + poll
         // ═════════════════════════════════════════════════════════════════
 
         private void Update()
         {
             if (!_segmentationActive || _worker == null) return;
 
-            // ── 1. Poll de resultado de inferencia en vuelo ───────────────
-            //    Siempre primero: si hay resultado listo, procesarlo antes
-            //    de decidir si disparar la siguiente inferencia.
             if (_inferenceScheduled)
             {
                 bool resultReady = _worker.PollResult();
-
                 if (resultReady)
                 {
                     _inferenceScheduled      = false;
@@ -265,22 +271,16 @@ namespace IndoorNavAR.Segmentation
                 }
                 else if (!_worker.IsBusy)
                 {
-                    // Worker libre pero PollResult devolvió false → timeout
                     _inferenceScheduled = false;
                     _consecutivePollTimeouts++;
-
                     if (_consecutivePollTimeouts >= MAX_GPU_TIMEOUTS && !_cpuFallbackActive)
                         ReinitializeWithCPU();
                 }
-                // Si _worker.IsBusy todavía → seguir esperando (no hacer nada)
             }
 
-            // ── 2. Timer de inferencia (v11.0 — desacoplado del render loop) ──
-            //    Solo disparar si no hay una inferencia en vuelo.
             if (!_inferenceScheduled)
             {
                 _timeSinceLastInference += Time.deltaTime;
-
                 if (_timeSinceLastInference >= _inferenceInterval)
                 {
                     _timeSinceLastInference = 0f;
@@ -291,18 +291,24 @@ namespace IndoorNavAR.Segmentation
 
         // ── Captura y schedule ────────────────────────────────────────────
 
-        /// <summary>
-        /// Captura el frame más reciente de ARCore y schedules la inferencia.
-        /// Se llama desde el timer — NO desde frameReceived.
-        /// </summary>
         private void TryCaptureAndSchedule()
         {
             if (_worker == null || !_worker.IsReady || _worker.IsBusy) return;
 
+#if !UNITY_EDITOR
+            if (UnityEngine.XR.ARFoundation.ARSession.state !=
+                UnityEngine.XR.ARFoundation.ARSessionState.SessionTracking)
+            {
+                if (_logFrameCapture)
+                    Debug.Log($"[SegCtrl v12] ⏭️ [FIX_VIO] Saltando — ARSession={UnityEngine.XR.ARFoundation.ARSession.state}");
+                return;
+            }
+#endif
+
             if (!TryCaptureFromCpuImage())
             {
                 if (_logFrameCapture)
-                    Debug.LogWarning("[SegCtrl v11] ⚠️ Captura fallida — saltando tick.");
+                    Debug.LogWarning("[SegCtrl v12] ⚠️ Captura fallida.");
                 return;
             }
 
@@ -310,18 +316,20 @@ namespace IndoorNavAR.Segmentation
             _inferenceScheduled = true;
 
             if (_logFrameCapture)
-                Debug.Log("[SegCtrl v11] 📸 Inferencia schedulada.");
+                Debug.Log("[SegCtrl v12] 📸 Inferencia schedulada.");
         }
 
         // ── Resultado de inferencia ───────────────────────────────────────
 
         private void OnInferenceResultReady()
         {
-            // Overlay: solo si debugOverlay está habilitado Y el renderer está visible
-            if (_debugOverlayEnabled && _overlayRenderer != null && _overlayRenderer.IsVisible)
-                _overlayRenderer.UpdateMask(_worker.MaskData);
+            // FIX OVERLAY B: actualizar textura siempre, visible o no, para que
+            // cuando se active ya tenga datos
+            _overlayRenderer?.UpdateMask(_worker.MaskData);
 
+            UpdateObstacleAlertState();
             EvaluateAlerts();
+            EvaluateObstaclePosition();  // ← NUEVO: análisis de posición espacial
 
             VoiceCommandAPI.Instance?.SendSegmentationRatio(
                 _worker.ObstacleRatio,
@@ -329,32 +337,246 @@ namespace IndoorNavAR.Segmentation
                 _worker.WallRatio);
 
             if (_logStats)
-                Debug.Log($"[SegCtrl v11] 🎯 Obstacle={_worker.ObstacleRatio:P1} " +
+                Debug.Log($"[SegCtrl v12] 🎯 Obstacle={_worker.ObstacleRatio:P1} " +
                           $"Floor={_worker.FloorRatio:P1} Wall={_worker.WallRatio:P1}");
         }
 
         private void HandleInferenceComplete()
         {
-            // Callback del worker — solo logging en debug
-            if (_logStats) Debug.Log("[SegCtrl v11] ✅ OnInferenceComplete (worker callback).");
+            if (_logStats) Debug.Log("[SegCtrl v12] ✅ InferenceComplete.");
         }
 
         // ═════════════════════════════════════════════════════════════════
-        //  Captura de imagen CPU (sin cambios funcionales vs v10.2)
+        //  NUEVO: Análisis de posición de obstáculo en imagen
+        // ═════════════════════════════════════════════════════════════════
+
+        private enum ObstacleRegion { None, Left, Center, Right }
+
+        /// <summary>
+        /// Analiza la distribución de píxeles de obstáculo en la máscara para
+        /// determinar en qué región horizontal se encuentra el obstáculo principal.
+        /// Divide la imagen en 3 columnas (izquierda / centro / derecha) y cuenta
+        /// píxeles de clase OBSTACLE en cada una. La columna con más píxeles que
+        /// supere _columnBlockThreshold define la región.
+        /// </summary>
+        private ObstacleRegion AnalyzeObstaclePosition(out float normalizedX, out float normalizedY)
+        {
+            normalizedX = 0.5f;
+            normalizedY = 0.5f;
+
+            int[] mask = _worker.MaskData;
+            if (mask == null || mask.Length == 0) return ObstacleRegion.None;
+
+            int w = _worker.MaskWidth;
+            int h = _worker.MaskHeight;
+
+            int leftCount   = 0;
+            int centerCount = 0;
+            int rightCount  = 0;
+            int total       = w * h;
+
+            // Para centroide
+            long sumX = 0, sumY = 0;
+            int  obsCnt = 0;
+
+            for (int row = 0; row < h; row++)
+            {
+                // Ignorar la parte superior (suelo, techo lejano) — ROI inferior
+                // Las filas con índice alto = parte inferior de la imagen = obstáculos cercanos
+                float rowNorm = (float)row / h;
+
+                for (int col = 0; col < w; col++)
+                {
+                    int idx = row * w + col;
+                    if (mask[idx] != ObstacleSegmentationWorker.CLASS_OBSTACLE) continue;
+
+                    float colNorm = (float)col / w;
+
+                    if (colNorm < REGION_LEFT_LIMIT)        leftCount++;
+                    else if (colNorm < REGION_RIGHT_LIMIT)  centerCount++;
+                    else                                     rightCount++;
+
+                    sumX += col;
+                    sumY += row;
+                    obsCnt++;
+                }
+            }
+
+            if (obsCnt == 0) return ObstacleRegion.None;
+
+            // Centroide normalizado
+            normalizedX = (float)sumX / (obsCnt * w);
+            normalizedY = (float)sumY / (obsCnt * h);
+
+            // Umbral por columna
+            float leftRatio   = (float)leftCount   / total;
+            float centerRatio = (float)centerCount / total;
+            float rightRatio  = (float)rightCount  / total;
+
+            float maxRatio = Mathf.Max(leftRatio, centerRatio, rightRatio);
+            if (maxRatio < _columnBlockThreshold) return ObstacleRegion.None;
+
+            if (centerRatio >= leftRatio && centerRatio >= rightRatio)
+                return ObstacleRegion.Center;
+            if (leftRatio >= rightRatio)
+                return ObstacleRegion.Left;
+            return ObstacleRegion.Right;
+        }
+
+        /// <summary>
+        /// Si hay un obstáculo significativo, lo coloca en el mundo y fuerza
+        /// recálculo de ruta. Usa la región detectada para ajustar el offset lateral.
+        /// </summary>
+        private void EvaluateObstaclePosition()
+        {
+            if (_worker.ObstacleRatio < _obstacleAlertThreshold) return;
+            if (_obstacleConsecutiveCount < _obstacleConfirmCount) return;
+            if (Time.time - _lastObstaclePlaceTime < OBSTACLE_PLACE_COOLDOWN) return;
+            if (ObstacleRerouteMediator.IsActive) return;
+
+            ObstacleRegion region = AnalyzeObstaclePosition(
+                out float normX, out float normY);
+
+            if (region == ObstacleRegion.None) return;
+
+            // Obtener cámara de referencia
+            Camera cam = Camera.main;
+            if (cam == null) return;
+
+            Vector3 forward = cam.transform.forward;
+            forward.y = 0f;
+            if (forward.sqrMagnitude < 0.001f) return;
+            forward.Normalize();
+
+            Vector3 right = cam.transform.right;
+            right.y = 0f;
+            right.Normalize();
+
+            // Calcular offset lateral según región
+            float lateralSign = 0f;
+            switch (region)
+            {
+                case ObstacleRegion.Left:   lateralSign = -1f; break;
+                case ObstacleRegion.Right:  lateralSign =  1f; break;
+                case ObstacleRegion.Center: lateralSign =  0f; break;
+            }
+
+            // Distancia frontal: obstáculos en la parte baja de la imagen = más cercanos
+            // normY alto (cerca de 1) = parte inferior = obstáculo próximo
+            float distanceFactor = Mathf.Lerp(1.2f, _obstacleForwardDistance, 1f - normY);
+            Vector3 obstacleWorldPos = cam.transform.position
+                + forward * distanceFactor
+                + right   * lateralSign * _obstacleLateralOffset;
+
+            // Proyectar al NavMesh
+            if (!UnityEngine.AI.NavMesh.SamplePosition(
+                    obstacleWorldPos, out UnityEngine.AI.NavMeshHit hit, 2f,
+                    UnityEngine.AI.NavMesh.AllAreas))
+            {
+                Debug.LogWarning($"[SegCtrl v12] ⚠️ No se encontró NavMesh para obstáculo en {obstacleWorldPos:F2}");
+                return;
+            }
+
+            _lastObstaclePlaceTime = Time.time;
+
+            // Colocar obstáculo virtual
+            if (_obstacleAgentPrefab != null)
+            {
+                if (_activeObstacleAgent == null)
+                    _activeObstacleAgent = Instantiate(_obstacleAgentPrefab);
+
+                _activeObstacleAgent.PlaceAt(hit.position);
+            }
+
+            // Publicar evento para que NavigationPathController recalcule
+            EventBus.Instance?.Publish(new RouteDeviatedEvent
+            {
+                UserPosition      = cam.transform.position,
+                DeviationDistance = distanceFactor,
+                Destination       = GetCurrentDestination(),
+            });
+
+            string regionName = region.ToString().ToLower();
+            string ttsMsg = region == ObstacleRegion.Center
+                ? "Obstáculo al frente, buscando ruta alternativa"
+                : $"Obstáculo a la {(region == ObstacleRegion.Left ? "izquierda" : "derecha")}, rodeando";
+
+            VoiceCommandAPI.Instance?.SpeakArbitraryText(ttsMsg, priority: 2, interrupt: false);
+
+            Debug.Log($"[SegCtrl v12] 🚧 Obstáculo colocado: región={regionName} " +
+                      $"normX={normX:F2} normY={normY:F2} " +
+                      $"worldPos={hit.position:F2} dist={distanceFactor:F2}m");
+        }
+
+        /// <summary>
+        /// Obtiene el destino actual desde NavigationAgent si está navegando.
+        /// </summary>
+        private Vector3 GetCurrentDestination()
+        {
+            var agent = FindFirstObjectByType<NavigationAgent>(FindObjectsInactive.Include);
+            return agent != null ? agent.LastDestination : Vector3.zero;
+        }
+
+        // ═════════════════════════════════════════════════════════════════
+        //  Alertas
+        // ═════════════════════════════════════════════════════════════════
+
+        private void UpdateObstacleAlertState()
+        {
+            if (_worker.ObstacleRatio >= _obstacleAlertThreshold)
+            {
+                _obstacleConsecutiveCount++;
+            }
+            else
+            {
+                if (_obstacleConsecutiveCount > 0 && _logStats)
+                    Debug.Log($"[SegCtrl v12] ✅ Obstáculo despejado.");
+                _obstacleConsecutiveCount = 0;
+                _obstacleAlertActive      = false;
+
+                // Limpiar obstáculo virtual si el obstáculo desapareció
+                if (_activeObstacleAgent != null && _activeObstacleAgent.gameObject.activeSelf)
+                    _activeObstacleAgent.Remove();
+            }
+        }
+
+        private void EvaluateAlerts()
+        {
+            if (ObstacleRerouteMediator.IsActive) return;
+            if (_obstacleAlertActive) return;
+            if (_obstacleConsecutiveCount < _obstacleConfirmCount) return;
+            if (_worker.ObstacleRatio < _obstacleAlertThreshold) return;
+
+            bool  isHigh   = _worker.ObstacleRatio >= _obstacleHighThreshold;
+            float cooldown = isHigh ? _alertCooldownHigh : _alertCooldownNormal;
+            float elapsed  = Time.realtimeSinceStartup - _lastAlertTime;
+
+            if (elapsed < cooldown) return;
+
+            _lastAlertTime       = Time.realtimeSinceStartup;
+            _obstacleAlertActive = true;
+
+            string msg = isHigh
+                ? "Precaución, obstáculo muy cerca"
+                : "Obstáculo detectado al frente";
+
+            VoiceCommandAPI.Instance?.SpeakArbitraryText(msg, priority: 2, interrupt: false);
+            Debug.Log($"[SegCtrl v12] 🚧 Alerta: '{msg}' ratio={_worker.ObstacleRatio:P1}");
+        }
+
+        // ═════════════════════════════════════════════════════════════════
+        //  Captura CPU
         // ═════════════════════════════════════════════════════════════════
 
         private bool TryCaptureFromCpuImage()
         {
             if (_cameraManager == null) return false;
-
-            if (!_cameraManager.TryAcquireLatestCpuImage(out XRCpuImage cpuImage))
-                return false;
+            if (!_cameraManager.TryAcquireLatestCpuImage(out XRCpuImage cpuImage)) return false;
 
             using (cpuImage)
             {
                 int srcW = cpuImage.width;
                 int srcH = cpuImage.height;
-
                 float scale = (float)MODEL_SIZE / Mathf.Max(srcW, srcH);
                 int fitW = Mathf.Max(1, Mathf.RoundToInt(srcW * scale));
                 int fitH = Mathf.Max(1, Mathf.RoundToInt(srcH * scale));
@@ -375,8 +597,6 @@ namespace IndoorNavAR.Segmentation
                 {
                     if (_fitTex != null) Destroy(_fitTex);
                     _fitTex = new Texture2D(fitW, fitH, TextureFormat.RGB24, false);
-                    if (_logFrameCapture)
-                        Debug.Log($"[SegCtrl v11] 📐 Letterbox: {srcW}×{srcH} → {fitW}×{fitH} → {MODEL_SIZE}×{MODEL_SIZE}");
                 }
 
                 _fitTex.LoadRawTextureData(buffer);
@@ -393,18 +613,16 @@ namespace IndoorNavAR.Segmentation
                 GL.LoadPixelMatrix(0, MODEL_SIZE, MODEL_SIZE, 0);
                 Graphics.DrawTexture(new Rect(offX, offY, fitW, fitH), _fitTex);
                 GL.PopMatrix();
-
                 RenderTexture.active = _cameraRT;
                 _frameBufferFallback.ReadPixels(new Rect(0, 0, MODEL_SIZE, MODEL_SIZE), 0, 0);
                 _frameBufferFallback.Apply(false);
                 RenderTexture.active = prev;
             }
-
             return true;
         }
 
         // ═════════════════════════════════════════════════════════════════
-        //  Activación / desactivación de segmentación
+        //  Activación / desactivación
         // ═════════════════════════════════════════════════════════════════
 
         private void ActivateSegmentation()
@@ -413,39 +631,37 @@ namespace IndoorNavAR.Segmentation
 
             if (_worker == null || !_worker.IsReady)
             {
-                Debug.LogWarning("[SegCtrl v11] ⚠️ ActivateSegmentation: worker no listo. Intentando CPU...");
-                if (!_cpuFallbackActive && _modelAsset != null)
-                    ReinitializeWithCPU();
-
-                if (_worker == null || !_worker.IsReady)
-                {
-                    Debug.LogError("[SegCtrl v11] ❌ No se pudo activar: worker inválido.");
-                    return;
-                }
+                Debug.LogWarning("[SegCtrl v12] ⚠️ Worker no listo. Intentando CPU...");
+                if (!_cpuFallbackActive && _modelAsset != null) ReinitializeWithCPU();
+                if (_worker == null || !_worker.IsReady) { Debug.LogError("[SegCtrl v12] ❌ Worker inválido."); return; }
             }
 
-            _segmentationActive     = true;
-            _timeSinceLastInference = _inferenceInterval; // disparar inmediatamente en el primer tick
-            _inferenceScheduled     = false;
+            _segmentationActive          = true;
+            _timeSinceLastInference      = _inferenceInterval; // inferir en el próximo tick
+            _inferenceScheduled          = false;
+            _obstacleConsecutiveCount    = 0;
+            _obstacleAlertActive         = false;
 
-            // Mostrar overlay solo si debug está habilitado
+            // FIX OVERLAY B: activar overlay si corresponde
             if (_debugOverlayEnabled)
                 _overlayRenderer?.SetVisible(true);
 
             NotifyFlutterSegmentationState(true);
-            Debug.Log("[SegCtrl v11] ✅ Segmentación activada (timer mode).");
+            Debug.Log("[SegCtrl v12] ✅ Segmentación activada.");
         }
 
         private void DeactivateSegmentation()
         {
             if (!_segmentationActive) return;
 
-            _segmentationActive = false;
-            _inferenceScheduled = false;
+            _segmentationActive       = false;
+            _inferenceScheduled       = false;
+            _obstacleConsecutiveCount = 0;
+            _obstacleAlertActive      = false;
 
             _overlayRenderer?.SetVisible(false);
             NotifyFlutterSegmentationState(false);
-            Debug.Log("[SegCtrl v11] ⏸️ Segmentación desactivada.");
+            Debug.Log("[SegCtrl v12] ⏸️ Segmentación desactivada.");
         }
 
         // ═════════════════════════════════════════════════════════════════
@@ -455,11 +671,7 @@ namespace IndoorNavAR.Segmentation
         private void SubscribeToNavigationEvents()
         {
             var bus = EventBus.Instance;
-            if (bus == null)
-            {
-                Debug.LogWarning("[SegCtrl v11] ⚠️ EventBus no disponible.");
-                return;
-            }
+            if (bus == null) return;
             bus.Subscribe<NavigationStartedEvent>(OnNavigationStarted);
             bus.Subscribe<NavigationStoppedEvent>(OnNavigationStopped);
             bus.Subscribe<NavigationArrivedEvent>(OnNavigationArrived);
@@ -477,16 +689,9 @@ namespace IndoorNavAR.Segmentation
         private void OnNavigationStarted(NavigationStartedEvent evt)
         {
             if (!_onlyDuringNavigation) return;
-
-            if (!_initialized || _worker == null)
-            {
-                _pendingActivation = true;
-                Debug.LogWarning("[SegCtrl v11] ⚠️ NavigationStartedEvent antes de Init — encolando.");
-                return;
-            }
-
+            if (!_initialized || _worker == null) { _pendingActivation = true; return; }
             ActivateSegmentation();
-            Debug.Log("[SegCtrl v11] 🚀 Navegación iniciada → Segmentación ACTIVADA");
+            Debug.Log("[SegCtrl v12] 🚀 Navegación iniciada → Segmentación ACTIVADA");
         }
 
         private void OnNavigationStopped(NavigationStoppedEvent evt)
@@ -494,7 +699,6 @@ namespace IndoorNavAR.Segmentation
             if (!_onlyDuringNavigation) return;
             _pendingActivation = false;
             DeactivateSegmentation();
-            Debug.Log("[SegCtrl v11] 🛑 Navegación detenida → Segmentación DESACTIVADA");
         }
 
         private void OnNavigationArrived(NavigationArrivedEvent evt)
@@ -502,46 +706,18 @@ namespace IndoorNavAR.Segmentation
             if (!_onlyDuringNavigation) return;
             _pendingActivation = false;
             DeactivateSegmentation();
-            Debug.Log("[SegCtrl v11] 🎯 Llegada → Segmentación DESACTIVADA");
         }
 
         // ═════════════════════════════════════════════════════════════════
-        //  Alertas TTS
-        // ═════════════════════════════════════════════════════════════════
-
-        private void EvaluateAlerts()
-        {
-            if (ObstacleRerouteMediator.IsActive)
-            {
-                if (_logStats)
-                    Debug.Log("[SegCtrl v11] 🔇 Alertas suprimidas — ObstacleRerouteMediator activo.");
-                return;
-            }
-
-            if (Time.unscaledTime - _lastAlertTime < _alertCooldown) return;
-            if (_worker.ObstacleRatio < _obstacleAlertThreshold) return;
-
-            _lastAlertTime = Time.unscaledTime;
-            string msg = _worker.ObstacleRatio > 0.25f
-                ? "Precaución, obstáculo muy cerca"
-                : "Obstáculo detectado al frente";
-
-            VoiceCommandAPI.Instance?.SpeakArbitraryText(msg, priority: 2, interrupt: false);
-            Debug.Log($"[SegCtrl v11] 🚧 Alerta: {msg} ({_worker.ObstacleRatio:P1})");
-        }
-
-        // ═════════════════════════════════════════════════════════════════
-        //  Notificación a Flutter
+        //  Notificación Flutter
         // ═════════════════════════════════════════════════════════════════
 
         private void NotifyFlutterSegmentationState(bool active)
         {
             var api = VoiceCommandAPI.Instance;
             if (api == null) return;
-
             string json = $"{{\"action\":\"segmentation_active\",\"active\":{(active ? "true" : "false")}}}";
             api.ReplyPublic(json);
-            Debug.Log($"[SegCtrl v11] 📡 segmentation_active → Flutter: {active}");
         }
 
         // ═════════════════════════════════════════════════════════════════
@@ -552,22 +728,15 @@ namespace IndoorNavAR.Segmentation
         public void ReinitializeWithCPU()
         {
             if (_cpuFallbackActive) return;
-            Debug.LogWarning("[SegCtrl v11] 🔄 GPU timeout — reinicializando con CPU...");
-
+            Debug.LogWarning("[SegCtrl v12] 🔄 GPU timeout → CPU...");
             _worker?.Dispose();
             _worker = new ObstacleSegmentationWorker(
                 _modelAsset, BackendType.CPU, _tensorRotation, _flipInputY, _flipInputX);
-
-            if (!_worker.IsReady)
-            {
-                Debug.LogError("[SegCtrl v11] ❌ Fallback CPU falló.");
-                return;
-            }
-
+            if (!_worker.IsReady) { Debug.LogError("[SegCtrl v12] ❌ Fallback CPU falló."); return; }
             _worker.OnInferenceComplete += HandleInferenceComplete;
-            _inferenceScheduled          = false;
-            _cpuFallbackActive           = true;
-            Debug.Log("[SegCtrl v11] ✅ Fallback CPU activo.");
+            _inferenceScheduled  = false;
+            _cpuFallbackActive   = true;
+            Debug.Log("[SegCtrl v12] ✅ Fallback CPU activo.");
         }
 
         // ═════════════════════════════════════════════════════════════════
@@ -577,23 +746,20 @@ namespace IndoorNavAR.Segmentation
         private IEnumerator DiagnoseARSetup()
         {
             yield return new WaitForSeconds(5f);
-            Debug.Log($"[SegCtrl v11] 🔍 Diagnóstico: " +
+            Debug.Log($"[SegCtrl v12] 🔍 Diagnóstico: " +
                       $"initialized={_initialized} active={_segmentationActive} " +
-                      $"workerReady={_worker?.IsReady} cpuFallback={_cpuFallbackActive}");
+                      $"workerReady={_worker?.IsReady} onlyDuringNav={_onlyDuringNavigation}");
         }
 
         private void ForceCanvasExpand()
         {
-            var scaler = GetComponentInChildren<CanvasScaler>(true);
-            if (scaler == null)
-                scaler = GetComponentInParent<CanvasScaler>();
-
+            var scaler = GetComponentInChildren<CanvasScaler>(true)
+                      ?? GetComponentInParent<CanvasScaler>();
             if (scaler != null &&
                 scaler.uiScaleMode == CanvasScaler.ScaleMode.ScaleWithScreenSize &&
                 scaler.screenMatchMode != CanvasScaler.ScreenMatchMode.Expand)
             {
                 scaler.screenMatchMode = CanvasScaler.ScreenMatchMode.Expand;
-                Debug.Log("[SegCtrl v11] ✅ CanvasScaler → Expand.");
             }
         }
 
@@ -602,59 +768,55 @@ namespace IndoorNavAR.Segmentation
         // ═════════════════════════════════════════════════════════════════
 
         /// <summary>
-        /// Activa o desactiva el overlay de debug sin detener la inferencia.
-        /// En producción mantener false. En demo/presentación poner true.
+        /// FIX OVERLAY A: SetOverlayVisible ahora activa el overlay independientemente
+        /// del estado de navegación, permitiendo debug visual en cualquier momento.
         /// </summary>
         public void SetOverlayVisible(bool visible)
         {
             _debugOverlayEnabled = visible;
 
-            bool shouldShow = visible && (!_onlyDuringNavigation || _segmentationActive);
-            _overlayRenderer?.SetVisible(shouldShow);
+            if (visible)
+            {
+                // Activar overlay directamente — si la segmentación no está activa,
+                // forzar al menos una captura para tener datos
+                _overlayRenderer?.SetVisible(true);
 
-            Debug.Log($"[SegCtrl v11] 🎭 DebugOverlay → {(shouldShow ? "VISIBLE" : "OCULTO")} " +
-                      $"(requested={visible}, active={_segmentationActive})");
+                // Si la segmentación no está corriendo, activarla para debug
+                if (!_segmentationActive && !_onlyDuringNavigation)
+                    ActivateSegmentation();
+                else if (!_segmentationActive)
+                {
+                    // En modo _onlyDuringNavigation=true, activar solo el overlay
+                    // sin disparar la segmentación completa (producción)
+                    _overlayRenderer?.SetVisible(true);
+                    Debug.Log("[SegCtrl v12] 🎭 Overlay forzado visible (segmentación inactiva — solo visual).");
+                }
+            }
+            else
+            {
+                // Solo ocultar si la segmentación no lo necesita activo
+                bool shouldShow = _segmentationActive && _debugOverlayEnabled;
+                _overlayRenderer?.SetVisible(shouldShow);
+            }
+
+            Debug.Log($"[SegCtrl v12] 🎭 DebugOverlay → {visible} " +
+                      $"(segActive={_segmentationActive})");
         }
 
         public void SetROITopSkip(float ratio)
         {
             _roiTopSkip = Mathf.Clamp01(ratio);
-            Debug.Log($"[SegCtrl v11] ROI skip → {_roiTopSkip:P0}.");
         }
 
         // ═════════════════════════════════════════════════════════════════
-        //  ContextMenu — Debug
+        //  ContextMenu
         // ═════════════════════════════════════════════════════════════════
 
-        [ContextMenu("🐛 Activar Debug Overlay (demo)")]
-        private void DbgOverlayOn()
-        {
-            SetOverlayVisible(true);
-            Debug.Log("[SegCtrl v11] 🐛 DEBUG OVERLAY ON — modo presentación");
-        }
+        [ContextMenu("🐛 Activar Debug Overlay")]
+        private void DbgOverlayOn()  => SetOverlayVisible(true);
 
-        [ContextMenu("🚀 Desactivar Debug Overlay (producción)")]
-        private void DbgOverlayOff()
-        {
-            SetOverlayVisible(false);
-            Debug.Log("[SegCtrl v11] 🚀 DEBUG OVERLAY OFF — modo producción");
-        }
-
-        [ContextMenu("🔄 Rot 0°")]   private void DbgRot0()   => ApplyRotation(0);
-        [ContextMenu("🔄 Rot 90°")]  private void DbgRot90()  => ApplyRotation(90);
-        [ContextMenu("🔄 Rot 180°")] private void DbgRot180() => ApplyRotation(180);
-        [ContextMenu("🔄 Rot 270°")] private void DbgRot270() => ApplyRotation(270);
-        private void ApplyRotation(int deg) { _tensorRotation = deg; _worker?.SetRotation(deg); }
-
-        [ContextMenu("🔄 Flip Y ON")]
-        private void DbgFlipYOn()  { _flipInputY = true;  _worker?.SetFlipY(true);
-                                     _overlayRenderer?.SetFlipMode(SegmentationOverlayRenderer.FlipMode.None); }
-        [ContextMenu("🔄 Flip Y OFF")]
-        private void DbgFlipYOff() { _flipInputY = false; _worker?.SetFlipY(false); }
-        [ContextMenu("🔄 Flip X ON")]
-        private void DbgFlipXOn()  { _flipInputX = true;  _worker?.SetFlipX(true); }
-        [ContextMenu("🔄 Flip X OFF")]
-        private void DbgFlipXOff() { _flipInputX = false; _worker?.SetFlipX(false); }
+        [ContextMenu("🚀 Desactivar Debug Overlay")]
+        private void DbgOverlayOff() => SetOverlayVisible(false);
 
         [ContextMenu("Toggle Overlay")]
         private void DbgToggleOverlay() => SetOverlayVisible(!_debugOverlayEnabled);
@@ -665,32 +827,47 @@ namespace IndoorNavAR.Segmentation
         [ContextMenu("⏸️ Desactivar Segmentación")]
         private void DbgDeactivate() => DeactivateSegmentation();
 
+        [ContextMenu("🔄 Rot 90°")]  private void DbgRot90()  => ApplyRotation(90);
+        [ContextMenu("🔄 Rot 0°")]   private void DbgRot0()   => ApplyRotation(0);
+        [ContextMenu("🔄 Rot 180°")] private void DbgRot180() => ApplyRotation(180);
+        [ContextMenu("🔄 Rot 270°")] private void DbgRot270() => ApplyRotation(270);
+        private void ApplyRotation(int deg) { _tensorRotation = deg; _worker?.SetRotation(deg); }
+
+        [ContextMenu("🔄 Flip Y ON")]  private void DbgFlipYOn()  { _flipInputY = true;  _worker?.SetFlipY(true);  }
+        [ContextMenu("🔄 Flip Y OFF")] private void DbgFlipYOff() { _flipInputY = false; _worker?.SetFlipY(false); }
+        [ContextMenu("🔄 Flip X ON")]  private void DbgFlipXOn()  { _flipInputX = true;  _worker?.SetFlipX(true);  }
+        [ContextMenu("🔄 Flip X OFF")] private void DbgFlipXOff() { _flipInputX = false; _worker?.SetFlipX(false); }
+
+        [ContextMenu("🔄 Resetear alertas")]
+        private void DbgResetAlerts()
+        {
+            _obstacleConsecutiveCount = 0;
+            _obstacleAlertActive      = false;
+            _lastAlertTime            = -999f;
+        }
+
         [ContextMenu("📊 Log Stats")]
         private void DbgStats()
         {
-            Debug.Log($"[SegCtrl v11] " +
-                      $"Active={_segmentationActive} Initialized={_initialized} " +
-                      $"PendingActivation={_pendingActivation} " +
-                      $"DebugOverlay={_debugOverlayEnabled} " +
-                      $"InferenceScheduled={_inferenceScheduled} " +
-                      $"TimerAccum={_timeSinceLastInference:F1}s/{_inferenceInterval}s\n" +
-                      $"  Obstacle={_worker?.ObstacleRatio:P1} " +
+            Debug.Log($"[SegCtrl v12] Active={_segmentationActive} " +
+                      $"Obstacle={_worker?.ObstacleRatio:P1} " +
                       $"Floor={_worker?.FloorRatio:P1} Wall={_worker?.WallRatio:P1}\n" +
-                      $"  WorkerBusy={_worker?.IsBusy} WorkerReady={_worker?.IsReady} " +
-                      $"CPU={_cpuFallbackActive} PollTimeouts={_consecutivePollTimeouts}\n" +
-                      $"  MediatorActive={ObstacleRerouteMediator.IsActive}");
+                      $"  overlayVisible={_overlayRenderer?.IsVisible} " +
+                      $"debugEnabled={_debugOverlayEnabled}");
         }
 
         [ContextMenu("⏱️ Forzar inferencia ahora")]
         private void DbgForceInference()
         {
-            if (!_segmentationActive)
-            {
-                Debug.LogWarning("[SegCtrl v11] Segmentación inactiva — activa primero.");
-                return;
-            }
+            if (!_segmentationActive) { Debug.LogWarning("[SegCtrl v12] Activa primero."); return; }
             _timeSinceLastInference = _inferenceInterval;
-            Debug.Log("[SegCtrl v11] ⏱️ Timer forzado — inferencia en próximo Update().");
+        }
+
+        [ContextMenu("🔍 Analizar posición de obstáculo")]
+        private void DbgAnalyzeObstacle()
+        {
+            var region = AnalyzeObstaclePosition(out float nx, out float ny);
+            Debug.Log($"[SegCtrl v12] Región obstáculo: {region} normX={nx:F2} normY={ny:F2}");
         }
     }
 }

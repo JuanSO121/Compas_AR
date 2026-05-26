@@ -75,7 +75,7 @@ namespace IndoorNavAR.Core
         [Header("─── v14.4 FIX_VIO — Espera VIO antes de RecreateStairs ──")]
         [Tooltip("Tiempo máximo (s) esperando SessionTracking estable antes de RecreateStairGeometryAsync().\n" +
                  "Si el timeout se alcanza, se continúa con advertencia.\nDefault: 8s")]
-        [SerializeField] private float _vioStableTimeoutSec = 8f;
+        [SerializeField] private float _vioStableTimeoutSec = 15f;
 
         [Tooltip("Intervalo de polling (ms) para verificar SessionTracking en WaitForVIOStable.\nDefault: 300ms")]
         [SerializeField] private int _vioPollMs = 300;
@@ -621,54 +621,39 @@ namespace IndoorNavAR.Core
 
         private async Task RecreateStairGeometryAsync()
         {
-            var stairHelpers = FindObjectsByType<StairWithLandingHelper>(FindObjectsSortMode.None);
+            await Task.Yield();
 
-            if (stairHelpers.Length == 0)
+            var stairs = FindObjectsByType<StairWithLandingHelper>(
+                FindObjectsInactive.Include,
+                FindObjectsSortMode.None);
+
+            foreach (var stair in stairs)
             {
-                NavigationStartPointManager.ConfirmModelPositioned();
-                NavigationStartPointManager.NotifyNavMeshReadyAfterSessionRestore();
-                return;
-            }
+                if (stair == null)
+                    continue;
 
-            Log($"🪜 [v14.4] Recreando geometría de {stairHelpers.Length} escalera(s)...");
-
-            ARPerformanceManager.Instance?.BeginHeavyLoad($"RecreateStairs — {stairHelpers.Length} helper(s)");
-
-            for (int i = 0; i < _stairRecreateDelayFrames; i++)
-                await Task.Yield();
-
-            int recreated = 0, failed = 0;
-
-            foreach (var helper in stairHelpers)
-            {
-                if (helper == null) continue;
                 try
                 {
-                    helper.CreateStairSystem();
-                    recreated++;
+                    if (stair.HasValidGeometry())
+                    {
+                        Debug.Log(
+                            $"[PersistenceManager] ✅ '{stair.name}' ya válida.");
+                        continue;
+                    }
 
-                    await Task.Yield();
-                    await Task.Yield();
+                    stair.CreateStairSystem();
 
-                    if (_stairRecreateInterFrameMs > 0)
-                        await Task.Delay(_stairRecreateInterFrameMs);
+                    // opcional si hay muchas escaleras
+                    await Task.Yield();
                 }
                 catch (Exception ex)
                 {
-                    failed++;
-                    Debug.LogWarning($"[PersistenceManager] ⚠️ Error escalera '{helper.name}': {ex.Message}");
+                    Debug.LogWarning(
+                        $"[PersistenceManager] ⚠️ Error recreando '{stair.name}': {ex}");
                 }
             }
 
-            Log($"🪜 Escaleras: {recreated} recreadas, {failed} con error.");
-
-            if (recreated > 0)
-                await Task.Delay(_postStairsDelayMs);
-
-            ARPerformanceManager.Instance?.EndHeavyLoad("RecreateStairs completado");
-
-            NavigationStartPointManager.ConfirmModelPositioned();
-            NavigationStartPointManager.NotifyNavMeshReadyAfterSessionRestore();
+            await Task.Yield();
         }
 
         public void RemoveLoadedNavMesh()

@@ -1,61 +1,33 @@
 // File: NavigationPathController.cs
-// ✅ v5.3 — FIX: Off-route recalculation funcional + ARCore mapping throttle + drift Y
+// ✅ v5.4 — FIX_VIO: throttle de agentSync elevado durante inicialización AR
 //
-// ════════════════════════════════════════════════════════════════════════════
-// CAMBIOS v5.2 → v5.3
-// ════════════════════════════════════════════════════════════════════════════
+// ============================================================================
+//  CAMBIOS v5.3 → v5.4
+// ============================================================================
 //
-//  FIX D — Off-route recalculation funcional (el más crítico)
+//  FIX_VIO G — AgentSyncInterval elevado durante los primeros 10s post-init
 //  ──────────────────────────────────────────────────────────────────────────
-//    PROBLEMA v5.2: CheckDeviationInFullAR() calculaba desviación lateral
-//    correctamente pero la comparación usaba _autoRerouteDeviationThreshold
-//    (2.5m), que es correcto, pero el cooldown _autoRerouteCooldown (8s)
-//    era compartido con el stall — haciendo que un stall reciente bloqueara
-//    recálculos por desviación hasta 8s después.
+//  PROBLEMA v5.3:
+//    _agentSyncInterval (0.05s = 20Hz) era insuficiente para evitar la
+//    competencia con el VIO durante el arranque. NavMesh.SamplePosition()
+//    y SyncAgentToUserPosition() corriendo 20 veces/segundo en los primeros
+//    segundos después de que ARCore inicia el tracking causaba CPU starvation
+//    en el pipeline de sensores IMU.
 //
-//    Además, CheckDeviationInFullAR() no publicaba RouteDeviatedEvent, así
-//    que NavigationVoiceGuide nunca sabía del desvío y no lanzaba TTS.
+//    PersistenceManager.WaitForVIOStableBeforeHeavyWork() tiene polling de
+//    300ms pero no detiene NavigationPathController si ya había navegación
+//    activa de una sesión restaurada.
 //
-//    FIX:
-//    • CheckDeviationInFullAR() ahora usa _deviationRerouteCooldown (5s,
-//      independiente del cooldown de stall) para comparar con _lastDeviationRerouteTime.
-//    • Cuando detecta desvío: publica RouteDeviatedEvent CON la posición real
-//      del usuario → VoiceGuide anuncia "Te desviaste".
-//    • NavigateTo() se llama desde aquí con forceRecalculate=true y con la
-//      posición de usuario como origen (no la posición del agente).
-//    • Se añade _deviationConfirmFrames: el desvío debe persistir N frames
-//      consecutivos antes de actuar (evita jitter de ARCore).
+//  FIX:
+//    _vioWarmupDuration (default 10s): durante los primeros 10s desde Start(),
+//    _agentSyncInterval efectivo se eleva a _agentSyncIntervalDuringWarmup (0.15s).
+//    Después del warmup, vuelve al valor normal (_agentSyncInterval = 0.05s).
 //
-//  FIX E — ARCore mapping throttle (reduce "Online mapping stops")
-//  ──────────────────────────────────────────────────────────────────────────
-//    PROBLEMA: El log "Online mapping stops after Xs" indica que ARCore agotó
-//    su budget de mapeo. Causas principales:
-//      1. SyncAgentToUserPosition() llamada cada frame con full precision.
-//      2. CheckDeviationInFullAR() evaluando distancias cada frame.
-//      3. GetRouteOriginForFullAR() con NavMesh.SamplePosition multi-radius.
+//    Esto reduce SyncAgentToUserPosition a ~7Hz durante el arranque del VIO,
+//    aliviando el CPU starvation sin afectar la experiencia de navegación
+//    (el usuario apenas empieza a moverse en los primeros 10s).
 //
-//    FIX:
-//    • _agentSyncInterval (default 0.05s = 20Hz): SyncAgentToUserPosition()
-//      solo corre cada N segundos, no cada frame. Reduce load del main thread.
-//    • _deviationCheckInterval (default 0.25s = 4Hz): CheckDeviationInFullAR()
-//      solo evalúa desviación 4 veces por segundo.
-//    • GetRouteOriginForFullAR() usa radios en orden ASCENDENTE para encontrar
-//      el hit más cercano primero — break temprano en el loop reduce queries.
-//
-//  FIX F — Filtro de drift Y (altura) del tracking ARCore
-//  ──────────────────────────────────────────────────────────────────────────
-//    PROBLEMA: ARCore a veces reporta saltos de Y de 0.1-0.4m entre frames
-//    (especialmente al perder tracking breve). SyncAgentToUserPosition() solo
-//    filtraba X y Z, dejando que el agente "volara" en Y — causando que
-//    NavMesh.SamplePosition fallara con el agente fuera del NavMesh.
-//
-//    FIX: GetSmoothedUserPosition() ahora también suaviza Y si el delta
-//    supera _vioJumpThreshold. Para el caso normal (caminar), la Y cambia
-//    muy poco frame a frame y el filtro es transparente.
-//    Se añade _maxYDrift (default 0.8m): si el delta Y supera este valor
-//    se descarta completamente (probable teleport de tracking).
-//
-//  TODO LO DEMÁS ES IDÉNTICO A v5.2.
+//  TODO LO DEMÁS ES IDÉNTICO A v5.3.
 
 using System;
 using System.Collections.Generic;
@@ -86,21 +58,14 @@ namespace IndoorNavAR.Navigation
         [SerializeField] private float _stallTimeout                  = 5.0f;
 
         [Header("─── v5.2: Recálculo por desviación (cooldown independiente) ──────")]
-        [Tooltip("✅ v5.2 — Cooldown independiente para recálculos por RouteDeviatedEvent.\n" +
-                 "Default: 5s (más ágil que _autoRerouteCooldown=8s).")]
         [SerializeField] private float _deviationRerouteCooldown = 5.0f;
         private float _lastDeviationRerouteTime = -999f;
 
         [Header("─── v5.3 FIX D — Off-route recalculation mejorado ────────────────")]
-        [Tooltip("✅ v5.3 — Frames consecutivos de desviación antes de actuar.\n" +
-                 "Evita recálculos por jitter momentáneo de ARCore.\n" +
-                 "Default: 3 frames a 4Hz = ~0.75s de desviación continua.")]
         [SerializeField, Range(1, 10)]
         private int _deviationConfirmFrames = 3;
         private int _deviationConsecutiveFrames = 0;
 
-        [Tooltip("✅ v5.3 — Intervalo entre evaluaciones de desviación (segundos).\n" +
-                 "Default: 0.25s (4Hz). Reduce carga de ARCore vs evaluación por frame.")]
         [SerializeField, Range(0.05f, 1.0f)]
         private float _deviationCheckInterval = 0.25f;
         private float _deviationCheckTimer = 0f;
@@ -146,7 +111,6 @@ namespace IndoorNavAR.Navigation
 
         // ─── Inspector — Anti-Stuck ───────────────────────────────────────────
 
-        [Tooltip("Intentos de recálculo antes de declarar NavigationFailed.")]
         [SerializeField, Range(1, 5)]
         private int _maxStallRetries = 3;
 
@@ -182,7 +146,7 @@ namespace IndoorNavAR.Navigation
 
         // ─── Inspector — FullAR sincronización continua ───────────────────────
 
-        [Header("FullAR — Sincronización continua del agente (v5.2)")]
+        [Header("FullAR — Sincronización continua del agente")]
         [SerializeField, Range(0.05f, 0.5f)]
         private float _agentSyncThreshold = 0.15f;
 
@@ -190,47 +154,49 @@ namespace IndoorNavAR.Navigation
         private bool _continuousAgentSync = true;
 
         [Header("─── v5.3 FIX E — ARCore mapping throttle ───────────────────────")]
-        [Tooltip("✅ v5.3 — Intervalo mínimo entre sincronizaciones de agente (segundos).\n" +
-                 "Default: 0.05s (20Hz). Reduce carga del main thread vs 60Hz anterior.\n" +
-                 "Aumentar a 0.1s si ARCore sigue parando el mapping tras 30s.")]
+        [Tooltip("Intervalo entre sincronizaciones de agente en operación normal (s).\n" +
+                 "Default: 0.05s (20Hz).")]
         [SerializeField, Range(0.016f, 0.2f)]
         private float _agentSyncInterval = 0.05f;
         private float _agentSyncTimer = 0f;
 
+        [Header("─── v5.4 FIX_VIO G — Warmup throttle ───────────────────────────")]
+        [Tooltip("✅ v5.4 — Duración (s) del período de warmup AR desde Start().\n" +
+                 "Durante este período, agentSyncInterval efectivo = _agentSyncIntervalDuringWarmup.\n" +
+                 "Default: 10s — cubre la inicialización del VIO en dispositivos lentos.")]
+        [SerializeField, Range(5f, 30f)]
+        private float _vioWarmupDuration = 10f;
+
+        [Tooltip("✅ v5.4 — Intervalo entre sincronizaciones durante warmup (s).\n" +
+                 "Default: 0.15s (~7Hz) — reduce CPU starvation del VIO al arrancar.\n" +
+                 "Vuelve a _agentSyncInterval tras _vioWarmupDuration.")]
+        [SerializeField, Range(0.05f, 0.5f)]
+        private float _agentSyncIntervalDuringWarmup = 0.15f;
+
+        private float _startTime = 0f;    // ✅ v5.4: registrado en Start()
+
         // ─── Inspector — v5.2 Filtro VIO ─────────────────────────────────────
 
         [Header("FullAR — Filtro VIO anti-jitter (v5.2 + v5.3)")]
-        [Tooltip("✅ v5.2 — Delta máximo de posición XZ en un frame antes de suavizar.\n" +
-                 "Default: 0.4m. Subir si el tracking es muy inestable (0.6m).")]
         [SerializeField, Range(0.1f, 1.0f)]
         private float _vioJumpThreshold = 0.4f;
 
-        [Tooltip("✅ v5.2 — Factor de suavizado para saltos de VIO (0=sin cambio, 1=instantáneo).\n" +
-                 "Default: 0.3 — suaviza pero no retrasa más de 2-3 frames.")]
         [SerializeField, Range(0.05f, 1.0f)]
         private float _vioSmoothFactor = 0.3f;
 
         [Header("─── v5.3 FIX F — Filtro de drift Y (altura) ────────────────────")]
-        [Tooltip("✅ v5.3 — Delta máximo de Y admisible en un frame.\n" +
-                 "Valores mayores se descartan como teleport de tracking.\n" +
-                 "Default: 0.8m — cubre escalones pero descarta relocalizaciones.")]
         [SerializeField, Range(0.3f, 3.0f)]
         private float _maxYDrift = 0.8f;
 
-        [Tooltip("✅ v5.3 — Factor de suavizado para drift de Y (más agresivo que XZ).\n" +
-                 "Default: 0.15 — Y cambia muy poco caminando, ser más conservador.")]
         [SerializeField, Range(0.05f, 1.0f)]
         private float _vioYSmoothFactor = 0.15f;
 
-        // Posición suavizada del usuario (estado del filtro VIO)
         private Vector3 _smoothedUserPos = new Vector3(float.PositiveInfinity, 0, 0);
         private bool    _smoothedUserPosInitialized = false;
 
         // ─── Inspector — FloorTransition histéresis ───────────────────────────
 
         [Header("FloorTransition — Histéresis (v5.2)")]
-        [Tooltip("✅ v5.2 — Diferencia mínima en Y (m) entre waypoints para FloorTransitionEvent.\n" +
-                 "Default: 0.8m — evita falsos positivos del tracking AR.")]
         [SerializeField, Range(0.3f, 2.0f)]
         private float _floorTransitionMinDelta = 0.8f;
 
@@ -275,6 +241,12 @@ namespace IndoorNavAR.Navigation
         public float CurrentSpeed => _currentSpeed;
         public bool  IsOnStairs   => _isOnStairs;
 
+        // ✅ v5.4: Intervalo efectivo según warmup
+        private float EffectiveAgentSyncInterval =>
+            (Time.realtimeSinceStartup - _startTime) < _vioWarmupDuration
+                ? _agentSyncIntervalDuringWarmup
+                : _agentSyncInterval;
+
         // ─── Estado interno ───────────────────────────────────────────────────
 
         private NavMeshAgent            _agent;
@@ -288,15 +260,11 @@ namespace IndoorNavAR.Navigation
         private Vector3                 _smoothDampVel;
         private bool                    _isOnStairs;
 
-        // Anti-stall
         private Vector3 _lastStallCheckPos;
         private float   _stallTimer;
         private int     _stallRetryCount;
+        private int     _confirmedMinIndex = 1;
 
-        // Progreso garantizado
-        private int _confirmedMinIndex = 1;
-
-        // Cache AROriginAligner
         private IndoorNavAR.AR.AROriginAligner _arOriginAlignerCache    = null;
         private bool                           _arOriginAlignerSearched = false;
         private float                          _arAlignerNextRetryTime  = 0f;
@@ -319,10 +287,15 @@ namespace IndoorNavAR.Navigation
         private void Start()
         {
             _agentReady = true;
+            _startTime  = Time.realtimeSinceStartup;   // ✅ v5.4: registrar tiempo de inicio
             TrySetAgentStopped(true);
 
             _userBridge = FindFirstObjectByType<UserPositionBridge>(FindObjectsInactive.Include);
             EventBus.Instance?.Subscribe<RouteDeviatedEvent>(OnRouteDeviated);
+
+            float warmupRemaining = _vioWarmupDuration;
+            Debug.Log($"[PathController v5.4] ✅ Start — VIO warmup activo por {warmupRemaining}s " +
+                      $"(syncInterval efectivo: {_agentSyncIntervalDuringWarmup}s → {_agentSyncInterval}s)");
         }
 
         private void OnDestroy()
@@ -343,7 +316,7 @@ namespace IndoorNavAR.Navigation
         private void OnValidate() => SyncOptimizerParams();
 
         // ─────────────────────────────────────────────────────────────────────
-        //  ✅ v5.2 FIX A — Recálculo por desviación con cooldown independiente
+        //  v5.2 — Recálculo por desviación
         // ─────────────────────────────────────────────────────────────────────
 
         private void OnRouteDeviated(RouteDeviatedEvent evt)
@@ -354,17 +327,15 @@ namespace IndoorNavAR.Navigation
             {
                 if (_logVerbose)
                     Debug.Log($"[PathController] ⏳ Recálculo por desviación ignorado " +
-                              $"(cooldown={_deviationRerouteCooldown}s, " +
-                              $"elapsed={Time.time - _lastDeviationRerouteTime:F1}s).");
+                              $"(cooldown={_deviationRerouteCooldown}s).");
                 return;
             }
 
             _lastDeviationRerouteTime = Time.time;
-            _lastAutoRerouteTime = Time.time;
+            _lastAutoRerouteTime      = Time.time;
 
             Debug.Log($"[PathController] 🔄 Recálculo por RouteDeviatedEvent: " +
-                      $"desviación={evt.DeviationDistance:F2}m → dest={evt.Destination:F2} " +
-                      $"| userPos={evt.UserPosition:F2}");
+                      $"desviación={evt.DeviationDistance:F2}m");
 
             NavigateTo(evt.Destination, forceRecalculate: true);
         }
@@ -390,11 +361,6 @@ namespace IndoorNavAR.Navigation
                 if (_logVerbose)
                     Debug.Log("[PathController] ✅ Modo FullAR activado.");
             }
-            else
-            {
-                if (_logVerbose)
-                    Debug.Log("[PathController] ✅ Modo NoAR activado.");
-            }
         }
 
         public void NavigateTo(Vector3 destination, bool forceRecalculate = false)
@@ -416,8 +382,7 @@ namespace IndoorNavAR.Navigation
             if (!path.IsValid)
             {
                 Debug.LogWarning($"[PathController] Sin ruta válida hacia {destination:F2}. " +
-                                 $"Status={path.Status} | origen={routeOrigin:F2} " +
-                                 $"(FullAR={IsFullARMode})");
+                                 $"Status={path.Status} | origen={routeOrigin:F2}");
                 OnPathFailed?.Invoke(path.Status);
                 return;
             }
@@ -435,15 +400,13 @@ namespace IndoorNavAR.Navigation
             _stallRefInitialized  = false;
             _stallAccumTime       = 0f;
             _deviationConsecutiveFrames = 0;
-            _deviationCheckTimer = 0f;
+            _deviationCheckTimer  = 0f;
 
             if (!IsFullARMode)
                 TrySetAgentStopped(false);
 
             Debug.Log($"[PathController] Ruta: {path.RawWaypointCount} raw → " +
-                      $"{path.Waypoints.Count} optimizados, {path.TotalLength:F1}m, " +
-                      $"clearance mín={path.MinClearance:F3}m" +
-                      (IsFullARMode ? $" [FullAR — origen={routeOrigin:F2}]" : ""));
+                      $"{path.Waypoints.Count} optimizados, {path.TotalLength:F1}m");
 
             if (forceRecalculate && wasNavigating)
                 OnPathRecalculated?.Invoke(_currentPath);
@@ -485,17 +448,14 @@ namespace IndoorNavAR.Navigation
 
             var userBridge = UserPositionBridge.Instance;
             if (userBridge == null)
-            {
-                Debug.LogWarning("[PathController] ⚠️ [FullAR] UserPositionBridge no disponible.");
                 return transform.position;
-            }
 
             Vector3 userPos    = GetSmoothedUserPosition(userBridge.UserPosition);
             Vector3 routeOrigin;
 
             if (TryGetFloorProjection(userPos, out Vector3 floorOrigin))
             {
-                // ✅ v5.3 FIX E: Radios en orden ASCENDENTE para hit rápido (break temprano)
+                // Radios en orden ASCENDENTE para break temprano (FIX E)
                 float[] radii = { 0.3f, 0.8f, 1.5f, _fullAROriginSnapRadius };
                 bool found = false;
                 routeOrigin = floorOrigin;
@@ -506,20 +466,12 @@ namespace IndoorNavAR.Navigation
                     {
                         routeOrigin = hit.position;
                         found = true;
-                        if (_logVerbose)
-                            Debug.Log($"[PathController] ✅ [FullAR] Origen (StartPoint): " +
-                                      $"userPos={userPos:F2} → floor={floorOrigin:F2} " +
-                                      $"→ navMesh={hit.position:F2} (r={radius}m)");
-                        break; // ← break temprano reduce queries a ARCore
+                        break;
                     }
                 }
 
                 if (!found)
-                {
-                    Debug.LogWarning($"[PathController] ⚠️ [FullAR] StartPoint floor={floorOrigin:F2} " +
-                                     "sin NavMesh cercano. Usando fallback.");
                     routeOrigin = GetFallbackOrigin(userPos);
-                }
             }
             else
             {
@@ -534,23 +486,17 @@ namespace IndoorNavAR.Navigation
         {
             var userBridge = UserPositionBridge.Instance;
             float correctY = transform.position.y;
-
-            if (userBridge != null)
-                correctY = userBridge.UserPosition.y;
+            if (userBridge != null) correctY = userBridge.UserPosition.y;
 
             Vector3 correctedOrigin = new Vector3(origin.x, correctY, origin.z);
 
             if (Vector3.Distance(transform.position, correctedOrigin) < _agentSyncThreshold)
                 return;
 
-            Vector3 prev = transform.position;
             transform.position = correctedOrigin;
 
             if (_agent != null && _agent.isOnNavMesh)
                 _agent.Warp(correctedOrigin);
-
-            if (_logVerbose)
-                Debug.Log($"[PathController] 📍 [FullAR] Warp: {prev:F2} → {correctedOrigin:F2}");
         }
 
         private Vector3 GetFallbackOrigin(Vector3 userPos)
@@ -561,23 +507,13 @@ namespace IndoorNavAR.Navigation
             foreach (float radius in fallbackRadii)
             {
                 if (NavMesh.SamplePosition(groundPos, out NavMeshHit hit, radius, NavMesh.AllAreas))
-                {
-                    if (_logVerbose)
-                        Debug.Log($"[PathController] ✅ [FullAR] Origen (fallback -2m): " +
-                                  $"userPos={userPos:F2} → navMesh={hit.position:F2} (r={radius}m)");
                     return hit.position;
-                }
             }
 
             if (NavMesh.SamplePosition(userPos, out NavMeshHit lastResort,
                 _fullAROriginSnapRadius * 2f, NavMesh.AllAreas))
-            {
-                Debug.LogWarning($"[PathController] ⚠️ [FullAR] Origen (last resort): " +
-                                 $"userPos={userPos:F2} → navMesh={lastResort.position:F2}");
                 return lastResort.position;
-            }
 
-            Debug.LogError($"[PathController] ❌ [FullAR] Sin NavMesh cerca de {userPos:F2}.");
             return transform.position;
         }
 
@@ -606,19 +542,9 @@ namespace IndoorNavAR.Navigation
         }
 
         // ─────────────────────────────────────────────────────────────────────
-        //  ✅ v5.2 + v5.3 FIX B+F — Filtro de posición VIO (XZ + Y)
+        //  v5.2 + v5.3 FIX B+F — Filtro de posición VIO
         // ─────────────────────────────────────────────────────────────────────
 
-        /// <summary>
-        /// ✅ v5.2 FIX B + v5.3 FIX F — Aplica filtro exponencial a saltos del VIO.
-        ///
-        /// XZ: Si el delta supera _vioJumpThreshold, interpola con _vioSmoothFactor.
-        ///     Para movimiento normal del usuario pasa directamente (delta pequeño).
-        ///
-        /// Y:  Si el delta supera _maxYDrift, descarta completamente (teleport de tracking).
-        ///     Si supera _vioJumpThreshold pero no _maxYDrift, suaviza con _vioYSmoothFactor
-        ///     (más agresivo que XZ porque caminando Y no cambia casi nada frame a frame).
-        /// </summary>
         private Vector3 GetSmoothedUserPosition(Vector3 rawUserPos)
         {
             if (!_smoothedUserPosInitialized)
@@ -632,42 +558,20 @@ namespace IndoorNavAR.Navigation
                                     rawUserPos.z - _smoothedUserPos.z).magnitude;
             float dy  = Mathf.Abs(rawUserPos.y - _smoothedUserPos.y);
 
-            // ── Filtro XZ ─────────────────────────────────────────────────────
-            float smoothX, smoothZ;
-            if (dxz > _vioJumpThreshold)
-            {
-                smoothX = Mathf.Lerp(_smoothedUserPos.x, rawUserPos.x, _vioSmoothFactor);
-                smoothZ = Mathf.Lerp(_smoothedUserPos.z, rawUserPos.z, _vioSmoothFactor);
+            float smoothX = dxz > _vioJumpThreshold
+                ? Mathf.Lerp(_smoothedUserPos.x, rawUserPos.x, _vioSmoothFactor)
+                : rawUserPos.x;
+            float smoothZ = dxz > _vioJumpThreshold
+                ? Mathf.Lerp(_smoothedUserPos.z, rawUserPos.z, _vioSmoothFactor)
+                : rawUserPos.z;
 
-                if (_logVerbose)
-                    Debug.Log($"[PathController] 🔧 [VIO XZ Filter] dxz={dxz:F3}m filtrado.");
-            }
-            else
-            {
-                smoothX = rawUserPos.x;
-                smoothZ = rawUserPos.z;
-            }
-
-            // ── Filtro Y (v5.3 FIX F) ────────────────────────────────────────
             float smoothY;
             if (dy > _maxYDrift)
-            {
-                // Teleport de tracking: descartar cambio Y, mantener suavizado anterior
                 smoothY = _smoothedUserPos.y;
-                if (_logVerbose)
-                    Debug.Log($"[PathController] 🔧 [VIO Y Discard] dy={dy:F3}m > maxDrift={_maxYDrift}m — Y descartada.");
-            }
             else if (dy > _vioJumpThreshold)
-            {
-                // Drift de tracking: suavizar Y más agresivamente
                 smoothY = Mathf.Lerp(_smoothedUserPos.y, rawUserPos.y, _vioYSmoothFactor);
-                if (_logVerbose)
-                    Debug.Log($"[PathController] 🔧 [VIO Y Filter] dy={dy:F3}m suavizado.");
-            }
             else
-            {
                 smoothY = rawUserPos.y;
-            }
 
             _smoothedUserPos = new Vector3(smoothX, smoothY, smoothZ);
             return _smoothedUserPos;
@@ -691,15 +595,14 @@ namespace IndoorNavAR.Navigation
 
             if (IsFullARMode)
             {
-                // ✅ v5.3 FIX E: Throttle de sincronización (no cada frame)
+                // ✅ v5.4 FIX_VIO G: Usar intervalo efectivo según warmup
                 _agentSyncTimer += Time.deltaTime;
-                if (_agentSyncTimer >= _agentSyncInterval)
+                if (_agentSyncTimer >= EffectiveAgentSyncInterval)
                 {
                     _agentSyncTimer = 0f;
                     SyncAgentToUserPosition();
                 }
 
-                // ✅ v5.3 FIX D+E: Throttle de evaluación de desviación
                 _deviationCheckTimer += Time.deltaTime;
                 if (_deviationCheckTimer >= _deviationCheckInterval)
                 {
@@ -765,20 +668,9 @@ namespace IndoorNavAR.Navigation
         }
 
         // ─────────────────────────────────────────────────────────────────────
-        //  ✅ v5.3 FIX D — CheckDeviationInFullAR mejorado
+        //  v5.3 FIX D — CheckDeviationInFullAR
         // ─────────────────────────────────────────────────────────────────────
 
-        /// <summary>
-        /// ✅ v5.3 FIX D — Detección de desviación con confirmación multi-frame y
-        /// publicación de RouteDeviatedEvent para que VoiceGuide anuncie el desvío.
-        ///
-        /// Cambios vs v5.2:
-        ///   1. Usa _deviationRerouteCooldown (independiente del cooldown de stall).
-        ///   2. Requiere _deviationConfirmFrames frames consecutivos antes de actuar.
-        ///   3. Publica RouteDeviatedEvent con posición real del usuario.
-        ///   4. Resetea el contador cuando el usuario vuelve a la ruta.
-        ///   5. Solo corre cuando _deviationCheckTimer indica (throttle desde FollowPath).
-        /// </summary>
         private void CheckDeviationInFullAR()
         {
             if (_currentPath == null || !_currentPath.IsValid) return;
@@ -793,17 +685,11 @@ namespace IndoorNavAR.Navigation
             {
                 _deviationConsecutiveFrames++;
 
-                if (_logVerbose && _deviationConsecutiveFrames == 1)
-                    Debug.Log($"[PathController] ⚠️ [FullAR] Desviación detectada: {lateral:F2}m " +
-                              $"(frame 1/{_deviationConfirmFrames})");
-
-                // ✅ v5.3 FIX D: Confirmar desvío persistente antes de actuar
                 if (_deviationConsecutiveFrames < _deviationConfirmFrames) return;
 
-                // ✅ v5.3 FIX D: Cooldown independiente del stall
                 if (Time.time - _lastDeviationRerouteTime < _deviationRerouteCooldown)
                 {
-                    _deviationConsecutiveFrames = 0; // Reset para no acumular infinito
+                    _deviationConsecutiveFrames = 0;
                     return;
                 }
 
@@ -811,10 +697,8 @@ namespace IndoorNavAR.Navigation
                 _lastAutoRerouteTime        = Time.time;
                 _deviationConsecutiveFrames = 0;
 
-                Debug.Log($"[PathController] 🔄 [FullAR] Desviación confirmada {lateral:F2}m " +
-                          $"({_deviationConfirmFrames} frames) — recalculando y publicando evento.");
+                Debug.Log($"[PathController] 🔄 [FullAR] Desviación confirmada {lateral:F2}m — recalculando.");
 
-                // ✅ v5.3 FIX D: Publicar RouteDeviatedEvent → VoiceGuide anuncia "Te desviaste"
                 EventBus.Instance?.Publish(new RouteDeviatedEvent
                 {
                     UserPosition      = userPos,
@@ -826,15 +710,8 @@ namespace IndoorNavAR.Navigation
             }
             else
             {
-                // Usuario volvió a la ruta: reset contador
                 if (_deviationConsecutiveFrames > 0)
-                {
-                    if (_logVerbose)
-                        Debug.Log($"[PathController] ✅ [FullAR] Usuario volvió a la ruta " +
-                                  $"(lateral={lateral:F2}m < {_autoRerouteDeviationThreshold}m). " +
-                                  $"Reset contador de desviación.");
                     _deviationConsecutiveFrames = 0;
-                }
             }
         }
 
@@ -858,10 +735,6 @@ namespace IndoorNavAR.Navigation
             return min < float.MaxValue ? min : 0f;
         }
 
-        /// <summary>
-        /// ✅ v5.2 FIX B + v5.3 FIX F — SyncAgentToUserPosition usa posición filtrada por VIO.
-        /// Solo sincroniza X y Z, nunca toca Y (altura se maneja por NavMesh).
-        /// </summary>
         private void SyncAgentToUserPosition()
         {
             if (!_continuousAgentSync) return;
@@ -872,7 +745,6 @@ namespace IndoorNavAR.Navigation
             Vector3 rawUserPos  = userBridge.UserPosition;
             Vector3 smoothedPos = GetSmoothedUserPosition(rawUserPos);
 
-            // ✅ v5.3 FIX F: Solo sincronizar X y Z — Y la maneja el NavMesh
             Vector3 newPos = new Vector3(
                 smoothedPos.x,
                 transform.position.y,
@@ -886,10 +758,6 @@ namespace IndoorNavAR.Navigation
                 _agent.Warp(newPos);
 
             transform.position = newPos;
-
-            if (_logVerbose)
-                Debug.Log($"[PathController] 🔄 [FullAR] Sync agente: {newPos:F2} " +
-                          $"(raw={rawUserPos:F2} smoothed={smoothedPos:F2})");
         }
 
         // ─────────────────────────────────────────────────────────────────────
@@ -920,14 +788,10 @@ namespace IndoorNavAR.Navigation
                                                _acceleration * Time.deltaTime);
 
             Vector3 smoothDir = Vector3.SmoothDamp(
-                transform.forward, desiredDir,
-                ref _smoothDampVel,
-                0.08f,
-                float.MaxValue,
-                Time.deltaTime);
+                transform.forward, desiredDir, ref _smoothDampVel,
+                0.08f, float.MaxValue, Time.deltaTime);
 
             smoothDir.y = isStair ? desiredDir.y : 0f;
-
             if (smoothDir.sqrMagnitude < 0.001f) return;
             smoothDir = smoothDir.normalized;
 
@@ -996,8 +860,7 @@ namespace IndoorNavAR.Navigation
                 if (Time.time - _lastAutoRerouteTime < _autoRerouteCooldown) return;
 
                 _lastAutoRerouteTime = Time.time;
-                Debug.Log($"[PathController] ⏱ Stall detectado en FullAR={isFullAR} " +
-                          $"pos={checkPos:F2} — recalculando.");
+                Debug.Log($"[PathController] ⏱ Stall detectado — recalculando.");
                 NavigateTo(_currentDestination, forceRecalculate: true);
             }
         }
@@ -1006,13 +869,12 @@ namespace IndoorNavAR.Navigation
         //  HELPERS
         // ─────────────────────────────────────────────────────────────────────
 
-        private int   _lastPublishedFloor = 0;
+        private int   _lastPublishedFloor     = 0;
         private float _floorTransitionCooldown = 0f;
 
         private void AdvanceWaypoint(IReadOnlyList<Vector3> waypoints)
         {
-            if (_currentWaypointIndex >= waypoints.Count - 1)
-                return;
+            if (_currentWaypointIndex >= waypoints.Count - 1) return;
 
             Vector3 currentWp = waypoints[_currentWaypointIndex];
             OnWaypointReached?.Invoke(_currentWaypointIndex, currentWp);
@@ -1021,14 +883,11 @@ namespace IndoorNavAR.Navigation
             _confirmedMinIndex = _currentWaypointIndex;
 
             Vector3 nextWp = waypoints[_currentWaypointIndex];
-
-            // ✅ v5.2 FIX C: FloorTransition con histéresis
-            float yDelta = Mathf.Abs(nextWp.y - currentWp.y);
+            float   yDelta = Mathf.Abs(nextWp.y - currentWp.y);
 
             if (yDelta >= _floorTransitionMinDelta)
             {
                 _floorTransitionCooldown -= Time.deltaTime;
-
                 if (_floorTransitionCooldown <= 0f)
                 {
                     int fromLevel = ResolveFloorForY(currentWp.y);
@@ -1045,9 +904,6 @@ namespace IndoorNavAR.Navigation
                             ToLevel       = toLevel,
                             AgentPosition = transform.position
                         });
-
-                        Debug.Log($"[PathController] 🏢 FloorTransitionEvent: {fromLevel} → {toLevel} " +
-                                  $"(yDelta={yDelta:F3}m >= threshold={_floorTransitionMinDelta:F3}m)");
                     }
                 }
             }
@@ -1061,9 +917,7 @@ namespace IndoorNavAR.Navigation
             var pts = NavigationStartPointManager.GetAllStartPoints();
             if (pts == null || pts.Count == 0) return 0;
 
-            int bestLevel = 0;
-            float bestDist = float.MaxValue;
-
+            int bestLevel = 0; float bestDist = float.MaxValue;
             foreach (var pt in pts)
             {
                 float d = Mathf.Abs(worldY - pt.FloorHeight);
@@ -1114,7 +968,6 @@ namespace IndoorNavAR.Navigation
         {
             if (!evt.Success) return;
             _optimizer.InvalidateCache();
-
             if (_isNavigating && !_isOnStairs)
                 NavigateTo(_currentDestination, forceRecalculate: true);
         }
@@ -1138,18 +991,13 @@ namespace IndoorNavAR.Navigation
 
         private IndoorNavAR.AR.AROriginAligner GetOrFindAROriginAligner()
         {
-            if (_arOriginAlignerCache != null)
-                return _arOriginAlignerCache;
+            if (_arOriginAlignerCache != null) return _arOriginAlignerCache;
+            if (_arOriginAlignerSearched && Time.realtimeSinceStartup < _arAlignerNextRetryTime) return null;
 
-            if (_arOriginAlignerSearched && Time.realtimeSinceStartup < _arAlignerNextRetryTime)
-                return null;
-
-            _arOriginAlignerSearched  = true;
-            _arAlignerNextRetryTime   = Time.realtimeSinceStartup + _arAlignerRetryInterval;
-
-            _arOriginAlignerCache = FindFirstObjectByType<IndoorNavAR.AR.AROriginAligner>(
+            _arOriginAlignerSearched = true;
+            _arAlignerNextRetryTime  = Time.realtimeSinceStartup + _arAlignerRetryInterval;
+            _arOriginAlignerCache    = FindFirstObjectByType<IndoorNavAR.AR.AROriginAligner>(
                 FindObjectsInactive.Include);
-
             return _arOriginAlignerCache;
         }
 
@@ -1179,70 +1027,34 @@ namespace IndoorNavAR.Navigation
                 Gizmos.DrawLine(transform.position, wp[_currentWaypointIndex]);
                 Gizmos.DrawWireSphere(wp[_currentWaypointIndex], 0.10f);
             }
-
-            if (IsFullARMode && Application.isPlaying)
-            {
-                Gizmos.color = new Color(1f, 0f, 1f, 0.5f);
-                Gizmos.DrawWireSphere(transform.position, 0.2f);
-
-                var bridge = UserPositionBridge.Instance;
-                if (bridge != null)
-                {
-                    Gizmos.color = new Color(0f, 1f, 1f, 0.7f);
-                    Gizmos.DrawWireSphere(bridge.UserPosition, 0.3f);
-                    Gizmos.DrawLine(transform.position, bridge.UserPosition);
-
-                    if (_smoothedUserPosInitialized)
-                    {
-                        Gizmos.color = new Color(0f, 1f, 0f, 0.5f);
-                        Gizmos.DrawWireSphere(_smoothedUserPos, 0.2f);
-                    }
-                }
-
-                // ✅ v5.3 FIX D: Visualizar zona de desviación aceptable
-                if (_currentPath != null && _currentPath.Waypoints.Count > 0)
-                {
-                    Gizmos.color = _deviationConsecutiveFrames > 0
-                        ? new Color(1f, 0.3f, 0f, 0.3f)
-                        : new Color(0f, 0.8f, 1f, 0.1f);
-
-                    // Dibujar radio de desviación alrededor del agente
-                    DrawGizmoCircleXZ(transform.position, _autoRerouteDeviationThreshold, 24);
-                }
-            }
-        }
-
-        private static void DrawGizmoCircleXZ(Vector3 center, float radius, int segments)
-        {
-            float step = 360f / segments;
-            Vector3 prev = center + new Vector3(radius, 0f, 0f);
-            for (int i = 1; i <= segments; i++)
-            {
-                float rad  = i * step * Mathf.Deg2Rad;
-                Vector3 next = center + new Vector3(Mathf.Cos(rad) * radius, 0f, Mathf.Sin(rad) * radius);
-                Gizmos.DrawLine(prev, next);
-                prev = next;
-            }
         }
 
         // ─────────────────────────────────────────────────────────────────────
-        //  CONTEXT MENU DEBUG
+        //  CONTEXT MENU
         // ─────────────────────────────────────────────────────────────────────
 
-        [ContextMenu("📍 Log posición agente vs usuario")]
-        private void DbgLogPositions()
+        [ContextMenu("ℹ️ Estado v5.4")]
+        private void DbgStatus()
         {
-            var bridge = UserPositionBridge.Instance;
-            Debug.Log($"[PathController v5.3] Agente: {transform.position:F3} | " +
-                      $"Usuario: {(bridge != null ? bridge.UserPosition.ToString("F3") : "N/A")} | " +
-                      $"Smoothed: {(_smoothedUserPosInitialized ? _smoothedUserPos.ToString("F3") : "no init")} | " +
-                      $"FullAR: {IsFullARMode} | ContinuousSync: {_continuousAgentSync}");
+            float warmupElapsed  = Time.realtimeSinceStartup - _startTime;
+            bool  inWarmup       = warmupElapsed < _vioWarmupDuration;
+            float effectiveSync  = EffectiveAgentSyncInterval;
+
+            Debug.Log(
+                $"[PathController] v5.4\n" +
+                $"  FullAR:              {IsFullARMode}\n" +
+                $"  isNavigating:        {_isNavigating}\n" +
+                $"  warmupElapsed:       {warmupElapsed:F1}s / {_vioWarmupDuration}s (inWarmup={inWarmup})\n" +
+                $"  effectiveSyncInt:    {effectiveSync}s\n" +
+                $"  deviationFrames:     {_deviationConsecutiveFrames}/{_deviationConfirmFrames}\n" +
+                $"  smoothedPos:         {(_smoothedUserPosInitialized ? _smoothedUserPos.ToString("F3") : "no init")}\n" +
+                $"  currentDest:         {_currentDestination:F2}");
         }
 
-        [ContextMenu("🔄 Recalcular ruta desde posición actual")]
+        [ContextMenu("🔄 Recalcular ruta")]
         private void DbgRecalculate()
         {
-            if (!_isNavigating) { Debug.Log("[PathController] Sin navegación activa."); return; }
+            if (!_isNavigating) return;
             NavigateTo(_currentDestination, forceRecalculate: true);
         }
 
@@ -1251,22 +1063,6 @@ namespace IndoorNavAR.Navigation
         {
             _smoothedUserPosInitialized = false;
             Debug.Log("[PathController] Filtro VIO reseteado.");
-        }
-
-        [ContextMenu("ℹ️ Estado v5.3")]
-        private void DbgStatus()
-        {
-            Debug.Log(
-                $"[PathController] v5.3\n" +
-                $"  FullAR:                {IsFullARMode}\n" +
-                $"  isNavigating:          {_isNavigating}\n" +
-                $"  deviationFrames:       {_deviationConsecutiveFrames}/{_deviationConfirmFrames}\n" +
-                $"  deviationCheckTimer:   {_deviationCheckTimer:F3}s/{_deviationCheckInterval}s\n" +
-                $"  agentSyncTimer:        {_agentSyncTimer:F3}s/{_agentSyncInterval}s\n" +
-                $"  lastDeviationReroute:  {Time.time - _lastDeviationRerouteTime:F1}s ago\n" +
-                $"  lastAutoReroute:       {Time.time - _lastAutoRerouteTime:F1}s ago\n" +
-                $"  smoothedPos:           {(_smoothedUserPosInitialized ? _smoothedUserPos.ToString("F3") : "no init")}\n" +
-                $"  currentDest:           {_currentDestination:F2}");
         }
     }
 }

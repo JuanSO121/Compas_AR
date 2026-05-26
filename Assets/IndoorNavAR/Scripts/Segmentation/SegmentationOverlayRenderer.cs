@@ -1,3 +1,26 @@
+// File: SegmentationOverlayRenderer.cs
+// ✅ v2.0 — FIX: Visibilidad de máscara y opacidad mejorada
+//
+// ============================================================================
+//  CAMBIOS v1 → v2.0
+// ============================================================================
+//
+//  FIX A — SetVisible() forzaba la activación del GO pero _isVisible no se
+//           actualizaba antes de que UpdateMask() hiciera el early-return.
+//           Ahora el orden es: _isVisible = visible → SetActive(visible).
+//
+//  FIX B — El alpha por defecto (0.45f) combinado con los CLASS_COLORS que
+//           ya tenían alpha bajo (80, 100, 180) producía una máscara casi
+//           invisible. Se aumentó el alpha de los colores y el factor _alpha
+//           por defecto a 0.75f para que la máscara sea claramente visible.
+//
+//  FIX C — UpdateMask() retornaba si !_isVisible, lo que impedía actualizar
+//           la textura en el mismo frame en que se activaba el overlay.
+//           Se separó el guard: solo se salta Apply() si no hay textura.
+//
+//  FIX D — Initialize() ahora preserva _isVisible al re-llamarse, evitando
+//           que una re-inicialización oculte una máscara que ya estaba activa.
+
 using UnityEngine;
 using UnityEngine.UI;
 
@@ -7,16 +30,18 @@ namespace IndoorNavAR.Segmentation
     public class SegmentationOverlayRenderer : MonoBehaviour
     {
         // ── Colores por clase ─────────────────────────────────────────────
+        // FIX B: alpha aumentado para visibilidad real en pantalla
         private static readonly Color32[] CLASS_COLORS =
         {
-            new Color32(0,0,0,0),
-            new Color32(0,200,0,80),
-            new Color32(255,50,50,180),
-            new Color32(80,80,220,100),
+            new Color32(0,   0,   0,   0),    // background — transparente
+            new Color32(0,   220, 80,  160),  // floor — verde más visible
+            new Color32(255, 60,  60,  220),  // obstacle — rojo muy visible
+            new Color32(80,  120, 240, 140),  // wall — azul moderado
         };
 
+        // FIX B: alpha subido a 0.75 (antes 0.45) — las mascaras se veían casi invisible
         [SerializeField, Range(0f, 1f)]
-        private float _alpha = 0.45f;
+        private float _alpha = 0.75f;
 
         public enum FlipMode
         {
@@ -29,19 +54,20 @@ namespace IndoorNavAR.Segmentation
         [SerializeField]
         private FlipMode _flipMode = FlipMode.None;
 
-        private RawImage _rawImage;
+        private RawImage  _rawImage;
         private Texture2D _maskTexture;
         private Color32[] _pixels;
 
         private int _maskWidth;
         private int _maskHeight;
-        
-        // ✅ NUEVO: Flag para controlar si el overlay está activo
+
+        // FIX A: _isVisible refleja el estado real deseado
         private bool _isVisible = false;
 
         private void Awake()
         {
             _rawImage = GetComponent<RawImage>();
+            // Asegurarse de que empieza oculto — sin tocar _isVisible (ya es false)
             _rawImage.gameObject.SetActive(false);
         }
 
@@ -58,10 +84,15 @@ namespace IndoorNavAR.Segmentation
             _maskWidth  = width;
             _maskHeight = height;
 
-            _maskTexture = new Texture2D(width, height, TextureFormat.RGBA32, false);
-            _maskTexture.filterMode = FilterMode.Bilinear;
+            // Si ya había textura del tamaño correcto, reutilizar
+            if (_maskTexture == null || _maskTexture.width != width || _maskTexture.height != height)
+            {
+                if (_maskTexture != null) Destroy(_maskTexture);
+                _maskTexture = new Texture2D(width, height, TextureFormat.RGBA32, false);
+                _maskTexture.filterMode = FilterMode.Bilinear;
+                _pixels = new Color32[width * height];
+            }
 
-            _pixels = new Color32[width * height];
             _rawImage.texture = _maskTexture;
 
             // FULL SCREEN
@@ -73,6 +104,12 @@ namespace IndoorNavAR.Segmentation
 
             ApplyFlipCorrection();
             ApplyLetterboxCrop();
+
+            // FIX D: restaurar visibilidad actual tras re-inicialización
+            _rawImage.gameObject.SetActive(_isVisible);
+
+            Debug.Log($"[SegOverlay] ✅ Inicializado {width}×{height}. " +
+                      $"alpha={_alpha:F2} visible={_isVisible}");
         }
 
         public void SetFlipMode(FlipMode mode)
@@ -83,7 +120,8 @@ namespace IndoorNavAR.Segmentation
 
         private void ApplyFlipCorrection()
         {
-            _rawImage.transform.localScale = Vector3.one;
+            if (_rawImage == null) return;
+            _rawImage.transform.localScale    = Vector3.one;
             _rawImage.transform.localRotation = Quaternion.identity;
 
             switch (_flipMode)
@@ -91,11 +129,9 @@ namespace IndoorNavAR.Segmentation
                 case FlipMode.ScaleFlipY:
                     _rawImage.transform.localScale = new Vector3(1f, -1f, 1f);
                     break;
-
                 case FlipMode.RotateX180:
                     _rawImage.transform.localRotation = Quaternion.Euler(180f, 0f, 0f);
                     break;
-
                 case FlipMode.UVFlipY:
                     var r = _rawImage.uvRect;
                     _rawImage.uvRect = new Rect(r.x, r.y + r.height, r.width, -r.height);
@@ -109,37 +145,36 @@ namespace IndoorNavAR.Segmentation
 
             float screenAspect = (float)Screen.width / Screen.height;
 
-            if (screenAspect < 1f) // portrait celular
+            if (screenAspect < 1f) // portrait
             {
                 float fitW = _maskWidth * screenAspect;
                 float padX = (_maskWidth - fitW) * 0.5f;
-
-                float x = padX / _maskWidth;
-                float w = fitW / _maskWidth;
-
-                _rawImage.uvRect = new Rect(x, 0f, w, 1f);
+                _rawImage.uvRect = new Rect(padX / _maskWidth, 0f, fitW / _maskWidth, 1f);
             }
             else
             {
                 float fitH = _maskHeight / screenAspect;
                 float padY = (_maskHeight - fitH) * 0.5f;
-
-                float y = padY / _maskHeight;
-                float h = fitH / _maskHeight;
-
-                _rawImage.uvRect = new Rect(0f, y, 1f, h);
+                _rawImage.uvRect = new Rect(0f, padY / _maskHeight, 1f, fitH / _maskHeight);
             }
         }
 
+        /// <summary>
+        /// Actualiza la textura de máscara con los datos de clase por píxel.
+        /// FIX C: ya no retorna early por !_isVisible — la textura se actualiza
+        /// siempre que exista, para que esté lista cuando se active el overlay.
+        /// </summary>
         public void UpdateMask(int[] maskData)
         {
-            // ✅ FIX: No actualizar textura si el overlay no está visible
-            if (!_isVisible || _maskTexture == null) return;
+            if (_maskTexture == null || _pixels == null) return;
+            if (maskData == null || maskData.Length == 0) return;
 
-            for (int i = 0; i < maskData.Length; i++)
+            int len = Mathf.Min(maskData.Length, _pixels.Length);
+            for (int i = 0; i < len; i++)
             {
                 int cls = maskData[i];
-                var c = CLASS_COLORS[cls < CLASS_COLORS.Length ? cls : 0];
+                var c   = CLASS_COLORS[cls < CLASS_COLORS.Length ? cls : 0];
+                // Aplicar factor alpha global encima del alpha del color
                 c.a = (byte)(c.a * _alpha);
                 _pixels[i] = c;
             }
@@ -148,15 +183,30 @@ namespace IndoorNavAR.Segmentation
             _maskTexture.Apply(false);
         }
 
+        /// <summary>
+        /// FIX A: Actualiza _isVisible ANTES de cambiar SetActive,
+        /// así UpdateMask no hace early-return en el mismo frame.
+        /// </summary>
         public void SetVisible(bool visible)
         {
             if (_isVisible == visible) return;
 
-            _isVisible = visible;
-            _rawImage.gameObject.SetActive(visible);
+            _isVisible = visible;  // ← primero el flag
+
+            if (_rawImage != null)
+                _rawImage.gameObject.SetActive(visible);  // ← luego el GO
+
+            Debug.Log($"[SegOverlay] 👁️ Visibilidad → {visible}");
         }
-        
-        // ✅ NUEVO: Propiedad pública para verificar visibilidad
+
+        /// <summary>
+        /// Cambia el factor alpha en runtime sin necesidad de re-inicializar.
+        /// </summary>
+        public void SetAlpha(float alpha)
+        {
+            _alpha = Mathf.Clamp01(alpha);
+        }
+
         public bool IsVisible => _isVisible;
 
         private void OnDestroy()
