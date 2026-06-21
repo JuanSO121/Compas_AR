@@ -4,10 +4,17 @@
 // Parte receptora del bridge Flutter → Unity.
 // La parte estática (Unity → Flutter) está en FlutterUnityBridgeStatic.cs.
 //
-// ✅ FIX: Añadido case "navigate_to" (acción que envía Flutter/UnityBridgeService v6.0)
-//         para que sea equivalente a "navigate_to_waypoint" pero usando el campo "name"
-//         en lugar de "waypointName". Sin este case el log mostraba:
-//         W/Unity: [FlutterUnityBridge] Acción no soportada: navigate_to
+// ✅ FIX OVERLAY (v_seg_fix):
+//   case "toggle_seg_mask" ahora localiza SegmentationController y llama
+//   SetOverlayVisible(!segCtrl.OverlayVisible) en lugar de ser un no-op.
+//   Sin este fix el overlay nunca se activaba desde Flutter aunque se
+//   enviaran múltiples toggle_seg_mask.
+//
+// ✅ FIX navigate_to (previo):
+//   Añadido case "navigate_to" (acción que envía Flutter/UnityBridgeService v6.0)
+//   para que sea equivalente a "navigate_to_waypoint" pero usando el campo "name"
+//   en lugar de "waypointName". Sin este case el log mostraba:
+//   W/Unity: [FlutterUnityBridge] Acción no soportada: navigate_to
 
 using System;
 using System.Threading.Tasks;
@@ -45,6 +52,7 @@ namespace IndoorNavAR.Integration
     ///   stop_voice            → delega a VoiceCommandAPI (no-op local)
     ///   session_status        → responde con estado actual de sesión
     ///   ping_scene            → responde con scene_ready si ya está lista
+    ///   toggle_seg_mask       → ✅ FIX: llama SetOverlayVisible en SegmentationController
     /// </summary>
     public partial class FlutterUnityBridge : MonoBehaviour   // ← partial: comparte clase con FlutterUnityBridgeStatic.cs
     {
@@ -231,15 +239,44 @@ namespace IndoorNavAR.Integration
                     }
                     break;
 
+                // ── Segmentación ──────────────────────────────────────────────
+
+                // ✅ FIX OVERLAY: antes era un no-op (solo Log). Ahora delega al
+                // SegmentationController para que el overlay realmente se active/oculte.
                 case "toggle_seg_mask":
-                    // Implementado en otros componentes; no acción requerida aquí.
                     Log("toggle_seg_mask recibido.");
+                    ToggleSegmentationOverlay();
                     break;
 
                 default:
                     LogWarn($"Acción no soportada: {cmd.action}");
                     break;
             }
+        }
+
+        // ── Segmentación ──────────────────────────────────────────────────────
+
+        /// <summary>
+        /// ✅ FIX OVERLAY: Localiza el SegmentationController (incluyendo inactivos)
+        /// y alterna la visibilidad del overlay de segmentación.
+        ///
+        /// Separado en método propio para poder llamarlo también desde
+        /// ContextMenu en desarrollo sin pasar por el bridge.
+        /// </summary>
+        private void ToggleSegmentationOverlay()
+        {
+            var segCtrl = FindFirstObjectByType<IndoorNavAR.Segmentation.SegmentationController>(
+                FindObjectsInactive.Include);
+
+            if (segCtrl == null)
+            {
+                LogWarn("toggle_seg_mask: SegmentationController no encontrado en la escena.");
+                return;
+            }
+
+            bool nextVisible = !segCtrl.OverlayVisible;
+            segCtrl.SetOverlayVisible(nextVisible);
+            Log($"toggle_seg_mask → overlay={nextVisible} segActive={segCtrl.IsSegmentationActive}");
         }
 
         // ── Navegación ────────────────────────────────────────────────────────

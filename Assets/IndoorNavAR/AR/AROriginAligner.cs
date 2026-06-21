@@ -1,43 +1,53 @@
 // File: AROriginAligner.cs
-// ✅ v9.1 — Fix _floorSnapTolerance insuficiente para edificios con NavMesh alto
+// ✅ v9.2 — Optimización de raycasts, reducción de trabajo por frame y diagnóstico de clearance
 //
 // ============================================================================
-//  CAMBIOS v9.0 → v9.1
+//  CAMBIOS v9.1 → v9.2
 // ============================================================================
 //
-//  BUG — _floorSnapTolerance=0.9 insuficiente para este edificio
-//  ─────────────────────────────────────────────────────────────
-//  SÍNTOMA (log v9.1):
-//    estimFloor=1.59 | hitY=3.51 | ΔY=1.92 | margen=1.40
-//    → Sync fallo #1 al #9 continuos
+//  BUG #1 — searchOrigin.y demasiado alto causa todos los hits descartados
+//  ─────────────────────────────────────────────────────────────────────────
+//  SÍNTOMA (log v9.2):
+//    hitY=3.43 | estimFloor=1.14–1.26 | ΔY > hitMargin → TODOS descartados pasada1
+//    Solo pasa la segunda pasada con r=1m
+//    → múltiples SamplePosition fallidos cada frame
 //
 //  CAUSA:
-//    En este edificio específico el NavMesh del piso 1 está a Y≈1.59 pero
-//    el único hit disponible (losa del techo del piso 2) está a Y=3.51.
-//    hitMargin = _floorSnapTolerance + 0.5 = 0.9 + 0.5 = 1.40m
-//    ΔY = |3.51 - 1.59| = 1.92m > 1.40m → descartado siempre.
-//    El NavMesh correcto (suelo del piso 1) está a ~0.03m de estimFloor
-//    pero los SamplePosition con r=0.5..3m no lo alcanzan porque
-//    searchOrigin.y = estimFloor + hitMargin = 1.59 + 1.40 = 2.99m
-//    y el NavMesh está en Y=1.62m (Δ=1.37m ≈ límite del margen).
+//    searchOrigin.y = estimFloor + hitMargin = 1.26 + 2.0 = 3.26m
+//    El NavMesh correcto está a Y≈1.14m (Δ=2.12m > hitMargin=2.0m)
+//    Los hits de la losa del techo a Y=3.43 son los únicos encontrados y
+//    siempre se descartan. Cada frame ejecuta 4 SamplePosition fallidos
+//    antes de caer a la segunda pasada con searchOriginLow.
 //
-//  FIX 1 — _floorSnapTolerance default: 0.9 → 1.5
-//    hitMargin = 1.5 + 0.5 = 2.0m — cubre ΔY=1.92m con margen de 0.08m.
-//    searchOrigin.y = 1.59 + 2.0 = 3.59m → SamplePosition hacia abajo
-//    encuentra NavMesh a Y≈1.62m (ΔY=1.97m ≤ 2.0m) → ✅ ACEPTADO.
+//  FIX 1 — searchOrigin usa estimFloor directamente (sin sumar hitMargin)
+//    El motivo original de sumar hitMargin al Y de búsqueda era evitar
+//    que el origen cayera dentro de la geometría del piso. Sin embargo,
+//    NavMesh.SamplePosition ya busca en una esfera de radio r alrededor
+//    del punto dado — no necesita estar "sobre" el NavMesh.
+//    Nuevo searchOrigin.y = estimFloor (centro) en lugar de estimFloor+hitMargin.
+//    Esto permite que los radios pequeños (0.5m, 1.0m) alcancen el NavMesh
+//    sin ejecutar raycasts hacia la losa del techo.
 //
-//  FIX 2 — Diagnóstico automático al 5º fallo consecutivo
-//    Cuando _consecutiveSyncFails == 5, logea automáticamente los
-//    StartPoints disponibles y sus FloorHeight para facilitar el ajuste
-//    del Inspector sin necesidad de usar ContextMenu.
+//  FIX 2 — Throttle por distancia mínima más agresivo
+//    _fullArSyncThreshold era la única guarda de distancia. Se añade
+//    _syncMinMoveDelta (default 0.08m) como umbral de movimiento mínimo
+//    entre syncs consecutivos para evitar recalcular posición cada frame
+//    cuando el usuario está quieto (situación más frecuente).
 //
-//  FIX 3 — searchOrigin con radio progresivo en el eje Y también
-//    Para edificios donde el NavMesh puede estar significativamente
-//    por encima O por debajo de estimFloor (rampas, escaleras), el
-//    searchOrigin ahora prueba también desde estimFloor - hitMargin/2
-//    como segunda pasada si la primera falla.
+//  FIX 3 — Skip de pasada1 cuando estimFloor es claramente incorrecto
+//    Si el delta entre estimFloor y el mejor StartPoint.FloorHeight
+//    supera hitMargin*0.8, saltamos directamente a la pasada2 (searchOriginLow)
+//    en lugar de ejecutar 4 SamplePosition sabiendo que fallarán.
+//    Esto elimina el overhead en el caso "edificio con losa alta".
 //
-//  TODOS LOS FIXES v9.0 SE MANTIENEN INTACTOS.
+//  FIX 4 — Guard de clearance antes de Warp
+//    Antes de mover el agente a bestHit.position, se verifica que
+//    NavMesh.FindClosestEdge reporta una distancia > _minClearanceRequired (0.15m).
+//    Si la clearance es cero o muy baja, se descarta el hit y se incrementa
+//    _syncFailFrames igual que si no hubiera hit. Esto previene el ciclo
+//    Stall → Clearance 0.000m → recálculo de PathController.
+//
+//  TODOS LOS FIXES v9.1 SE MANTIENEN INTACTOS.
 
 using System.Collections;
 using UnityEngine;
@@ -80,7 +90,18 @@ namespace IndoorNavAR.AR
                  "v9.1: 1.5 → hitMargin=2.00m — cubre ΔY hasta 2.0m\n\n" +
                  "Si sigues viendo 'Sync fallo' aumentar en 0.2 hasta que cese.\n" +
                  "Valor máximo recomendado: 2.5 (evitar falsos positivos en pisos)")]
-        [SerializeField] private float _floorSnapTolerance = 1.5f;   // FIX 1: 0.9 → 1.5
+        [SerializeField] private float _floorSnapTolerance = 1.5f;
+
+        [Header("─── v9.2 Optimizaciones ────────────────────────────────────")]
+        [Tooltip("Movimiento mínimo (m) entre syncs consecutivos.\n" +
+                 "Evita recalcular posición cada frame cuando el usuario está quieto.\n" +
+                 "Default: 0.08m (mayor que _fullArSyncThreshold para reducir trabajo)")]
+        [SerializeField] private float _syncMinMoveDelta = 0.08f;
+
+        [Tooltip("Clearance mínima (m) requerida en el hit de NavMesh antes de mover el agente.\n" +
+                 "Un hit con clearance=0 está dentro de geometría y causa PathController stalls.\n" +
+                 "Default: 0.15m")]
+        [SerializeField] private float _minClearanceRequired = 0.15f;
 
         [Header("─── VIO Recovery ───────────────────────────────────────────")]
         [SerializeField] private float _vioRecoveryDelay          = 0.8f;
@@ -153,6 +174,9 @@ namespace IndoorNavAR.AR
         private float _nextSyncAllowedTime     = 0f;
         private float _currentSyncFailCooldown = 0f;
         private int   _consecutiveSyncFails    = 0;
+
+        // v9.2: posición de cámara en el último sync exitoso (para _syncMinMoveDelta)
+        private Vector3 _lastSuccessfulSyncCamPos = new Vector3(float.PositiveInfinity, 0, 0);
 
         // ─── Propiedades ──────────────────────────────────────────────────
 
@@ -307,6 +331,8 @@ namespace IndoorNavAR.AR
                 _consecutiveSyncFails    = 0;
                 _currentSyncFailCooldown = 0f;
                 _nextSyncAllowedTime     = 0f;
+                // v9.2: resetear también el guard de movimiento mínimo
+                _lastSuccessfulSyncCamPos = new Vector3(float.PositiveInfinity, 0, 0);
             }
 
             if (nowTracking && _pendingAlignAfterTracking)
@@ -361,6 +387,7 @@ namespace IndoorNavAR.AR
             {
                 _pendingAlignAfterTracking = false;
                 _lastSyncedCameraPos       = new Vector3(float.PositiveInfinity, 0, 0);
+                _lastSuccessfulSyncCamPos  = new Vector3(float.PositiveInfinity, 0, 0);
                 _consecutiveSyncFails      = 0;
                 _currentSyncFailCooldown   = 0f;
                 _nextSyncAllowedTime       = 0f;
@@ -479,7 +506,8 @@ namespace IndoorNavAR.AR
                 _xrOrigin.MoveCameraToWorldLocation(targetPos);
 
                 _initialAlignDone    = true;
-                _lastSyncedCameraPos = new Vector3(float.PositiveInfinity, 0, 0);
+                _lastSyncedCameraPos        = new Vector3(float.PositiveInfinity, 0, 0);
+                _lastSuccessfulSyncCamPos   = new Vector3(float.PositiveInfinity, 0, 0);
 
                 _consecutiveSyncFails    = 0;
                 _currentSyncFailCooldown = 0f;
@@ -539,6 +567,13 @@ namespace IndoorNavAR.AR
 
             Vector3 cameraPos = _xrOrigin.Camera.transform.position;
 
+            // v9.2 FIX 2: guard de movimiento mínimo más agresivo
+            // _fullArSyncThreshold controla si el agente necesita moverse (post-hit),
+            // pero _syncMinMoveDelta controla si vale la pena hacer el raycast en absoluto.
+            if (Vector3.Distance(cameraPos, _lastSuccessfulSyncCamPos) < _syncMinMoveDelta)
+                return;
+
+            // Mantener el guard original de threshold como segunda capa
             if (Vector3.Distance(cameraPos, _lastSyncedCameraPos) < _fullArSyncThreshold) return;
             _lastSyncedCameraPos = cameraPos;
 
@@ -554,34 +589,52 @@ namespace IndoorNavAR.AR
             float estimatedFloorY = GetExpectedFloorY(cameraPos.y);
             float hitMargin       = _floorSnapTolerance + 0.5f;
 
-            // Pasada 1: searchOrigin sobre el piso esperado (caso normal)
-            Vector3 searchOrigin = new Vector3(cameraPos.x, estimatedFloorY + hitMargin, cameraPos.z);
-
             NavMeshHit bestHit = default;
             bool       found   = false;
 
-            foreach (float r in new[] { 0.5f, 1.0f, 2.0f, _fullArSnapRadius })
+            // v9.2 FIX 3: detectar si pasada1 va a fallar antes de ejecutarla
+            // Si la diferencia entre estimFloor y el piso más cercano del StartPoint
+            // ya supera hitMargin*0.8, los hits de pasada1 (desde arriba) van a ser
+            // la losa del techo. Saltar directamente a pasada2 en ese caso.
+            bool skipPasada1 = ShouldSkipPasada1(estimatedFloorY, hitMargin);
+
+            if (!skipPasada1)
             {
-                if (!NavMesh.SamplePosition(searchOrigin, out NavMeshHit hit, r, NavMesh.AllAreas))
-                    continue;
+                // Pasada 1 — v9.2 FIX 1: searchOrigin.y = estimFloor (sin sumar hitMargin)
+                // NavMesh.SamplePosition busca en esfera de radio r — no necesita estar "sobre"
+                // el NavMesh. Sumar hitMargin provocaba que el origen quedara cerca de la losa
+                // del techo, causando que todos los hits apuntaran a ella y fueran descartados.
+                Vector3 searchOrigin = new Vector3(cameraPos.x, estimatedFloorY, cameraPos.z);
 
-                float deltaY = Mathf.Abs(hit.position.y - estimatedFloorY);
-                if (deltaY <= hitMargin)
+                foreach (float r in new[] { 0.5f, 1.0f, 2.0f, _fullArSnapRadius })
                 {
-                    bestHit = hit;
-                    found   = true;
-                    break;
-                }
+                    if (!NavMesh.SamplePosition(searchOrigin, out NavMeshHit hit, r, NavMesh.AllAreas))
+                        continue;
 
+                    float deltaY = Mathf.Abs(hit.position.y - estimatedFloorY);
+                    if (deltaY <= hitMargin)
+                    {
+                        bestHit = hit;
+                        found   = true;
+                        break;
+                    }
+
+                    if (_logAlignment)
+                        Debug.Log($"[AROriginAligner] Hit p1 r={r}m descartado: " +
+                                  $"hitY={hit.position.y:F2} estimFloor={estimatedFloorY:F2} " +
+                                  $"ΔY={deltaY:F2} margen={hitMargin:F2}");
+                }
+            }
+            else
+            {
                 if (_logAlignment)
-                    Debug.Log($"[AROriginAligner] Hit r={r}m descartado: " +
-                              $"hitY={hit.position.y:F2} estimFloor={estimatedFloorY:F2} " +
-                              $"ΔY={deltaY:F2} margen={hitMargin:F2}");
+                    Debug.Log($"[AROriginAligner] ⏭ Pasada1 omitida — estimFloor={estimatedFloorY:F2} " +
+                              $"demasiado lejos del StartPoint más cercano (hitMargin={hitMargin:F2})");
             }
 
-            // FIX 3: Pasada 2 si la primera falló — searchOrigin desde debajo
-            // Cubre casos donde el NavMesh está significativamente por debajo
-            // del suelo estimado (ej: rampas descendentes, desniveles).
+            // Pasada 2 si la primera falló (o fue omitida)
+            // Cubre casos donde el NavMesh está por debajo del suelo estimado.
+            // v9.2: también actúa como pasada principal cuando pasada1 se omite.
             if (!found)
             {
                 Vector3 searchOriginLow = new Vector3(
@@ -608,10 +661,23 @@ namespace IndoorNavAR.AR
 
             if (found)
             {
+                // v9.2 FIX 4: verificar clearance antes de mover el agente
+                // Un hit con clearance=0 está dentro de geometría → PathController stall
+                if (!HasSufficientClearance(bestHit.position))
+                {
+                    if (_logAlignment)
+                        Debug.LogWarning($"[AROriginAligner] ⚠️ Hit descartado por clearance insuficiente: " +
+                                         $"pos={bestHit.position:F2} (< {_minClearanceRequired:F3}m)");
+                    // Tratar como fallo para activar throttle y evitar loop
+                    RecordSyncFail(cameraPos, estimatedFloorY, new Vector3(cameraPos.x, estimatedFloorY, cameraPos.z));
+                    return;
+                }
+
                 _syncFailFrames          = 0;
                 _consecutiveSyncFails    = 0;
                 _currentSyncFailCooldown = 0f;
                 _nextSyncAllowedTime     = 0f;
+                _lastSuccessfulSyncCamPos = cameraPos; // v9.2: actualizar guard de movimiento
 
                 if (Vector3.Distance(_navigationAgent.transform.position,
                         bestHit.position) < _fullArSyncThreshold)
@@ -626,33 +692,70 @@ namespace IndoorNavAR.AR
             }
             else
             {
-                _syncFailFrames++;
-                _consecutiveSyncFails++;
-
-                _currentSyncFailCooldown = Mathf.Min(
-                    _syncFailCooldown * Mathf.Pow(2f, _consecutiveSyncFails - 1),
-                    _syncFailCooldownMax);
-                _nextSyncAllowedTime = Time.unscaledTime + _currentSyncFailCooldown;
-
-                Debug.LogWarning(
-                    $"[AROriginAligner] ! Sync fallo #{_consecutiveSyncFails} — " +
-                    $"camY={cameraPos.y:F2} estimFloor={estimatedFloorY:F2} " +
-                    $"searchOrigin={searchOrigin:F2} " +
-                    $"cooldown={_currentSyncFailCooldown:F1}s");
-
-                // FIX 2: diagnóstico automático al 5º fallo
-                if (_consecutiveSyncFails == 5)
-                    LogStartPointDiagnostic(estimatedFloorY, hitMargin);
-
-                if (_syncFailThreshold > 0 && _syncFailFrames >= _syncFailThreshold)
-                {
-                    _syncFailFrames = 0; _consecutiveSyncFails = 0;
-                    EmergencyWarpAgentToCamera(cameraPos);
-                }
+                RecordSyncFail(cameraPos, estimatedFloorY,
+                    new Vector3(cameraPos.x, estimatedFloorY, cameraPos.z));
             }
         }
 
-        // FIX 2: diagnóstico automático de StartPoints para ajuste de Inspector
+        // v9.2: extrae la lógica de fallo a método para reutilización
+        private void RecordSyncFail(Vector3 cameraPos, float estimatedFloorY, Vector3 searchOrigin)
+        {
+            _syncFailFrames++;
+            _consecutiveSyncFails++;
+
+            _currentSyncFailCooldown = Mathf.Min(
+                _syncFailCooldown * Mathf.Pow(2f, _consecutiveSyncFails - 1),
+                _syncFailCooldownMax);
+            _nextSyncAllowedTime = Time.unscaledTime + _currentSyncFailCooldown;
+
+            Debug.LogWarning(
+                $"[AROriginAligner] ! Sync fallo #{_consecutiveSyncFails} — " +
+                $"camY={cameraPos.y:F2} estimFloor={estimatedFloorY:F2} " +
+                $"searchOrigin={searchOrigin:F2} " +
+                $"cooldown={_currentSyncFailCooldown:F1}s");
+
+            // FIX 2 (v9.1): diagnóstico automático al 5º fallo
+            if (_consecutiveSyncFails == 5)
+                LogStartPointDiagnostic(estimatedFloorY, _floorSnapTolerance + 0.5f);
+
+            if (_syncFailThreshold > 0 && _syncFailFrames >= _syncFailThreshold)
+            {
+                _syncFailFrames = 0; _consecutiveSyncFails = 0;
+                EmergencyWarpAgentToCamera(cameraPos);
+            }
+        }
+
+        // v9.2 FIX 3: determina si la pasada1 va a fallar basado en StartPoints
+        private bool ShouldSkipPasada1(float estimatedFloorY, float hitMargin)
+        {
+            var pts = NavigationStartPointManager.GetAllStartPoints();
+            if (pts.Count == 0) return false;
+
+            float bestDist = float.MaxValue;
+            foreach (var pt in pts)
+            {
+                if (pt == null) continue;
+                float d = Mathf.Abs(pt.FloorHeight - estimatedFloorY);
+                if (d < bestDist) bestDist = d;
+            }
+
+            // Si el StartPoint más cercano está a más de 80% del hitMargin,
+            // es probable que pasada1 encuentre la losa del techo en lugar del piso.
+            return bestDist > hitMargin * 0.8f;
+        }
+
+        // v9.2 FIX 4: verificar que el hit tiene espacio libre suficiente
+        private bool HasSufficientClearance(Vector3 position)
+        {
+            if (_minClearanceRequired <= 0f) return true;
+
+            if (!NavMesh.FindClosestEdge(position, out NavMeshHit edgeHit, NavMesh.AllAreas))
+                return true; // No encontró borde → asumir que hay espacio
+
+            return edgeHit.distance >= _minClearanceRequired;
+        }
+
+        // FIX 2 (v9.1): diagnóstico automático de StartPoints para ajuste de Inspector
         private void LogStartPointDiagnostic(float estimatedFloorY, float hitMargin)
         {
             var pts = NavigationStartPointManager.GetAllStartPoints();
@@ -707,6 +810,14 @@ namespace IndoorNavAR.AR
                 if (!NavMesh.SamplePosition(searchPos, out NavMeshHit hit, r, NavMesh.AllAreas))
                     continue;
 
+                // v9.2: verificar clearance también en warp de emergencia
+                if (!HasSufficientClearance(hit.position))
+                {
+                    if (_logAlignment)
+                        Debug.LogWarning($"[AROriginAligner] 🚨 WARP r={r}m: clearance insuficiente, buscando alternativa...");
+                    continue;
+                }
+
                 Debug.LogWarning(
                     $"[AROriginAligner] 🚨 WARP: {_navigationAgent.transform.position:F2} " +
                     $"→ {hit.position:F2} (r={r}m)");
@@ -715,12 +826,13 @@ namespace IndoorNavAR.AR
                 if (_agentNavMeshAgent?.enabled == true)
                 { _agentNavMeshAgent.Warp(hit.position); _agentNavMeshAgent.isStopped = true; }
 
-                _lastStableAgentPos      = hit.position;
-                _hasStablePos            = true;
-                _lastSyncedCameraPos     = new Vector3(float.PositiveInfinity, 0, 0);
-                _consecutiveSyncFails    = 0;
-                _currentSyncFailCooldown = 0f;
-                _nextSyncAllowedTime     = 0f;
+                _lastStableAgentPos       = hit.position;
+                _hasStablePos             = true;
+                _lastSyncedCameraPos      = new Vector3(float.PositiveInfinity, 0, 0);
+                _lastSuccessfulSyncCamPos = new Vector3(float.PositiveInfinity, 0, 0);
+                _consecutiveSyncFails     = 0;
+                _currentSyncFailCooldown  = 0f;
+                _nextSyncAllowedTime      = 0f;
                 return;
             }
 
@@ -775,7 +887,7 @@ namespace IndoorNavAR.AR
 
         private void Log(string m) { if (_logAlignment) Debug.Log($"[AROriginAligner] {m}"); }
 
-        [ContextMenu("ℹ️ Info v9.1")]
+        [ContextMenu("ℹ️ Info v9.2")]
         private void DebugInfo()
         {
             float camY        = _xrOrigin?.Camera != null ? _xrOrigin.Camera.transform.position.y : -999f;
@@ -786,10 +898,11 @@ namespace IndoorNavAR.AR
             float recovAgo    = Time.realtimeSinceStartup - _trackingRecoveredTime;
             float syncCoolRem = Mathf.Max(0f, _nextSyncAllowedTime - Time.unscaledTime);
             var   sp          = NavigationStartPointManager.GetStartPointForLevel(_targetLevel);
+            bool  skip1       = ShouldSkipPasada1(efy, hitMargin);
 
             Debug.Log(
                 "══════════════════════════════════════════════\n" +
-                "  AROriginAligner v9.1\n" +
+                "  AROriginAligner v9.2\n" +
                 "══════════════════════════════════════════════\n" +
                 $"  Modo:                {(IsNoArMode ? "NoAR" : "FullAR")}\n" +
                 $"  ARSession:           {ARSession.state}\n" +
@@ -800,7 +913,10 @@ namespace IndoorNavAR.AR
                 $"  estimGround:         {estimGround:F3}  (camY - eyeOffset={_eyeHeightOffset})\n" +
                 $"  expectedFloorY:      {efy:F3}\n" +
                 $"  _floorSnapTolerance: {_floorSnapTolerance} → hitMargin={hitMargin:F2}m\n" +
+                $"  ShouldSkipPasada1:   {skip1}\n" +
                 $"  SyncFails:           #{_consecutiveSyncFails} | cooldown={_currentSyncFailCooldown:F1}s\n" +
+                $"  _syncMinMoveDelta:   {_syncMinMoveDelta}m\n" +
+                $"  _minClearanceReq:   {_minClearanceRequired}m\n" +
                 $"  StartPoint:          {(sp != null ? $"{sp.gameObject.name} @ {sp.transform.position:F2}" : "N/A")}\n" +
                 "══════════════════════════════════════════════");
 
@@ -821,7 +937,8 @@ namespace IndoorNavAR.AR
             if (_noArMode) return;
             _pendingAlignAfterTracking = false; _stableFrameCount = 0; _syncFailFrames = 0;
             _consecutiveSyncFails = 0; _currentSyncFailCooldown = 0f; _nextSyncAllowedTime = 0f;
-            _lastSyncedCameraPos  = new Vector3(float.PositiveInfinity, 0, 0);
+            _lastSyncedCameraPos        = new Vector3(float.PositiveInfinity, 0, 0);
+            _lastSuccessfulSyncCamPos   = new Vector3(float.PositiveInfinity, 0, 0);
             Debug.Log("[AROriginAligner] 🔄 VIO Reset simulado — throttle reseteado.");
         }
 
@@ -835,11 +952,23 @@ namespace IndoorNavAR.AR
         [ContextMenu("🔄 Resetear throttle de sync")]
         private void DebugResetThrottle()
         {
-            _consecutiveSyncFails    = 0;
-            _currentSyncFailCooldown = 0f;
-            _nextSyncAllowedTime     = 0f;
-            _lastSyncedCameraPos     = new Vector3(float.PositiveInfinity, 0, 0);
+            _consecutiveSyncFails       = 0;
+            _currentSyncFailCooldown    = 0f;
+            _nextSyncAllowedTime        = 0f;
+            _lastSyncedCameraPos        = new Vector3(float.PositiveInfinity, 0, 0);
+            _lastSuccessfulSyncCamPos   = new Vector3(float.PositiveInfinity, 0, 0);
             Debug.Log("[AROriginAligner] Throttle reseteado — próximo sync inmediato.");
+        }
+
+        [ContextMenu("🔬 Test clearance posición actual del agente")]
+        private void DebugTestClearance()
+        {
+            if (_navigationAgent == null) return;
+            var pos = _navigationAgent.transform.position;
+            bool ok = HasSufficientClearance(pos);
+            NavMesh.FindClosestEdge(pos, out NavMeshHit eh, NavMesh.AllAreas);
+            Debug.Log($"[AROriginAligner] Clearance en agente: {eh.distance:F4}m " +
+                      $"(requerido: {_minClearanceRequired:F3}m) → {(ok ? "✅ OK" : "❌ INSUFICIENTE")}");
         }
 
         #endregion
